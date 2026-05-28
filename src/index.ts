@@ -184,7 +184,14 @@ app.addHook("onRequest", async (req, reply) => {
  *   for account A cannot operate on a project owned by account B.
  * ----- */
 
-const EXEMPT_PATHS = new Set(["/v1/health"]);
+const EXEMPT_PATHS = new Set([
+  "/v1/health",
+  // `/v1/billing/info` carries the Stripe publishable key (safe to expose
+  // by design) and the public marketing pricing catalog the apex /pricing
+  // page server-fetches. No sensitive data — keeping it un-authed so an
+  // un-authed visitor (and the apex page itself) can render the catalog.
+  "/v1/billing/info",
+]);
 
 function scopeAllows(
   scope: "read" | "deploy" | "admin",
