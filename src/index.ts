@@ -2130,6 +2130,40 @@ app.post("/v1/auth/register", async (request, reply) => {
   return reply.code(201).send(result);
 });
 
+// Self-service password change for the currently signed-in user (plan
+// §5.4). Session-only — an API key can't rotate the human's password,
+// only the human can. Verifies the current password before writing the
+// new hash.
+app.post("/v1/account/me/change-password", async (request, reply) => {
+  const session = getSessionAuth(request);
+  if (!session) {
+    return reply
+      .code(401)
+      .send({ error: "session required (Bearer cts_ token)" });
+  }
+  const body = (request.body ?? {}) as {
+    currentPassword?: unknown;
+    newPassword?: unknown;
+  };
+  if (
+    typeof body.currentPassword !== "string" ||
+    typeof body.newPassword !== "string"
+  ) {
+    return reply.code(400).send({
+      error: "currentPassword and newPassword (string) required",
+    });
+  }
+  const result = await cp.changePassword({
+    userId: session.userId,
+    currentPassword: body.currentPassword,
+    newPassword: body.newPassword,
+  });
+  if ("error" in result) {
+    return reply.code(400).send({ error: result.error });
+  }
+  return reply.code(200).send(result);
+});
+
 // Admin password reset — fills the gap until the real /forgot flow ships
 // (deferred to once Cantila Mail can deliver reset emails). Gated by the
 // `CANTILA_ADMIN_TOKEN` env var; returns 503 when the token is not set so
@@ -2343,6 +2377,33 @@ app.post("/v1/agents/resume", async () => {
   return { paused: false };
 });
 
+/* ----- SeoAgent — plan §4.9 extension (10th brain swarm agent).
+ *  Filters the brain snapshot to just the SEO slice so the Console
+ *  can render a dedicated SEO panel without paging through every
+ *  other agent's actions. Includes the active fixer mode so the
+ *  operator can see at a glance whether auto-apply is wired up. ----- */
+app.get("/v1/seo/audit", async (request) => {
+  const q = request.query as { fresh?: string };
+  if (q.fresh === "1") await cp.tickAgents();
+  const snap = cp.agentsStatus();
+  return {
+    at: snap.at,
+    pendingProposals: snap.pendingProposals.filter((p) => p.agent === "seo"),
+    recentActions: snap.recentActions.filter((a) => a.agent === "seo"),
+    learnings: snap.learnings.filter((l) => l.agent === "seo"),
+    stats: snap.agentStats.seo,
+    fixer: {
+      autoApply: config.seoAgentAutoApply,
+      live:
+        config.seoAgentAutoApply &&
+        Boolean(config.githubToken) &&
+        Boolean(config.githubRepo),
+      repo: config.githubRepo || null,
+    },
+    origin: config.seoOrigin,
+  };
+});
+
 // Dev-only debug seam — push a synthetic action into the brain's journal
 // so the learning loop can be exercised end-to-end. Disabled in
 // production. Used by the learning-loop smoke test.
@@ -2356,6 +2417,8 @@ const injectActionSchema = z.object({
     "capacity",
     "mail",
     "sms",
+    "automation",
+    "seo",
   ]),
   kind: z.string().min(1),
   outcome: z.enum(["ok", "failed"]),

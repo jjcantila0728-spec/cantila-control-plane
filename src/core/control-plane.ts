@@ -4526,6 +4526,38 @@ export class ControlPlane {
   }
 
   /** Register a new password user explicitly. Fails if the email is taken. */
+  /** Self-service password change for the currently signed-in user
+   *  (plan §5.4). Verifies the current password against the stored hash
+   *  before writing the new one; returns `{ error }` on a mismatch or a
+   *  too-short new password. Same store call as `adminResetPassword`,
+   *  different gate: the caller has already proven their identity via
+   *  the session cookie, so no admin token is needed. */
+  async changePassword(input: {
+    userId: string;
+    currentPassword: string;
+    newPassword: string;
+  }): Promise<{ userId: string } | { error: string }> {
+    if (input.newPassword.length < 8) {
+      return { error: "new password must be at least 8 characters" };
+    }
+    if (input.newPassword === input.currentPassword) {
+      return { error: "new password must differ from the current one" };
+    }
+    const user = await this.deps.store.getUser(input.userId);
+    if (!user) return { error: "user not found" };
+    if (
+      !user.passwordHash ||
+      !verifyPassword(input.currentPassword, user.passwordHash)
+    ) {
+      return { error: "current password is incorrect" };
+    }
+    await this.deps.store.updateUserPassword(
+      input.userId,
+      hashPassword(input.newPassword),
+    );
+    return { userId: input.userId };
+  }
+
   /** Admin password reset — bypass for the missing `/forgot` flow.
    *  Gated by the `CANTILA_ADMIN_TOKEN` env var checked in index.ts; this
    *  layer assumes the caller is already authenticated as an operator.
