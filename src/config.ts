@@ -25,4 +25,22 @@ export const config = {
    *  in-process demo flow needs no setup. Recommended for any deployment
    *  that is reachable from the public internet. */
   requireAuth: flag(process.env.CANTILA_REQUIRE_AUTH),
+  /** Public-face origin the SeoAgent crawls and emits canonical URLs for.
+   *  Defaults to https://cantila.app; override in dev/staging. */
+  seoOrigin:
+    process.env.SEO_PUBLIC_ORIGIN ??
+    `https://${process.env.CANTILA_PUBLIC_HOST ?? "cantila.app"}`,
+  /** Tick interval for the SeoAgent. SEO doesn't need fast cadence and
+   *  crawling is expensive, so it ticks slowly — every 6h by default. */
+  seoTickMs: Number(process.env.SEO_AGENT_TICK_MS ?? 6 * 60 * 60 * 1000),
+  /** When true AND a GitHub PAT is configured, the SeoAgent commits its
+   *  mechanical fixes (sitemap regen, missing canonical, missing alt) to
+   *  the cantila-console repo automatically. When false (the default),
+   *  the agent only queues proposals for human review. */
+  seoAgentAutoApply: flag(process.env.SEO_AGENT_AUTO_APPLY),
+  /** GitHub PAT used by the live SeoFixer adapter. When absent, the stub
+   *  fixer is used — auto-apply degrades to a no-op that logs intent. */
+  githubToken: process.env.GITHUB_TOKEN ?? "",
+  /** owner/repo of the cantila-console repo the SeoAgent commits into. */
+  githubRepo: process.env.GITHUB_REPO ?? "",
 } as const;

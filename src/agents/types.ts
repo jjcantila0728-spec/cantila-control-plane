@@ -14,7 +14,8 @@ export type AgentName =
   | "capacity"
   | "mail"
   | "sms"
-  | "automation";
+  | "automation"
+  | "seo";
 
 export type ActionClass = "safe" | "destructive";
 export type Confidence = "high" | "medium" | "low";
