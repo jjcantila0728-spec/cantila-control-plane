@@ -4526,6 +4526,27 @@ export class ControlPlane {
   }
 
   /** Register a new password user explicitly. Fails if the email is taken. */
+  /** Admin password reset — bypass for the missing `/forgot` flow.
+   *  Gated by the `CANTILA_ADMIN_TOKEN` env var checked in index.ts; this
+   *  layer assumes the caller is already authenticated as an operator.
+   *  Returns `null` if no user with that email exists. */
+  async adminResetPassword(input: {
+    email: string;
+    newPassword: string;
+  }): Promise<{ email: string; userId: string } | null> {
+    const email = input.email.trim().toLowerCase();
+    if (input.newPassword.length < 8) {
+      throw new Error("password must be at least 8 characters");
+    }
+    const existing = await this.deps.store.findUserByEmail(email);
+    if (!existing) return null;
+    await this.deps.store.updateUserPassword(
+      existing.id,
+      hashPassword(input.newPassword),
+    );
+    return { email, userId: existing.id };
+  }
+
   async registerUser(input: {
     email: string;
     password: string;

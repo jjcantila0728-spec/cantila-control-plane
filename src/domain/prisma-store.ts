@@ -1361,6 +1361,17 @@ export class PrismaStore implements Store {
     return toAuthUser(row);
   }
 
+  async updateUserPassword(
+    userId: string,
+    passwordHash: string,
+  ): Promise<AuthUser> {
+    const row = await this.db.user.update({
+      where: { id: userId },
+      data: { passwordHash },
+    });
+    return toAuthUser(row);
+  }
+
   async createSession(s: Session): Promise<Session> {
     const row = await this.db.session.create({
       data: {

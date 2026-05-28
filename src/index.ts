@@ -2130,6 +2130,46 @@ app.post("/v1/auth/register", async (request, reply) => {
   return reply.code(201).send(result);
 });
 
+// Admin password reset — fills the gap until the real /forgot flow ships
+// (deferred to once Cantila Mail can deliver reset emails). Gated by the
+// `CANTILA_ADMIN_TOKEN` env var; returns 503 when the token is not set so
+// dev environments can't accidentally hand out resets.
+app.post("/v1/auth/admin/reset-password", async (request, reply) => {
+  const adminToken = process.env.CANTILA_ADMIN_TOKEN;
+  if (!adminToken) {
+    return reply
+      .code(503)
+      .send({ error: "admin reset disabled — CANTILA_ADMIN_TOKEN not set" });
+  }
+  const provided = request.headers["x-cantila-admin-token"];
+  if (typeof provided !== "string" || provided !== adminToken) {
+    return reply.code(403).send({ error: "forbidden" });
+  }
+  const body = (request.body ?? {}) as {
+    email?: unknown;
+    newPassword?: unknown;
+  };
+  if (typeof body.email !== "string" || typeof body.newPassword !== "string") {
+    return reply
+      .code(400)
+      .send({ error: "email and newPassword (string) required" });
+  }
+  try {
+    const result = await cp.adminResetPassword({
+      email: body.email,
+      newPassword: body.newPassword,
+    });
+    if (!result) {
+      return reply.code(404).send({ error: "no user with that email" });
+    }
+    return reply.code(200).send(result);
+  } catch (err) {
+    return reply
+      .code(400)
+      .send({ error: err instanceof Error ? err.message : "reset failed" });
+  }
+});
+
 // Which SSO provider is wired (real OIDC vs the bundled stub) — the
 // Console login page renders this on the "Continue with SSO" button.
 app.get("/v1/auth/sso/info", async () => {
