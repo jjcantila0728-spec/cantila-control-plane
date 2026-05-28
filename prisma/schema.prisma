@@ -1,0 +1,1055 @@
+// ============================================================
+// Cantila — control-plane data model
+// The single source of truth for all platform state, in PostgreSQL.
+//
+// Core invariant: every Project owns its OWN dedicated services —
+// see ManagedDatabase, Mailbox and PhoneNumber, each keyed 1:1 by a
+// unique projectId. They are created with the project on its first
+// deploy and torn down with it. (Plan §4.2 — auto-wired services.)
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----- enums -----
+
+enum Plan {
+  hobby
+  starter
+  pro
+  agency
+  dedicated
+}
+
+// Billing health of an account, driven by the dunning state machine
+// (plan §8 / §15.2 — src/billing/dunning.ts).
+enum BillingStatus {
+  active
+  past_due
+  suspended
+  canceled
+}
+
+enum Role {
+  owner
+  admin
+  developer
+  viewer
+}
+
+enum Runtime {
+  static
+  node
+  python
+  php
+  go
+  ruby
+  docker
+}
+
+enum ProjectType {
+  web_app
+  static_site
+  api
+  ai_agent
+  worker
+  cron
+}
+
+enum ProjectStatus {
+  provisioning
+  building
+  live
+  sleeping
+  crashed
+  paused
+}
+
+enum Region {
+  fsn1
+  hel1
+  ash
+}
+
+enum DeployStatus {
+  queued
+  building
+  live
+  failed
+  rolled_back
+  superseded
+}
+
+enum DeployTrigger {
+  chat
+  git
+  cli
+  mcp
+  upload
+}
+
+enum DbEngine {
+  postgres
+  mysql
+  mongodb
+  redis
+}
+
+enum ServiceStatus {
+  provisioning
+  active
+  sleeping
+  error
+}
+
+enum EnvScope {
+  production
+  preview
+  all
+}
+
+enum DomainKind {
+  subdomain
+  custom
+}
+
+enum ApiKeyScope {
+  read
+  deploy
+  admin
+}
+
+enum ActivityKind {
+  deploy
+  domain
+  database
+  storage
+  git
+  config
+  key
+  alert
+  backup
+  system
+}
+
+enum BackupTrigger {
+  manual
+  auto_pre_deploy
+}
+
+enum MailboxKind {
+  personal
+  shared
+}
+
+// Mail alias routing kinds (plan §4.4 — Cantila Mail aliases). Mirrors
+// the Console's existing alias vocabulary.
+enum MailAliasKind {
+  alias
+  forward
+  catch_all
+  parse
+}
+
+// Phone-number classification for the number marketplace (plan §4.5).
+enum PhoneNumberType {
+  local
+  toll_free
+  mobile
+  short_code
+}
+
+// Lifecycle state of a marketplace number.
+enum MarketplaceNumberStatus {
+  active
+  porting
+  released
+}
+
+// What an inbound call to a number does (plan §4.5 — voice routing).
+enum CallRoutingAction {
+  forward
+  voicemail
+  reject
+  app_webhook
+}
+
+// Which engine an automation Project runs (plan §4.10).
+enum AutomationKind {
+  n8n
+  openclaw
+}
+
+// ----- identity & accounts -----
+
+model Account {
+  id        String   @id @default(cuid())
+  name      String
+  handle    String   @unique
+  plan      Plan     @default(hobby)
+  /// Parent account, when this row is a sub-account under an agency /
+  /// reseller (plan §5.5 — white-label). Top-level accounts leave this
+  /// null. Loose-typed string FK matches the rest of the account-id
+  /// columns in this schema; the cross-account assertion lives at the
+  /// ControlPlane layer (`canActOnAccount`).
+  parentAccountId      String?
+  /// Stripe Customer.id — minted on bootstrap by the Stripe rail
+  /// (plan §8 / §15.1). Indexed so the webhook receiver can find the
+  /// owning tenant by `customer` payload field.
+  stripeCustomerId     String?  @unique
+  stripeSubscriptionId String?
+  /// Per-tenant Anthropic API key (plan §4.3.1). Plaintext in this column
+  /// today; production should encrypt-at-rest with a KMS-backed envelope
+  /// before writing. Never echoed in standard API responses — masked at
+  /// the ControlPlane boundary.
+  anthropicApiKey      String?
+  /// Billing health driven by the dunning state machine (plan §8 /
+  /// §15.2). Defaults to `active` so existing rows backfill cleanly when
+  /// this migration runs — no account is ever silently put in dunning.
+  billingStatus      BillingStatus @default(active)
+  /// Failed-payment count in the current dunning cycle; 0 when healthy.
+  dunningAttempts    Int           @default(0)
+  /// Most recent failed payment (null unless in dunning).
+  dunningFailedAt    DateTime?
+  /// When `past_due` escalates to `suspended` (null unless in dunning).
+  dunningGraceEndsAt DateTime?
+  /// White-label per-account branding (plan §5.5). Optional — when
+  /// absent the Console renders the default Cantila identity. Set by
+  /// the account itself or by its agency parent.
+  /// Hex colour like `#ff7a18` (validated at the ControlPlane layer).
+  brandPrimaryColor  String?
+  /// Secondary accent colour, hex. Optional.
+  brandAccentColor   String?
+  /// Public URL to the brand logo (SVG or PNG). The Console renders
+  /// it in the sidebar mark slot when set.
+  brandLogoUrl       String?
+  /// Display name override for the sidebar / topbar — useful when an
+  /// agency wants the workspace chrome to read "Acme Client A" rather
+  /// than the legal account name.
+  brandDisplayName   String?
+  /// Plan §5.5 — white-label billing-rollup. When set, this account
+  /// does NOT carry its own Stripe subscription; every charge that
+  /// would land on its own subscription (number leases, plan tier
+  /// fees, etc.) is routed to the referenced account's subscription
+  /// instead. Must point at the agency parent (enforced at the
+  /// ControlPlane layer; two-level only, no transitive rollup). Null
+  /// for accounts that pay their own bill. Indexed so the future
+  /// "show me every sub-account on this agency's bill" view hits.
+  billedToAccountId  String?
+  createdAt DateTime @default(now())
+
+  memberships        Membership[]
+  apiKeys            ApiKey[]
+  projects           Project[]
+  registrations      DomainRegistration[]
+  marketplaceNumbers MarketplaceNumber[]
+
+  @@index([parentAccountId])
+  @@index([billedToAccountId])
+}
+
+model User {
+  id               String   @id @default(cuid())
+  email            String   @unique
+  name             String
+  passwordHash     String?
+  twoFactorEnabled Boolean  @default(false)
+  /// The account this user belongs to (plan §5.4) — makes a session a
+  /// real, account-scoped API credential. Nullable for legacy rows.
+  accountId        String?
+  createdAt        DateTime @default(now())
+
+  memberships Membership[]
+  sessions    Session[]
+}
+
+model Membership {
+  id        String   @id @default(cuid())
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  role      Role     @default(developer)
+  createdAt DateTime @default(now())
+
+  @@unique([accountId, userId])
+}
+
+// ----- per-user sessions (plan §5.4 — OIDC/SSO auth) -----
+//
+// A server-side session backing the Console's per-user login. The raw
+// token is returned once at login (and held in a cookie); only its
+// SHA-256 hash is stored — the same one-time-reveal posture ApiKey uses.
+// Additive: the scoped-API-key model is unchanged and keeps working
+// alongside this; sessions gate the Console, keys gate the API.
+
+model Session {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  /// The account the session is currently scoped to (plan §18). One User
+  /// can belong to many Accounts via `Membership`; this records which one
+  /// is active for this session. Null = unscoped (caller has no active
+  /// org, e.g. just-signed-in user with no memberships yet).
+  currentAccountId String?
+
+  @@index([userId])
+}
+
+// ----- invites (plan §5.4 — per-user invite flow) -----
+//
+// A one-time invite for someone to join an Account at a given role.
+// The raw token is returned exactly once at creation and embedded in
+// the accept URL; only its SHA-256 hash is persisted — same one-time-
+// reveal posture as `ApiKey` and `Session`.
+//
+// `status` is loose-typed (string) to keep this migration additive — no
+// new enum is introduced and an out-of-band sweep can write `expired`
+// without a schema change. Valid values: pending / accepted / revoked /
+// expired.
+
+enum InviteStatus {
+  pending
+  accepted
+  revoked
+  expired
+}
+
+model Invite {
+  id                String        @id @default(cuid())
+  accountId         String
+  email             String
+  role              Role          @default(developer)
+  tokenHash         String        @unique
+  status            InviteStatus  @default(pending)
+  invitedByUserId   String?
+  createdAt         DateTime      @default(now())
+  expiresAt         DateTime
+  acceptedAt        DateTime?
+  acceptedByUserId  String?
+
+  @@index([accountId, status])
+  @@index([email])
+}
+
+model ApiKey {
+  id         String      @id @default(cuid())
+  account    Account     @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId  String
+  name       String
+  scope      ApiKeyScope @default(deploy)
+  prefix     String
+  hashedKey  String      @unique
+  lastUsedAt DateTime?
+  createdAt  DateTime    @default(now())
+}
+
+// ----- projects -----
+
+model Project {
+  id        String        @id @default(cuid())
+  account   Account       @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId String
+  slug      String        @unique
+  name      String
+  runtime   Runtime
+  type      ProjectType   @default(web_app)
+  region    Region        @default(fsn1)
+  status    ProjectStatus @default(provisioning)
+  /// Horizontal scaling (plan §5.2). Default 1/1/1 = single instance,
+  /// matching the legacy contract for projects created before this column.
+  desiredInstances Int           @default(1)
+  minInstances     Int           @default(1)
+  maxInstances     Int           @default(1)
+  repoUrl       String?
+  branch        String?
+  autoDeploy    Boolean       @default(false)
+  /// Per-project HMAC secret for verifying incoming git webhook payloads.
+  /// Set by `connectGit`, returned exactly once, rotated via `rotateWebhookSecret`.
+  /// Nullable so projects connected before the migration ran keep working.
+  webhookSecret String?
+  autoSleep  Boolean       @default(true)
+  alwaysOn   Boolean       @default(false)
+  vcpu      Int           @default(1)
+  memoryMb  Int           @default(1024)
+  diskGb    Int           @default(5)
+  /// Plan §4.10 — when set, this project is a Cantila Automations
+  /// instance. The deploy pipeline drops the right engine container in,
+  /// and `/v1/automations/*` reads route off this column.
+  automationKind   AutomationKind?
+  /// Loose JSON bag the automation surfaces use (engine config, ports,
+  /// auth-token rotation state). Stored as JSON so schema doesn't need
+  /// to grow with the engine catalog.
+  automationConfig Json?
+  createdAt DateTime      @default(now())
+
+  deployments     Deployment[]
+  envVars         EnvVar[]
+  domains         Domain[]
+  buckets         StorageBucket[]
+  hostedMailboxes HostedMailbox[]
+  mailAliases     MailAlias[]
+
+  // auto-wired services — one of each, private to this project
+  database    ManagedDatabase?
+  mailbox     Mailbox?
+  phoneNumber PhoneNumber?
+
+  // per-project brain & build outputs (plan §4.9 + complete-builder)
+  messages ProjectMessage[]
+  memory   ProjectMemory?
+  assets   ProjectAsset[]
+
+  // Per-account name uniqueness — the URL `/@handle/<name>` resolves on
+  // this index. Slug remains globally unique (it is the DNS-facing
+  // subdomain). Two accounts may both have a project named "MyApp".
+  @@unique([accountId, name])
+}
+
+model Deployment {
+  id            String        @id @default(cuid())
+  project       Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId     String
+  status        DeployStatus  @default(queued)
+  trigger       DeployTrigger
+  runtime       Runtime
+  commitHash    String?
+  commitMessage String?
+  branch        String?
+  /// Set when this deployment is a branch preview (plan §5.1). Lives at
+  /// {slug}-{previewBranch}.cantila.app; does not supersede production.
+  previewBranch String?
+  imageRef      String?
+  nodeId        String?
+  url           String?
+  logs          String[]      @default([])
+  durationSec   Int           @default(0)
+  createdAt     DateTime      @default(now())
+}
+
+// ----- auto-wired services (one per project) -----
+
+model ManagedDatabase {
+  id            String        @id @default(cuid())
+  project       Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId     String        @unique
+  engine        DbEngine      @default(postgres)
+  version       String
+  region        Region
+  status        ServiceStatus @default(provisioning)
+  sizeGb        Int           @default(10)
+  // connection URI — stored encrypted at rest, never returned in plaintext
+  connectionUri String
+  createdAt     DateTime      @default(now())
+}
+
+model Mailbox {
+  id            String        @id @default(cuid())
+  project       Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId     String        @unique
+  address       String
+  sendingDomain String
+  smtpHost      String
+  smtpUser      String
+  // SMTP password — stored encrypted at rest
+  smtpPassword  String
+  status        ServiceStatus @default(provisioning)
+  createdAt     DateTime      @default(now())
+}
+
+model PhoneNumber {
+  id        String        @id @default(cuid())
+  project   Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String        @unique
+  e164      String        @unique
+  region    Region
+  status    ServiceStatus @default(provisioning)
+  // SMS API key — stored encrypted at rest
+  apiKey    String
+  /// Capabilities as a comma-separated list, e.g. "sms,mms,voice" (plan §4.5).
+  capabilities String @default("sms,mms,voice")
+  // Inbound-call routing (plan §4.5). Defaults to voicemail.
+  callRoutingAction CallRoutingAction @default(voicemail)
+  callRoutingTarget String?
+  createdAt DateTime      @default(now())
+}
+
+/// An inbound mail message received on one of the project's sending
+/// domains (plan §4.4 — two-way mail). Persisted message history; an
+/// append-only log keyed by accountId / projectId (no FK relation, same
+/// shape as `InboundMessage`), distinct from the bounded in-memory mail
+/// event ring which keeps only rollup telemetry.
+model InboundMail {
+  id                String   @id @default(cuid())
+  accountId         String
+  projectId         String
+  /// The Cantila address the message was delivered to.
+  toAddress         String
+  /// The external sender's address.
+  fromAddress       String
+  subject           String
+  body              String
+  /// MTA-side message id (RFC 5322 Message-ID when present).
+  providerMessageId String
+  /// The `MailAlias.id` that matched `toAddress`, when one did. Absent
+  /// when the message landed directly on a `HostedMailbox` address.
+  matchedAliasId    String?
+  /// Copy of the alias's `target` at receive time — preserves the audit
+  /// trail through alias edits afterward.
+  routedTo          String?
+  receivedAt        DateTime @default(now())
+
+  @@index([projectId, receivedAt])
+  @@index([accountId, receivedAt])
+}
+
+/// An inbound SMS message received on a project's phone number (plan
+/// §4.5 — two-way SMS). Persisted message history; an append-only log
+/// keyed by accountId / projectId (no FK relation, like ActivityEvent),
+/// distinct from the bounded in-memory SMS event ring.
+model InboundMessage {
+  id                String   @id @default(cuid())
+  accountId         String
+  projectId         String
+  /// The Cantila number the message was received on, E.164.
+  toE164            String
+  /// The external sender, E.164.
+  fromE164          String
+  body              String
+  /// Recognised compliance keyword (stop / start / help), when present.
+  keyword           String?
+  /// Carrier-side message id.
+  providerMessageId String
+  receivedAt        DateTime @default(now())
+
+  @@index([projectId, receivedAt])
+  @@index([accountId, receivedAt])
+}
+
+/// An inbound voice call received on a project's phone number (plan §4.5
+/// — two-way voice). Persisted call history; an append-only log keyed by
+/// accountId / projectId (no FK relation), the voice counterpart of
+/// `InboundMessage`.
+model InboundCallRecord {
+  id             String   @id @default(cuid())
+  accountId      String
+  projectId      String
+  /// The Cantila number the call came in on, E.164.
+  toE164         String
+  /// The external caller, E.164.
+  fromE164       String
+  /// Carrier-side call id.
+  providerCallId String
+  /// The routing action Cantila applied (forward / voicemail / reject / app_webhook).
+  routingAction  String
+  receivedAt     DateTime @default(now())
+
+  @@index([projectId, receivedAt])
+  @@index([accountId, receivedAt])
+}
+
+/// Durable SMS telemetry events (plan §4.5) — the persisted backing for
+/// the control plane's in-memory SMS event ring, so SMS deliverability
+/// history survives a restart. Append-only; the in-memory ring is bounded
+/// and rehydrated from the most recent rows on startup.
+model SmsEvent {
+  id            String   @id @default(cuid())
+  at            DateTime
+  kind          String
+  projectId     String
+  accountId     String
+  phoneNumberId String
+  fromE164      String
+  messageId     String
+  toMasked      String
+
+  @@index([at])
+  @@index([accountId, at])
+}
+
+/// Durable mail telemetry events (plan §4.4) — the persisted backing for
+/// the control plane's in-memory mail event ring, so mail deliverability
+/// history survives a restart. Append-only; the in-memory ring is bounded
+/// and rehydrated from the most recent rows on startup. Same posture as
+/// `SmsEvent` above.
+model MailEvent {
+  id             String   @id @default(cuid())
+  at             DateTime
+  kind           String
+  projectId      String
+  accountId      String
+  mailboxId      String
+  mailboxAddress String
+  sendingDomain  String
+  messageId      String
+  toMasked       String
+
+  @@index([at])
+  @@index([accountId, at])
+  @@index([sendingDomain, at])
+}
+
+/// Durable OTP challenges (plan §4.5) — the persisted backing for the
+/// control plane's in-memory challenge map, so an in-flight verification
+/// survives a restart. The control-plane TTL sweep prunes expired rows.
+/// `codeHash` is a salted SHA-256 — the OTP code itself is never stored.
+model OtpChallenge {
+  id          String   @id
+  projectId   String
+  accountId   String
+  phone       String
+  phoneMasked String
+  purpose     String
+  codeHash    String
+  createdAt   DateTime
+  expiresAt   DateTime
+  attempts    Int      @default(0)
+  status      String
+
+  @@index([createdAt])
+}
+
+// ----- networking & config -----
+
+model Domain {
+  id        String     @id @default(cuid())
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  hostname  String     @unique
+  kind      DomainKind @default(subdomain)
+  sslActive Boolean    @default(false)
+  primary   Boolean    @default(false)
+  createdAt DateTime   @default(now())
+}
+
+// ----- registrar -----
+//
+// A domain Cantila has registered on the account's behalf (plan §4.7).
+// Separate from `Domain` (which is "this hostname is attached to this
+// project"). One Account → many DomainRegistrations.
+
+model DomainRegistration {
+  id                  String   @id @default(cuid())
+  account             Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId           String
+  hostname            String   @unique
+  tld                 String
+  pricePerYearCents   Int
+  expiresAt           DateTime
+  whoisPrivacy        Boolean  @default(true)
+  autoRenew           Boolean  @default(true)
+  attachedProjectId   String?
+  createdAt           DateTime @default(now())
+}
+
+model EnvVar {
+  id        String   @id @default(cuid())
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  key       String
+  // value — encrypted at rest when `secret` is true
+  value     String
+  secret    Boolean  @default(false)
+  scope     EnvScope @default(all)
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, key, scope])
+}
+
+model StorageBucket {
+  id         String   @id @default(cuid())
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId  String
+  name       String   @unique
+  region     Region
+  publicRead Boolean  @default(false)
+  cdn        Boolean  @default(false)
+  // Logical counters — production fills these from object-store telemetry.
+  objects    Int      @default(0)
+  sizeGb     Int      @default(0)
+  createdAt  DateTime @default(now())
+}
+
+// ----- hosted mailboxes (plan §4.4 — Cantila Mail) -----
+//
+// A real inbox a person uses (you@yourdomain.com) — distinct from the
+// auto-wired transactional `Mailbox` above, which is a project's SMTP
+// service. A project can own many hosted mailboxes; they are created and
+// removed through the mailbox CRUD endpoints (not the deploy pipeline).
+
+model HostedMailbox {
+  id          String        @id @default(cuid())
+  project     Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId   String
+  address     String        @unique
+  displayName String
+  kind        MailboxKind   @default(personal)
+  quotaMb     Int           @default(10240)
+  usedMb      Int           @default(0)
+  status      ServiceStatus @default(provisioning)
+  createdAt   DateTime      @default(now())
+
+  @@index([projectId])
+}
+
+// ----- mail aliases (plan §4.4 — routing rules) -----
+//
+// A mail forwarding / alias rule. Mail to `address` is routed to `target`
+// by the MTA, with semantics determined by `kind`. Project-scoped — the
+// alias's hostname must match the project's sending domain (or be
+// `*@<domain>` for catch-all). The real MTA does not exist yet (plan
+// §15.2); today this records the rule the future MTA will honor.
+
+model MailAlias {
+  id          String        @id @default(cuid())
+  project     Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId   String
+  address     String        @unique
+  target      String
+  kind        MailAliasKind @default(alias)
+  active      Boolean       @default(true)
+  description String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@index([projectId])
+}
+
+// ----- mail sending-IP pools (plan §4.4 — IP-pool rotation) -----
+//
+// Account-scoped pools the future MTA reads to decide which sending
+// IP a given outbound message rides through. `ips` is a comma-separated
+// list of IPv4 addresses (synthetic in the prototype). Exactly one
+// pool per account is marked `isDefault` — the CP enforces single-default
+// at write time.
+
+enum MailIpPoolKind {
+  warmup
+  main
+  transactional
+  marketing
+}
+
+model MailIpPool {
+  id          String         @id @default(cuid())
+  accountId   String
+  name        String
+  kind        MailIpPoolKind @default(main)
+  /// Comma-separated IPv4 list; the real MTA reads from the cloud
+  /// allocator and writes back here on resize.
+  ips         String         @default("")
+  reputation  Int            @default(50)
+  active      Boolean        @default(true)
+  isDefault   Boolean        @default(false)
+  description String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@index([accountId])
+}
+
+/// What kind of node this row represents. `managed` is provisioned and
+/// owned by Cantila; `byo` was supplied by a tenant via Bring-Your-Own-VPS
+/// (plan §5.5).
+enum NodeKind {
+  managed
+  byo
+}
+
+/// Lifecycle of a Node — pending → active → (degraded/offline) → retired.
+enum NodeStatus {
+  pending
+  active
+  degraded
+  offline
+  retired
+}
+
+/// A compute node the control plane can schedule workloads on (plan §5.5
+/// — Bring-Your-Own-VPS). BYO nodes are enrolled by the tenant via a
+/// one-time token; the node-agent on the box presents the raw token to
+/// flip the row to `active` and to heartbeat. Account-scoped; loose
+/// `accountId` FK (matches `ApiKey.accountId` / `MailIpPool.accountId`).
+model Node {
+  id                    String     @id @default(cuid())
+  accountId             String
+  kind                  NodeKind   @default(byo)
+  label                 String
+  region                String
+  host                  String     @default("")
+  sshUser               String     @default("root")
+  /// SHA-256 hash of the one-time enrollment token. The raw value is
+  /// returned exactly once at mint and never persisted.
+  enrollmentTokenHash   String
+  /// Visible prefix of the enrollment token (e.g. "ctn_a1b2…"). Helps
+  /// an operator recognise their own pending token without revealing
+  /// the secret.
+  enrollmentTokenPrefix String
+  publicKeyFingerprint  String?
+  capacityInstances     Int        @default(16)
+  status                NodeStatus @default(pending)
+  reportedInstances     Int?
+  reportedLoadPct       Int?
+  enrolledAt            DateTime?
+  lastHeartbeatAt       DateTime?
+  retiredAt             DateTime?
+  createdAt             DateTime   @default(now())
+
+  @@index([accountId])
+  @@index([enrollmentTokenHash])
+}
+
+/// A phone number an account bought through the Cantila SMS number
+/// marketplace (plan §4.5). Account-owned, billable, with a lifecycle —
+/// distinct from the auto-wired per-project `PhoneNumber`.
+model MarketplaceNumber {
+  id                String                  @id @default(cuid())
+  account           Account                 @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId         String
+  e164              String                  @unique
+  country           String
+  numberType        PhoneNumberType
+  /// Capabilities as a comma-separated list, e.g. "sms,mms,voice".
+  capabilities      String
+  setupPriceCents   Int
+  monthlyPriceCents Int
+  status            MarketplaceNumberStatus @default(active)
+  /// Carrier-side id from the TelephonyProvider.
+  providerId        String
+  /// Optional project the number is assigned to.
+  projectId         String?
+  /// Stripe SubscriptionItem id billing the recurring monthly lease.
+  stripeSubscriptionItemId String?
+  purchasedAt       DateTime                @default(now())
+  releasedAt        DateTime?
+
+  @@index([accountId])
+}
+
+// ----- A2P/10DLC carrier registration (plan §4.5) -----
+//
+// Brand + campaign records the operator submits to The Campaign
+// Registry via a carrier or aggregator before US A2P SMS is allowed
+// at scale. Loose-JSON payload because brand and campaign fields
+// differ; the CP enforces required keys per kind at create time.
+
+enum A2pRegistrationKind {
+  brand
+  campaign
+}
+
+enum A2pRegistrationStatus {
+  draft
+  submitted
+  in_review
+  approved
+  rejected
+  hold
+}
+
+model A2pRegistration {
+  id                     String                @id @default(cuid())
+  accountId              String
+  kind                   A2pRegistrationKind
+  name                   String
+  status                 A2pRegistrationStatus @default(draft)
+  /// For campaigns — the brand `A2pRegistration.id` they belong to.
+  brandRegistrationId    String?
+  /// Regulatory metadata (legal name + EIN for brand; use case + sample
+  /// messages + opt-in flow for campaign). Stored as JSON so the field
+  /// set can grow without a schema change.
+  payload                Json
+  /// Carrier-side TCR id, once the submission is acknowledged.
+  providerRegistrationId String?
+  rejectionReason        String?
+  createdAt              DateTime              @default(now())
+  submittedAt            DateTime?
+  resolvedAt             DateTime?
+
+  @@index([accountId, kind])
+  @@index([accountId, status])
+}
+
+// ----- data plane -----
+
+// ----- activity feed -----
+//
+// Every mutating operation in the ControlPlane records a row here. The
+// Console reads it for the dashboard activity widget and the /activity
+// page (plan §4.8).
+
+model ActivityEvent {
+  id             String       @id @default(cuid())
+  accountId      String
+  kind           ActivityKind
+  title          String
+  detail         String
+  projectId      String?
+  // Plan §5.5 — white-label audit. Only present when an agency
+  // parent took the action against a sub-account (actor ≠ target).
+  // Legacy rows backfill to NULL — meaning "the account itself".
+  actorAccountId String?
+  at             DateTime     @default(now())
+
+  @@index([accountId, at])
+  @@index([actorAccountId])
+}
+
+// ----- agent brain journal (plan §4.9 — continuous learning) -----
+//
+// Durable record of every action the AgentBrain has taken. Replaces the
+// brain's in-memory `actions` ring as the source of truth for the
+// learning loop's success-rate math — so a process restart doesn't wipe
+// what the brain has learned about its own track record.
+//
+// `verified` advances from "pending" (post-check scheduled) to "ok" /
+// "failed" once the verifier runs. Indexed on `at` (descending reads
+// for the snapshot) and on `(agent, kind)` (grouping for buildLearnings).
+
+model AgentAction {
+  /// Proposal id — natural key; one record per executed proposal. Unique
+  /// so updateAgentActionVerification can upsert the post-check result
+  /// keyed by it.
+  proposalId      String   @id
+  agent           String
+  kind            String
+  title           String
+  outcome         String
+  detail          String
+  verified        String   @default("n_a")
+  verifiedAt      DateTime?
+  verifyDetail    String?
+  resultProjectId String?
+  at              DateTime @default(now())
+
+  @@index([at])
+  @@index([agent, kind])
+}
+
+// ----- backups (plan §5.5) -----
+//
+// Point-in-time project snapshots — captures the live deployment id at
+// the moment of backup plus a copy of every env var, so restore is a
+// rollback of the deployment AND a re-application of the configuration
+// that was paired with it.
+
+model Backup {
+  id                 String        @id @default(cuid())
+  projectId          String
+  accountId          String
+  deploymentId       String
+  /// JSON-serialised array of { key, value, secret, scope }. Stored as
+  /// JSON so the snapshot survives env-var deletion/edits on the project.
+  envVarsJson        Json
+  databaseSnapshotId String?
+  note               String?
+  trigger            BackupTrigger @default(manual)
+  createdAt          DateTime      @default(now())
+
+  @@index([projectId, createdAt])
+  @@index([accountId, createdAt])
+}
+
+// ----- per-project brain & build outputs (complete-builder) -----
+//
+// Each project keeps its own chat thread + rolling summary + asset
+// gallery. The orchestrator reads `ProjectMemory.summary` plus the last
+// ~N `ProjectMessage` rows as the prompt context, so subsequent chats
+// stay token-cheap (Anthropic prompt cache) while preserving the full
+// history persistently. `ProjectAsset` holds every generated image /
+// animation / copy artefact, with a workspace-relative path that the
+// build pipeline picks up at deploy time.
+
+enum ProjectMessageRole {
+  user
+  agent
+  system
+  tool
+}
+
+enum ProjectMessageKind {
+  message
+  op_card
+  result
+  asset
+}
+
+model ProjectMessage {
+  id        String              @id @default(cuid())
+  project   Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  role      ProjectMessageRole
+  /// Specialist agent or skill that emitted this row, when not the user
+  /// (e.g. "deploy", "scale", "generate_image", "orchestrator").
+  agent     String?
+  kind      ProjectMessageKind  @default(message)
+  content   String
+  /// Free-form bag for op cards: { opKey, status, detail, deploymentId,
+  /// assetId, thumbnailUrl, ... }. Renderer reads this to pick the right
+  /// card variant.
+  metadata  Json?
+  createdAt DateTime            @default(now())
+
+  @@index([projectId, createdAt])
+}
+
+model ProjectMemory {
+  /// One row per project — projectId is both PK and FK.
+  projectId               String   @id
+  project                 Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// Rolling LLM-written summary of the project so far. Acts as the
+  /// cached prompt prefix (cache_control: ephemeral) so each new turn
+  /// re-uses the same prefix and only pays for the delta.
+  summary                 String   @default("")
+  /// The most recent ProjectMessage.id collapsed into `summary`. The
+  /// summarizer only walks rows newer than this when it next runs.
+  lastSummarizedMessageId String?
+  /// Approximate token count of `summary` (informational, helps the
+  /// Brain panel show how much of the context window the cache eats).
+  tokenCount              Int      @default(0)
+  updatedAt               DateTime @updatedAt
+}
+
+enum ProjectAssetKind {
+  image
+  icon
+  lottie
+  css_anim
+  video
+  copy
+  file
+}
+
+model ProjectAsset {
+  id        String           @id @default(cuid())
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  kind     ProjectAssetKind
+  /// Workspace-relative path, e.g. `public/logo.png`. The build pipeline
+  /// picks the file up from `runtime/projects/<projectId>/workspace/`.
+  path     String
+  mimeType String
+  width    Int?
+  height   Int?
+  /// The prompt that produced the asset (when generated). Used by the
+  /// AssetGallery so the user can see what was asked for, and by the
+  /// orchestrator if a follow-up regenerates with a tweak.
+  prompt   String?
+  /// Which provider produced it: "stub", "replicate", "anthropic-svg",
+  /// "anthropic-lottie", "fal", etc.
+  provider String           @default("stub")
+  sizeBytes Int             @default(0)
+  createdAt DateTime        @default(now())
+
+  @@index([projectId, createdAt])
+  @@index([projectId, kind])
+}

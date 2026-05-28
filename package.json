@@ -1,0 +1,32 @@
+{
+  "name": "cantila-control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cantila control plane — the API, deploy pipeline and MCP server behind the Cantila hosting cloud.",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "mcp": "tsx src/mcp/index.ts",
+    "build": "prisma generate && tsc",
+    "start": "node dist/index.js",
+    "postinstall": "prisma generate",
+    "typecheck": "tsc --noEmit",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.98.0",
+    "@prisma/client": "5.22.0",
+    "fastify": "4.28.1",
+    "stripe": "^22.1.1",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.16.11",
+    "prisma": "5.22.0",
+    "tsx": "4.19.1",
+    "typescript": "5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

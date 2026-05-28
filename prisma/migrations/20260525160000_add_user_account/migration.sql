@@ -1,0 +1,21 @@
+-- ============================================================
+-- DRAFT MIGRATION — add_user_account (plan §5.4 — session API auth)
+--
+-- Hand-authored and NOT yet verified by `prisma migrate`. Adds a
+-- nullable `accountId` column to the existing `User` table so a
+-- Console session resolves to an account and becomes a real,
+-- account-scoped API credential.
+--
+-- Purely additive: the column is nullable, so every existing `User`
+-- row backfills to NULL (readers fall back to the default account).
+-- No FK constraint is added — the column is a plain account-id string,
+-- the same shape `ApiKey.accountId` already uses.
+--
+-- Before shipping, run `prisma migrate dev` (or `prisma db push`) +
+-- `prisma generate`, then `tsc` the control plane so the generated
+-- client picks up `User.accountId`. See the earlier draft migrations
+-- for the same caveats.
+-- ============================================================
+
+-- AlterTable
+ALTER TABLE "User" ADD COLUMN "accountId" TEXT;

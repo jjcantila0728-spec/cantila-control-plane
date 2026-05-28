@@ -1,0 +1,3346 @@
+/* ============================================================
+   Cantila control plane — HTTP API server.
+   A thin Fastify transport over the shared ControlPlane service.
+   ============================================================ */
+
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import { z } from "zod";
+import { config } from "./config";
+import { createStore } from "./domain/create-store";
+import { stubProvisioner } from "./dataplane/stub";
+import { selectDataPlane } from "./dataplane/factory";
+import { ControlPlane } from "./core/control-plane";
+import type { ApiKey } from "./domain/types";
+import { now } from "./lib/ids";
+import { setRequestContext } from "./lib/request-context";
+import { McpServer } from "./mcp/server";
+import { cantilaTools } from "./mcp/tools";
+import { StubStripeAdapter, type StripeAdapter } from "./billing/stripe";
+import { StripeRealAdapter } from "./billing/stripe-real";
+import { RuleBasedAiAnalyser } from "./ai/analyser";
+import { ClaudeAiAnalyser } from "./ai/claude";
+import { buildDeployPlanner } from "./ai/deploy-planner";
+import { buildImageProvider } from "./skills/image-provider";
+import { ProjectOrchestrator } from "./agents/project-orchestrator";
+import { buildDefaultRegistry } from "./automations/registry";
+import { registerAutomationRoutes } from "./automations/routes";
+import { registerConnectionRoutes } from "./connections/routes";
+
+/** The default account used when CANTILA_REQUIRE_AUTH is off — keeps the
+ *  no-auth dev story identical to v1.3 (the Console / CLI both work without
+ *  ever touching keys). With auth on, the caller's key is authoritative
+ *  and this constant is never read. */
+const DEFAULT_ACCOUNT_ID = "acc_demo";
+
+// Stripe adapter — auto-selects on `STRIPE_SECRET_KEY` presence (plan
+// §15.1). When set, the real Stripe-SDK-backed adapter is wired and
+// model spend lands on real customers/subscriptions. Without the key,
+// the stub adapter mints deterministic fake ids so the rail is
+// exercised end-to-end without an internet connection. The webhook
+// signing secret defaults to the stub's fixed value so the smoke test
+// keeps working when STRIPE_SECRET_KEY is unset.
+const stripe: StripeAdapter = process.env.STRIPE_SECRET_KEY
+  ? new StripeRealAdapter({
+      secretKey: process.env.STRIPE_SECRET_KEY,
+      webhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
+    })
+  : new StubStripeAdapter();
+
+// AI analyser — auto-selects (plan §5.6 / §15.1). When `ANTHROPIC_API_KEY`
+// is set the Claude-backed analyser is wired with the rule-based one as
+// its fallback (any LLM error degrades to rule-based, not "broken").
+// Without the key the rule-based analyser runs standalone.
+const ruleBased = new RuleBasedAiAnalyser();
+const aiAnalyser = process.env.ANTHROPIC_API_KEY
+  ? new ClaudeAiAnalyser({ fallback: ruleBased })
+  : ruleBased;
+
+const store = createStore();
+
+// Data plane — auto-selects on COOLIFY_API_URL + COOLIFY_API_TOKEN +
+// COOLIFY_SERVER_UUID + COOLIFY_PROJECT_UUID (plan §19). Without all
+// four, the stub data plane runs and the deploy pipeline simulates
+// builds locally — same offline contract as v1.3.
+const dataPlaneSelection = selectDataPlane();
+const dataPlane = dataPlaneSelection.dataPlane;
+console.log(`[dataplane] ${dataPlaneSelection.label} (${dataPlaneSelection.live ? "live" : "stub"})`);
+
+// Cantila Automations (plan §4.10) — engine adapter registry. Phase A
+// ships stubs for both kinds; Phase B + D swap in `N8nEngineAdapter` and
+// `OpenClawEngineAdapter` when their env vars are set.
+const engineRegistry = buildDefaultRegistry();
+
+/** In-process secrets store backing Cantila Connections (plan §4.11).
+ *  Phase A placeholder for the real secrets manager — connection routes
+ *  write through it, the credential broker (plan §15.5 Phase F) reads
+ *  through it to push real bytes into engines. Shared at module scope
+ *  so writes from `/v1/connections` are visible to the broker. */
+const connectionSecrets = new Map<string, Record<string, string>>();
+const writeConnectionSecret = async (
+  ref: string,
+  payload: Record<string, string>,
+): Promise<void> => {
+  connectionSecrets.set(ref, payload);
+};
+const readConnectionSecret = async (
+  ref: string,
+): Promise<Record<string, string> | null> => {
+  return connectionSecrets.get(ref) ?? null;
+};
+
+const cp = new ControlPlane({
+  store,
+  provisioner: stubProvisioner,
+  dataPlane,
+  stripe,
+  aiAnalyser,
+  engineRegistry,
+  resolveSecret: readConnectionSecret,
+});
+
+// Per-project agent team (plan: complete-builder). Auto-selects an LLM
+// planner + image provider based on env (ANTHROPIC_API_KEY,
+// REPLICATE_API_TOKEN). Without either, the orchestrator runs entirely
+// on deterministic stubs so every flow is exercisable offline.
+const deployPlanner = buildDeployPlanner();
+const imageProvider = buildImageProvider();
+const projectOrchestrator = new ProjectOrchestrator({
+  cp,
+  planner: deployPlanner,
+  images: imageProvider,
+});
+
+// Remote MCP server (plan §4.3.2 — "Cantila publishes a remote MCP
+// server"). Shares the same ControlPlane instance the HTTP API uses, so
+// stdio + remote + Console all read and write the same store. The same
+// `McpServer` class powers both transports — see `src/mcp/server.ts`.
+const mcpServer = new McpServer({ name: "cantila", version: "0.1.0" });
+for (const tool of cantilaTools(cp)) mcpServer.addTool(tool);
+
+const app = Fastify({ logger: true });
+
+/* ----- Raw-body capture for webhook HMAC verification.
+ *
+ * Fastify parses application/json and hands the route the parsed object;
+ * the original bytes are lost. For signature checks we MUST hash the
+ * exact bytes the sender hashed — re-serialising the parsed JSON would
+ * not match (key ordering, whitespace, escaping). So we register a
+ * custom JSON parser that stashes the raw text on `req.rawBody` before
+ * delegating to the default parser.
+ * ----- */
+
+app.addContentTypeParser(
+  "application/json",
+  { parseAs: "string" },
+  (req, body, done) => {
+    (req as unknown as { rawBody: string }).rawBody =
+      typeof body === "string" ? body : body.toString("utf8");
+    if (!body || (typeof body === "string" && body.length === 0)) {
+      done(null, {});
+      return;
+    }
+    try {
+      const parsed = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
+      done(null, parsed);
+    } catch (err) {
+      done(err as Error, undefined);
+    }
+  },
+);
+
+function rawBodyOf(req: FastifyRequest): string {
+  return (req as unknown as { rawBody?: string }).rawBody ?? "";
+}
+
+/* ----- CORS — allow the Console (Next.js dev server) to call this ----- */
+
+app.addHook("onRequest", async (req, reply) => {
+  reply.header("access-control-allow-origin", "*");
+  reply.header("access-control-allow-methods", "GET,POST,PUT,DELETE,OPTIONS");
+  reply.header("access-control-allow-headers", "content-type,authorization");
+  if (req.method === "OPTIONS") {
+    return reply.code(204).send();
+  }
+});
+
+/* ----- Auth gate (plan §5.4)
+ *
+ *   Resolution runs on every request — if a Bearer key is supplied and
+ *   valid, it is attached to the request as `req.apiKey`. Downstream route
+ *   handlers read it via `resolveAccountId(req)` to scope queries to the
+ *   caller's account.
+ *
+ *   Enforcement only kicks in when CANTILA_REQUIRE_AUTH=true. When on:
+ *     - GET /v1/health, GET /v1/me, OPTIONS are always allowed.
+ *     - GET routes require an API key of any scope.
+ *     - Mutating routes (POST/PUT/PATCH/DELETE) require `deploy` or `admin`.
+ *     - API-key management (/v1/api-keys, /v1/me) requires `admin`.
+ *
+ *   Project-scoped routes additionally call `assertProjectAccess` so a key
+ *   for account A cannot operate on a project owned by account B.
+ * ----- */
+
+const EXEMPT_PATHS = new Set(["/v1/health"]);
+
+function scopeAllows(
+  scope: "read" | "deploy" | "admin",
+  method: string,
+  url: string,
+): boolean {
+  if (url.startsWith("/v1/api-keys")) return scope === "admin";
+  const isWrite = method !== "GET" && method !== "HEAD";
+  if (!isWrite) return true; // any scope can read
+  return scope === "deploy" || scope === "admin";
+}
+
+/** A resolved Console session attached to a request — the session-token
+ *  equivalent of `req.apiKey` (plan §5.4). Makes a logged-in user's
+ *  session a first-class, account-scoped API credential.
+ *
+ *  Plan §18 — Option B: `accountId` is sourced from `Session.currentAccountId`
+ *  (the org the user is currently scoped to), with a legacy fallback to
+ *  `AuthUser.accountId`. `sessionId` is exposed so the org-switcher route
+ *  knows which session row to update. */
+interface SessionAuth {
+  userId: string;
+  accountId: string;
+  sessionId: string;
+}
+
+// Always-on hook: resolve whatever credential the caller supplied.
+//   - `Bearer ctk_…` — a scoped API key → attached as `req.apiKey`.
+//   - `Bearer cts_…` — a Console session → attached as `req.session`.
+// Never rejects — enforcement is the next hook's job. A header that is
+// present but doesn't validate is recorded as an `invalid_key` failure so
+// SecurityAgent can spot brute-force probing even when enforcement is off.
+app.addHook("onRequest", async (req) => {
+  if (req.method === "OPTIONS") return;
+  const auth = typeof req.headers.authorization === "string"
+    ? req.headers.authorization
+    : undefined;
+  if (!auth) return;
+  const m = /^Bearer\s+(\S+)$/i.exec(auth);
+  const token = m ? m[1] : undefined;
+
+  // A `cts_` Bearer token is a Console session — resolve it to the
+  // signed-in user's account and attach it as `req.session`.
+  if (token && token.startsWith("cts_")) {
+    const resolved = await cp.resolveSession(token);
+    if (resolved) {
+      (req as unknown as { session?: SessionAuth }).session = {
+        userId: resolved.user.id,
+        // Plan §18 — Option B: prefer the session's current active org;
+        // fall back to the legacy AuthUser.accountId for pre-§18 sessions,
+        // and to DEFAULT_ACCOUNT_ID only as a last resort (only reachable
+        // when CANTILA_REQUIRE_AUTH=off).
+        accountId:
+          resolved.currentAccountId ??
+          resolved.user.accountId ??
+          DEFAULT_ACCOUNT_ID,
+        sessionId: resolved.sessionId,
+      };
+      return;
+    }
+    cp.recordAuthFailure({
+      reason: "invalid_key",
+      method: req.method,
+      route: req.url.split("?")[0],
+      keyPrefix: token.slice(0, 12),
+    });
+    return;
+  }
+
+  // Otherwise — a scoped API key (`ctk_`).
+  const key = await cp.authenticate(auth);
+  if (key) {
+    (req as unknown as { apiKey?: ApiKey }).apiKey = key;
+    return;
+  }
+  // Header was present but didn't resolve — surface the prefix (first 12
+  // chars, max) so a burst can be attributed.
+  cp.recordAuthFailure({
+    reason: "invalid_key",
+    method: req.method,
+    route: req.url.split("?")[0],
+    keyPrefix: token ? token.slice(0, 12) : undefined,
+  });
+});
+
+/* ----- X-Cantila-Act-As — sub-account impersonation (plan §5.5).
+ *
+ *   An agency parent can scope a single request to one of its
+ *   sub-accounts by sending `X-Cantila-Act-As: <accountId-or-handle>`.
+ *   This hook resolves the header, checks `cp.canActOnAccount(caller,
+ *   target)`, and attaches `req.actAs = <targetAccountId>` on success.
+ *   Downstream code reads it via `resolveAccountId(req)`, which prefers
+ *   `req.actAs` over the caller's own account.
+ *
+ *   Safety:
+ *    - Without an authenticated credential (API key or session), the
+ *      header is rejected (401). You cannot impersonate without first
+ *      proving who you are.
+ *    - `canActOnAccount` already implements the rule: the caller must
+ *      either BE the target or be its agency parent. A wider grant
+ *      model (delegated admin, team-membership-across-tenants) is a
+ *      future drop that swaps the check without changing call sites.
+ *    - Failures are recorded as `cross_account` so SecurityAgent can
+ *      detect impersonation probing.
+ * ----- */
+app.addHook("onRequest", async (req, reply) => {
+  if (req.method === "OPTIONS") return;
+  const raw = req.headers["x-cantila-act-as"];
+  const headerValue = typeof raw === "string" ? raw.trim() : "";
+  if (!headerValue) return;
+
+  const key = getApiKey(req);
+  const session = getSessionAuth(req);
+  const callerAccountId = key?.accountId ?? session?.accountId;
+  if (!callerAccountId) {
+    cp.recordAuthFailure({
+      reason: "no_credentials",
+      method: req.method,
+      route: req.url.split("?")[0],
+    });
+    return reply.code(401).send({
+      error:
+        "X-Cantila-Act-As requires an authenticated API key or session token",
+    });
+  }
+
+  // Resolve target by id or handle. An `acc_…` prefix is treated as an
+  // id; anything else is a handle lookup. Handle resolution is a single
+  // DB read; falling back to id resolution lets a caller pass either.
+  let targetId = headerValue;
+  if (!headerValue.startsWith("acc_")) {
+    const byHandle = await cp.findAccountByHandle(headerValue);
+    if (!byHandle) {
+      return reply.code(404).send({
+        error: `act-as target '${headerValue}' not found`,
+      });
+    }
+    targetId = byHandle.id;
+  } else {
+    // Confirm the id exists so we 404 here rather than letting downstream
+    // routes return a more confusing error.
+    const byId = await cp.getAccount(targetId);
+    if (!byId) {
+      return reply.code(404).send({
+        error: `act-as target '${headerValue}' not found`,
+      });
+    }
+  }
+
+  if (!(await cp.canActOnAccount(callerAccountId, targetId))) {
+    cp.recordAuthFailure({
+      reason: "cross_account",
+      method: req.method,
+      route: req.url.split("?")[0],
+      keyPrefix: key?.prefix,
+      accountId: callerAccountId,
+    });
+    return reply.code(403).send({
+      error: `you cannot act as account '${targetId}' from '${callerAccountId}'`,
+    });
+  }
+
+  (req as unknown as { actAs?: string }).actAs = targetId;
+});
+
+/* ----- Per-request audit context (plan §5.5).
+ *
+ *   Sets the request's `actorAccountId` / `sessionUserId` on the
+ *   ambient AsyncLocalStorage store so every `recordEvent` call
+ *   downstream — across the deep ControlPlane call graph — can stamp
+ *   "done by <actor>" without explicit threading. The actor is only
+ *   meaningful when it differs from the target account; recordEvent
+ *   suppresses the stamp when actor == target.
+ *
+ *   Runs after the credential-resolution + act-as hooks so all three
+ *   `req.apiKey` / `req.session` / `req.actAs` slots are populated.
+ *   Fastify executes this hook in the same async chain as the route
+ *   handler, so `setRequestContext` (via AsyncLocalStorage.enterWith)
+ *   propagates to every awaited call beneath it.
+ * ----- */
+app.addHook("onRequest", async (req) => {
+  if (req.method === "OPTIONS") return;
+  const key = getApiKey(req);
+  const session = getSessionAuth(req);
+  // The actor is the caller's true account — ignore any act-as
+  // override. For an X-Cantila-Act-As request this is the parent;
+  // for a normal request it's just the caller (recordEvent then
+  // notices actor == target and stamps nothing).
+  const actorAccountId = key?.accountId ?? session?.accountId;
+  setRequestContext({
+    actorAccountId,
+    sessionUserId: session?.userId,
+  });
+});
+
+if (config.requireAuth) {
+  app.addHook("onRequest", async (req, reply) => {
+    if (req.method === "OPTIONS") return;
+    const url = req.url.split("?")[0];
+    if (EXEMPT_PATHS.has(url)) return;
+    // /v1/auth/* — per-user login, SSO, session and logout. These can't
+    // require an API key (you can't authenticate to obtain a credential
+    // with a credential). The session layer is additive to API-key auth.
+    if (url.startsWith("/v1/auth/")) return;
+    // Carrier webhooks — inbound SMS / voice and SMS / call delivery
+    // status land here. A carrier can't present an API key; the
+    // TelephonyProvider verifies the carrier's own webhook signature
+    // instead (same posture as the Stripe webhook).
+    if (
+      url.endsWith("/sms/inbound") ||
+      url.endsWith("/voice/inbound") ||
+      url.endsWith("/sms/status") ||
+      url.endsWith("/voice/status") ||
+      url.endsWith("/mail/inbound")
+    ) {
+      return;
+    }
+    // Node-agent endpoints (plan §5.5 — BYO-VPS). The agent on the
+    // tenant's box doesn't hold an API key — the raw enrollment token
+    // it presents in the body is the credential, and the CP looks it
+    // up by SHA-256 hash.
+    if (
+      req.method === "POST" &&
+      (url === "/v1/nodes/complete" || url === "/v1/nodes/heartbeat")
+    ) {
+      return;
+    }
+    // /v1/me is the "who am I" check — let it through unauthenticated so the
+    // caller gets back { authenticated: false } rather than a 401 wall.
+    if (url === "/v1/me") return;
+
+    // Invite lookup + accept are by definition unauthenticated — the
+    // invitee doesn't have a session yet. The token itself is the
+    // credential. (`POST /v1/invites` to MINT an invite still requires
+    // a real principal.)
+    if (url.startsWith("/v1/invites/by-token/")) return;
+    if (req.method === "POST" && url === "/v1/invites/accept") return;
+
+    // Bootstrap window: when zero Account rows exist on the whole control
+    // plane, allow either POST /v1/api-keys or POST /v1/accounts without
+    // auth. Both routes provision the operator's first tenant + admin key
+    // atomically; from then on the normal rules apply. (Same Stripe-style
+    // first-time-setup pattern.)
+    if (
+      req.method === "POST" &&
+      (url === "/v1/api-keys" || url === "/v1/accounts")
+    ) {
+      const totalAccounts = await cp.countAccounts();
+      if (totalAccounts === 0) return;
+    }
+    // /v1/accounts/me is the "what tenant am I on" check — let it through
+    // unauthenticated so it returns 404/400 with context instead of 401.
+    if (req.method === "GET" && url === "/v1/accounts/me") return;
+
+    const key = getApiKey(req);
+    const session = getSessionAuth(req);
+    if (!key && !session) {
+      cp.recordAuthFailure({
+        reason: "no_credentials",
+        method: req.method,
+        route: url,
+      });
+      return reply.code(401).send({
+        error:
+          "authentication required — pass a Bearer API key or session token",
+      });
+    }
+    // A Console session is a signed-in account owner — full account
+    // scope, no per-scope gating. API keys are still scope-gated.
+    if (key && !scopeAllows(key.scope, req.method, url)) {
+      cp.recordAuthFailure({
+        reason: "scope_denied",
+        method: req.method,
+        route: url,
+        keyPrefix: key.prefix,
+        accountId: key.accountId,
+      });
+      return reply.code(403).send({
+        error: `key scope '${key.scope}' is not allowed for ${req.method} ${url}`,
+      });
+    }
+  });
+  app.log.info("auth enforcement is ON (CANTILA_REQUIRE_AUTH)");
+}
+
+/* ----- per-request account scoping ----- */
+
+function getApiKey(req: FastifyRequest): ApiKey | undefined {
+  return (req as unknown as { apiKey?: ApiKey }).apiKey;
+}
+
+/** The resolved Console session on this request, if a `cts_` token authed it. */
+function getSessionAuth(req: FastifyRequest): SessionAuth | undefined {
+  return (req as unknown as { session?: SessionAuth }).session;
+}
+
+/** The act-as target on this request, if `X-Cantila-Act-As` was supplied
+ *  AND the auth-resolution hook accepted it via `canActOnAccount`. */
+function getActAs(req: FastifyRequest): string | undefined {
+  return (req as unknown as { actAs?: string }).actAs;
+}
+
+/** The authoritative account id for this request. The resolution order
+ *  is:
+ *   1. An accepted `X-Cantila-Act-As` target (plan §5.5 — white-label
+ *      parent acting as a sub-account). The auth-resolution hook has
+ *      already validated this via `canActOnAccount`.
+ *   2. An authenticated API key.
+ *   3. A Console session.
+ *   4. `?accountId=` query param (only honoured when no credential is
+ *      present, i.e. CANTILA_REQUIRE_AUTH=off and the demo flow).
+ *   5. The demo account.
+ *
+ *  With CANTILA_REQUIRE_AUTH=on a key or session is always present past
+ *  the enforcement hook, so the query param is effectively ignored —
+ *  multi-tenant isolation is enforced by construction. */
+function resolveAccountId(req: FastifyRequest): string {
+  const actAs = getActAs(req);
+  if (actAs) return actAs;
+  const key = getApiKey(req);
+  if (key) return key.accountId;
+  const session = getSessionAuth(req);
+  if (session) return session.accountId;
+  const q = (req.query ?? {}) as { accountId?: string };
+  return q.accountId ?? DEFAULT_ACCOUNT_ID;
+}
+
+/** The original caller's account id, ignoring any `X-Cantila-Act-As`
+ *  override. Used for audit fields ("done by acc_agency1 acting as
+ *  acc_sub1") and for safety checks that must always speak in the
+ *  caller's own name. */
+function resolveActorAccountId(req: FastifyRequest): string {
+  const key = getApiKey(req);
+  if (key) return key.accountId;
+  const session = getSessionAuth(req);
+  if (session) return session.accountId;
+  const q = (req.query ?? {}) as { accountId?: string };
+  return q.accountId ?? DEFAULT_ACCOUNT_ID;
+}
+
+/** Guard for billing mutations — checkout, billing-portal and plan-change.
+ *  These must act on a real authenticated principal (a scoped API key or a
+ *  Console session), never the anonymous `DEFAULT_ACCOUNT_ID` fallback that
+ *  `resolveAccountId` allows when `CANTILA_REQUIRE_AUTH` is off — otherwise
+ *  an unauthenticated visitor could open a checkout or portal session
+ *  against the demo account. Returns the target account id (which may be
+ *  the caller's own account, or a sub-account they're impersonating via
+ *  `X-Cantila-Act-As` — plan §5.5), or sends a 401 and returns null.
+ *  Independent of `CANTILA_REQUIRE_AUTH`. Plan §8.5.3.
+ *
+ *  Note on act-as: the act-as header itself required an authenticated
+ *  principal at the resolution hook above, so by the time we see
+ *  `req.actAs` here we know the caller proved who they are AND that
+ *  `canActOnAccount(caller, target)` returned true. An agency parent
+ *  managing a sub-account's billing (opening its checkout, viewing its
+ *  portal, changing its plan) is intentionally allowed — the parent
+ *  owns the sub-account. Per-tenant Stripe customers are still
+ *  distinct; the §5.5 billing-rollup follow-up is what flips this so
+ *  the parent's subscription covers every child. */
+function requireBillingPrincipal(
+  req: FastifyRequest,
+  reply: FastifyReply,
+): string | null {
+  const actAs = getActAs(req);
+  const key = getApiKey(req);
+  const session = getSessionAuth(req);
+  if (!key && !session) {
+    cp.recordAuthFailure({
+      reason: "no_credentials",
+      method: req.method,
+      route: req.url.split("?")[0],
+    });
+    reply.code(401).send({
+      error:
+        "billing actions require an authenticated API key or Console session",
+    });
+    return null;
+  }
+  return actAs ?? key?.accountId ?? session?.accountId ?? null;
+}
+
+/** Validate that `projectId` exists AND (when auth is enforced) belongs to
+ *  the caller's account. Sends the right error response and returns null
+ *  on failure; returns the project on success so the route can re-use it. */
+async function assertProjectAccess(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  projectId: string,
+): Promise<import("./domain/types").Project | null> {
+  const project = await cp.getProject(projectId);
+  if (!project) {
+    reply.code(404).send({ error: "project not found" });
+    return null;
+  }
+  // When a credential is on the request — an API key or a Console
+  // session — enforce ownership. Without one (auth off, no session), the
+  // demo flow can touch anything, same as v1.3.
+  const key = getApiKey(req);
+  const session = getSessionAuth(req);
+  const actAs = getActAs(req);
+  // Plan §5.5 — act-as is strict confinement: while a parent is acting
+  // as sub-account X, they may only touch X's projects, not Y's. The
+  // act-as hook already verified `canActOnAccount` so we trust the
+  // target here.
+  const scopeAccountId = actAs ?? key?.accountId ?? session?.accountId;
+  if (scopeAccountId && project.accountId !== scopeAccountId) {
+    // White-label parent → child read/write is allowed (plan §5.5) when
+    // the caller has NOT pinned themselves to one sub-account via
+    // act-as: an agency account can transparently act on any of its
+    // sub-accounts' projects. Once act-as is set the parent has
+    // narrowed their own scope and the fall-through is suppressed.
+    if (
+      !actAs &&
+      (await cp.canActOnAccount(scopeAccountId, project.accountId))
+    ) {
+      return project;
+    }
+    cp.recordAuthFailure({
+      reason: "cross_account",
+      method: req.method,
+      route: req.url.split("?")[0],
+      keyPrefix: key?.prefix,
+      accountId: scopeAccountId,
+    });
+    reply.code(403).send({ error: "project belongs to a different account" });
+    return null;
+  }
+  return project;
+}
+
+/* ----- request schemas ----- */
+
+const createProjectSchema = z.object({
+  name: z.string().min(1),
+  accountId: z.string().default("acc_demo"),
+  runtime: z
+    .enum(["static", "node", "python", "php", "go", "ruby", "docker"])
+    .default("node"),
+  region: z.enum(["fsn1", "hel1", "ash"]).default("fsn1"),
+});
+
+const deploySchema = z.object({
+  trigger: z.enum(["chat", "git", "cli", "mcp", "upload"]).default("cli"),
+  source: z
+    .object({
+      kind: z.enum(["git", "upload", "chat"]).default("git"),
+      ref: z.string().optional(),
+    })
+    .default({ kind: "git" }),
+});
+
+const setEnvSchema = z.object({
+  key: z.string().min(1),
+  value: z.string(),
+  secret: z.boolean().default(true),
+  scope: z.enum(["production", "preview", "all"]).default("all"),
+});
+
+const addDomainSchema = z.object({
+  hostname: z.string().min(1),
+});
+
+const scaleSchema = z.object({
+  vcpu: z.number().int().min(1).max(32).optional(),
+  memoryMb: z.number().int().min(256).max(65536).optional(),
+  diskGb: z.number().int().min(1).max(1000).optional(),
+  alwaysOn: z.boolean().optional(),
+  desiredInstances: z.number().int().min(1).max(32).optional(),
+  minInstances: z.number().int().min(1).max(32).optional(),
+  maxInstances: z.number().int().min(1).max(32).optional(),
+});
+
+const provisionDbSchema = z.object({
+  engine: z.enum(["postgres", "mysql", "mongodb", "redis"]).default("postgres"),
+});
+
+const connectGitSchema = z.object({
+  repoUrl: z.string().url(),
+  branch: z.string().default("main"),
+  autoDeploy: z.boolean().default(true),
+});
+
+const searchDomainsSchema = z.object({
+  q: z.string().min(1),
+  tlds: z.string().optional(), // comma-separated
+});
+
+const registerDomainSchema = z.object({
+  accountId: z.string().default("acc_demo"),
+  hostname: z.string().min(3),
+  years: z.number().int().min(1).max(10).default(1),
+  whoisPrivacy: z.boolean().default(true),
+  autoRenew: z.boolean().default(true),
+  projectId: z.string().optional(),
+});
+
+const attachRegistrationSchema = z.object({
+  projectId: z.string().min(1),
+});
+
+const createBucketSchema = z.object({
+  projectId: z.string().min(1),
+  name: z.string().min(1),
+  publicRead: z.boolean().default(false),
+  cdn: z.boolean().default(false),
+});
+
+const addMemberSchema = z.object({
+  email: z.string().email(),
+  name: z.string().min(1),
+  role: z.enum(["owner", "admin", "developer", "viewer"]).default("developer"),
+  accountId: z.string().default("acc_demo"),
+});
+
+const updateMemberRoleSchema = z.object({
+  role: z.enum(["owner", "admin", "developer", "viewer"]),
+  accountId: z.string().default("acc_demo"),
+});
+
+const createApiKeySchema = z.object({
+  name: z.string().min(1),
+  scope: z.enum(["read", "deploy", "admin"]).default("deploy"),
+  accountId: z.string().default("acc_demo"),
+});
+
+const createInviteSchema = z.object({
+  email: z.string().email(),
+  role: z.enum(["owner", "admin", "developer", "viewer"]).default("developer"),
+});
+
+const acceptInviteSchema = z.object({
+  token: z.string().min(8),
+  name: z.string().min(1).optional(),
+  password: z.string().min(1).optional(),
+});
+
+/** Bootstrap shape — used for both the first-ever POST /v1/api-keys (when
+ *  no Account rows exist yet) and the admin POST /v1/accounts endpoint
+ *  (when an existing operator wants to onboard a new tenant). */
+const bootstrapAccountSchema = z.object({
+  accountName: z.string().min(1),
+  accountHandle: z.string().min(3).max(40),
+  plan: z
+    .enum(["hobby", "starter", "pro", "agency", "dedicated"])
+    .default("hobby"),
+  keyName: z.string().min(1).default("bootstrap-admin"),
+  keyScope: z.enum(["read", "deploy", "admin"]).default("admin"),
+});
+
+const pushWebhookSchema = z.object({
+  repoUrl: z.string().optional(),
+  ref: z.string().optional(),
+  branch: z.string().optional(),
+  commit: z
+    .object({
+      hash: z.string().optional(),
+      message: z.string().optional(),
+      author: z.string().optional(),
+    })
+    .optional(),
+});
+
+/* ----- routes ----- */
+
+app.get("/v1/health", async () => ({
+  status: "ok",
+  service: "cantila-control-plane",
+  time: now(),
+}));
+
+// List all projects under an account.
+app.get("/v1/projects", async (request) => {
+  return { projects: await cp.listProjects(resolveAccountId(request)) };
+});
+
+// Create a project. The authenticated key's account is authoritative —
+// the body's accountId is ignored when a key is on the request.
+app.post("/v1/projects", async (request, reply) => {
+  const parsed = createProjectSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const project = await cp.createProject({
+    ...parsed.data,
+    accountId: resolveAccountId(request),
+  });
+  return reply.code(201).send(project);
+});
+
+// Project detail + its auto-wired services (secrets masked).
+app.get("/v1/projects/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const detail = await cp.getProjectDetail(id);
+  if (!detail) return reply.code(404).send({ error: "project not found" });
+  return detail;
+});
+
+// Run the deploy pipeline — auto-wires services on the first deploy.
+app.post("/v1/projects/:id/deploy", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = deploySchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  // Dunning gate (plan §8 / §15.2) — block deploys for an account
+  // suspended/canceled for non-payment. 402 Payment Required.
+  const billingGate = await cp.assertDeployAllowed(id);
+  if (!billingGate.ok) {
+    return reply.code(billingGate.code).send({ error: billingGate.error });
+  }
+  try {
+    return await cp.deploy(id, {
+      trigger: parsed.data.trigger,
+      source: parsed.data.source,
+    });
+  } catch (err) {
+    return reply
+      .code(404)
+      .send({ error: err instanceof Error ? err.message : "deploy failed" });
+  }
+});
+
+// Streaming variant — Server-Sent Events of each pipeline step as it
+// completes. Plan §5.3: real-time build & runtime logs.
+app.post("/v1/projects/:id/deploy/stream", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = deploySchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  // Ownership check BEFORE hijacking the socket — otherwise a 403 turns
+  // into a half-open SSE stream the client can't make sense of.
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  // Dunning gate — checked before the socket is hijacked so a blocked
+  // deploy returns a clean 402 instead of a half-open SSE stream.
+  const billingGate = await cp.assertDeployAllowed(id);
+  if (!billingGate.ok) {
+    return reply.code(billingGate.code).send({ error: billingGate.error });
+  }
+
+  // Take over the raw socket so we can write SSE frames directly.
+  reply.hijack();
+  const res = reply.raw;
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+    "access-control-allow-origin": "*",
+  });
+
+  const send = (event: string, data: unknown) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  try {
+    send("start", { projectId: id, trigger: parsed.data.trigger });
+    const outcome = await cp.deployStreaming(id, {
+      trigger: parsed.data.trigger,
+      source: parsed.data.source,
+      onStep: (e) => send("step", e),
+    });
+    send("done", outcome);
+  } catch (err) {
+    send("error", {
+      error: err instanceof Error ? err.message : "deploy failed",
+    });
+  } finally {
+    res.end();
+  }
+});
+
+// Build/deploy logs for the project's deployments.
+app.get("/v1/projects/:id/logs", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const logs = await cp.getLogs(id);
+  if (!logs) return reply.code(404).send({ error: "project not found" });
+  return { deployments: logs };
+});
+
+// Environment variables — including the injected service credentials.
+app.get("/v1/projects/:id/env", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const env = await cp.getEnv(id);
+  if (!env) return reply.code(404).send({ error: "project not found" });
+  return { env };
+});
+
+// Set or update an environment variable.
+app.post("/v1/projects/:id/env", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = setEnvSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.setEnv(id, parsed.data.key, parsed.data.value, {
+    secret: parsed.data.secret,
+    scope: parsed.data.scope,
+  });
+  if (!result) return reply.code(404).send({ error: "project not found" });
+  return result;
+});
+
+// Attach a custom domain (the free *.cantila.app subdomain is added with the project).
+app.post("/v1/projects/:id/domains", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = addDomainSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.addDomain(id, parsed.data.hostname);
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Vertical + horizontal resize (plan §5.2). 400 on bad instance bounds.
+app.post("/v1/projects/:id/scale", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = scaleSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.scale(id, parsed.data);
+  if (!result) return reply.code(404).send({ error: "project not found" });
+  if ("error" in result) return reply.code(400).send({ error: result.error });
+  return result;
+});
+
+// Per-instance health view (plan §5.2). Returns `desiredInstances` rows.
+app.get("/v1/projects/:id/instances", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return { instances: await cp.listInstances(id) };
+});
+
+/** Project load samples (plan §5.2 — real CPU/RPS metrics). Returns the
+ *  most-recent window (oldest-first) of CPU% / memory% / RPS samples
+ *  the data plane produced; the stub synthesises plausible values from
+ *  project state, production reads Docker / kube stats + LB counters. */
+app.get("/v1/projects/:id/metrics", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return { samples: await cp.getProjectMetrics(id) };
+});
+
+/* ----- chat-driven build (complete-builder) ----- */
+
+// Plan a deploy from a single free-form chat prompt. Pre-flight to
+// `POST /v1/projects` — the Console chooses the runtime / type / services
+// based on this output and creates the project with the planned values,
+// then redirects to /@handle/<name>.
+app.post("/v1/deploy/plan", async (request, reply) => {
+  const body = (request.body ?? {}) as { prompt?: string; files?: string[] };
+  if (!body.prompt || typeof body.prompt !== "string") {
+    return reply.code(400).send({ error: "prompt required" });
+  }
+  const plan = await deployPlanner.plan({
+    prompt: body.prompt,
+    files: Array.isArray(body.files) ? body.files : undefined,
+  });
+  return { plan };
+});
+
+// Resolve a project from `@handle` + `name`. Lets the Console render a
+// project page at `/@handle/<name>` without ever exposing the prj_* id.
+app.get("/v1/projects/by-handle/:handle/:name", async (request, reply) => {
+  const { handle, name } = request.params as { handle: string; name: string };
+  const cleanHandle = handle.startsWith("@") ? handle.slice(1) : handle;
+  const project = await cp.getProjectByHandle(cleanHandle, decodeURIComponent(name));
+  if (!project) return reply.code(404).send({ error: "project not found" });
+  if (!(await assertProjectAccess(request, reply, project.id))) return;
+  const detail = await cp.getProjectDetail(project.id);
+  if (!detail) return reply.code(404).send({ error: "project not found" });
+  return detail;
+});
+
+// Per-project chat history. Returns the rolling thread of messages — user
+// turns, agent ops, asset cards, results — in created-at order.
+app.get("/v1/projects/:id/chat", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return { messages: projectOrchestrator.listMessages(id) };
+});
+
+// Per-project assets — the AssetGallery panel reads this. Every generated
+// image / icon / lottie / video / file lands here with an inline preview.
+app.get("/v1/projects/:id/assets", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return { assets: projectOrchestrator.listAssets(id) };
+});
+
+// Per-project brain snapshot — rolling summary + counts + last-change-at.
+// The Brain panel reads this; it's the user-facing token-preservation
+// readout (how much of the context window is in cached summary vs live
+// history).
+app.get("/v1/projects/:id/brain", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return projectOrchestrator.getBrain(id);
+});
+
+// Start the build for a freshly-created project. The Console calls this
+// right after POST /v1/projects from the deploy chat, and the project
+// page opens an SSE stream to receive the op cards as they happen.
+app.post("/v1/projects/:id/build", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const body = (request.body ?? {}) as { prompt?: string };
+  if (!body.prompt) return reply.code(400).send({ error: "prompt required" });
+
+  const plan = await deployPlanner.plan({ prompt: body.prompt });
+  projectOrchestrator.seedFromDeploy({ projectId: id, prompt: body.prompt, plan });
+
+  // Take over the socket and stream op events. Mirrors the pattern in the
+  // deploy/stream route above.
+  reply.hijack();
+  const res = reply.raw;
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+    "access-control-allow-origin": "*",
+  });
+  const send = (event: string, data: unknown) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+  send("plan", plan);
+  await projectOrchestrator.runBuild({
+    projectId: id,
+    plan,
+    onEvent: (e) => send(e.kind, e),
+  });
+  res.end();
+});
+
+// Send a follow-up chat message on an existing project. Streams the
+// orchestrator's reply + any dispatched agent ops + any newly-generated
+// assets back as SSE events.
+app.post("/v1/projects/:id/chat", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const body = (request.body ?? {}) as { message?: string };
+  if (!body.message || typeof body.message !== "string") {
+    return reply.code(400).send({ error: "message required" });
+  }
+
+  reply.hijack();
+  const res = reply.raw;
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+    "x-accel-buffering": "no",
+    "access-control-allow-origin": "*",
+  });
+  const send = (event: string, data: unknown) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+  await projectOrchestrator.runChat({
+    projectId: id,
+    message: body.message,
+    onEvent: (e) => send(e.kind, e),
+  });
+  res.end();
+});
+
+// AI troubleshooting — plan §5.6. Pattern-matches the deployment's step
+// trace and returns plain-language suggestions + recommended actions.
+app.get(
+  "/v1/projects/:id/deployments/:deploymentId/troubleshoot",
+  async (request, reply) => {
+    const { id, deploymentId } = request.params as {
+      id: string;
+      deploymentId: string;
+    };
+    if (!(await assertProjectAccess(request, reply, id))) return;
+    const result = await cp.troubleshootDeploy(id, deploymentId);
+    if ("error" in result) {
+      return reply.code(404).send({ error: result.error });
+    }
+    return result;
+  },
+);
+
+// Instant rollback to a previous deployment.
+app.post(
+  "/v1/projects/:id/rollback/:deploymentId",
+  async (request, reply) => {
+    const { id, deploymentId } = request.params as {
+      id: string;
+      deploymentId: string;
+    };
+    if (!(await assertProjectAccess(request, reply, id))) return;
+    const result = await cp.rollback(id, deploymentId);
+    if ("error" in result) {
+      const code = result.error.includes("not found") ? 404 : 400;
+      return reply.code(code).send({ error: result.error });
+    }
+    return reply.code(201).send(result);
+  },
+);
+
+/* ----- Cantila Mail + SMS fleet (plan §4.4, §4.5) ----- */
+
+app.get("/v1/mail/fleet", async (request) => {
+  return cp.listAccountMailboxes(resolveAccountId(request));
+});
+
+/** Account-wide mail deliverability rollup (plan §4.4 + §15.1 — MailAgent
+ *  surface). `?sinceMinutes=N` narrows the window; default is the last hour. */
+app.get("/v1/mail/deliverability", async (request) => {
+  const q = (request.query ?? {}) as { sinceMinutes?: string };
+  const sinceMinutes = q.sinceMinutes ? Number(q.sinceMinutes) : 60;
+  const sinceIso = Number.isFinite(sinceMinutes)
+    ? new Date(Date.now() - sinceMinutes * 60_000).toISOString()
+    : undefined;
+  const domains = await cp.getMailDeliverability(resolveAccountId(request), {
+    sinceIso,
+  });
+  return { sinceIso, domains };
+});
+
+/** Per-pool deliverability rollup (plan §4.4 — IP-pool rotation). Same
+ *  shape as `/v1/mail/deliverability` but grouped by the in-memory
+ *  event's `poolId` instead of sending-domain — what MailAgent reads to
+ *  reason about per-pool reputation. Events with no `poolId` (legacy
+ *  or pre-rotation) are excluded. */
+app.get("/v1/mail/pool-deliverability", async (request) => {
+  const q = (request.query ?? {}) as { sinceMinutes?: string };
+  const sinceMinutes = q.sinceMinutes ? Number(q.sinceMinutes) : 60;
+  const sinceIso = Number.isFinite(sinceMinutes)
+    ? new Date(Date.now() - sinceMinutes * 60_000).toISOString()
+    : undefined;
+  const pools = await cp.getMailPoolDeliverability(resolveAccountId(request), {
+    sinceIso,
+  });
+  return { sinceIso, pools };
+});
+
+const sendMailSchema = z.object({
+  to: z.string().email(),
+  subject: z.string().optional(),
+  body: z.string().optional(),
+  /** Test hook — lets the smoke test force a high bounce rate without
+   *  spamming real recipients. The real MTA won't honour this knob. */
+  outcomeBias: z
+    .object({
+      delivered: z.number().min(0).max(1).optional(),
+      bounced: z.number().min(0).max(1).optional(),
+      complained: z.number().min(0).max(1).optional(),
+    })
+    .optional(),
+});
+
+/** Send one message through the project's mailbox. Today this is a mock
+ *  that records the event and rolls an outcome; the route shape is what
+ *  the real MTA will keep. Plan §15.2 — "Cantila Mail — fleet readout is
+ *  live; the mail itself is not." */
+app.post("/v1/projects/:id/mail/send", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const parsed = sendMailSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.sendMail(id, parsed.data);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(202).send(result);
+});
+
+/** Inbound mail webhook — the MTA / aggregator POSTs here when a
+ *  message lands on one of the project's sending domains. Carrier-called,
+ *  so it carries no API key (exempt from the auth hook). Mirrors the
+ *  SMS inbound shape — the real MTA verifies the carrier's own webhook
+ *  signature before forwarding. */
+const inboundMailSchema = z.object({
+  to: z.string().email(),
+  from: z.string().email(),
+  subject: z.string().optional(),
+  body: z.string().optional(),
+  providerMessageId: z.string().optional(),
+});
+
+app.post("/v1/projects/:id/mail/inbound", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = inboundMailSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.receiveInboundMail(id, parsed.data);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Persisted inbound mail message history for a project (plan §4.4 —
+ *  two-way mail). Operator-facing GET, `assertProjectAccess`-gated. A
+ *  distinct path from the carrier `/mail/inbound` webhook, so it is NOT
+ *  covered by the inbound-webhook auth exemption. */
+app.get("/v1/projects/:id/mail/inbox", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const messages = await cp.listInboundMail(project.accountId, {
+    projectId: id,
+    limit: 100,
+  });
+  return { messages };
+});
+
+/** Account-wide inbound mail history (plan §4.4). */
+app.get("/v1/mail/inbox", async (request) => {
+  const messages = await cp.listInboundMail(resolveAccountId(request), {
+    limit: 100,
+  });
+  return { messages };
+});
+
+app.get("/v1/sms/fleet", async (request) => {
+  return {
+    numbers: await cp.listAccountPhoneNumbers(resolveAccountId(request)),
+  };
+});
+
+/** Per-number deliverability rollup (plan §4.5 + §15.1 — SmsAgent surface). */
+app.get("/v1/sms/deliverability", async (request) => {
+  const q = (request.query ?? {}) as { sinceMinutes?: string };
+  const sinceMinutes = q.sinceMinutes ? Number(q.sinceMinutes) : 60;
+  const sinceIso = Number.isFinite(sinceMinutes)
+    ? new Date(Date.now() - sinceMinutes * 60_000).toISOString()
+    : undefined;
+  const numbers = await cp.getSmsDeliverability(resolveAccountId(request), {
+    sinceIso,
+  });
+  return { sinceIso, numbers };
+});
+
+const sendSmsSchema = z.object({
+  to: z.string().min(4),
+  body: z.string().optional(),
+  outcomeBias: z
+    .object({
+      delivered: z.number().min(0).max(1).optional(),
+      failed: z.number().min(0).max(1).optional(),
+      undelivered: z.number().min(0).max(1).optional(),
+    })
+    .optional(),
+});
+
+/** Send one SMS through the project's auto-wired phone number. Mock today
+ *  (plan §15.2); the route shape is what the real SMSC will keep. */
+app.post("/v1/projects/:id/sms/send", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const parsed = sendSmsSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.sendSms(id, parsed.data);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(202).send(result);
+});
+
+const optOutSchema = z.object({
+  from: z.string().min(4),
+});
+
+/** Record an inbound STOP / opt-out. The real SMSC's inbound webhook will
+ *  call this; today it's the test handle SmsAgent uses to verify it sees
+ *  the opt-out rate climb. */
+app.post("/v1/projects/:id/sms/opt-out", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const parsed = optOutSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.recordSmsOptOut(id, parsed.data.from);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(202).send(result);
+});
+
+/** Inbound SMS webhook — the carrier POSTs here when a text lands on a
+ *  provisioned number. Carrier-called, so it carries no API key (exempt
+ *  from the auth hook); the TelephonyProvider verifies the carrier's own
+ *  webhook signature when it parses the payload. */
+app.post("/v1/projects/:id/sms/inbound", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const result = await cp.receiveInboundSms(
+    id,
+    rawBodyOf(request),
+    request.headers as Record<string, string>,
+  );
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Persisted inbound SMS message history for a project (plan §4.5 —
+ *  two-way SMS). An operator-facing GET read — `assertProjectAccess`
+ *  gated. A distinct path from the carrier `/sms/inbound` webhook, so it
+ *  is NOT covered by the inbound-webhook auth exemption. */
+app.get("/v1/projects/:id/sms/inbox", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const messages = await cp.listInboundMessages(project.accountId, {
+    projectId: id,
+    limit: 100,
+  });
+  return { messages };
+});
+
+/** Account-wide inbound SMS message history (plan §4.5). */
+app.get("/v1/sms/inbox", async (request) => {
+  const messages = await cp.listInboundMessages(resolveAccountId(request), {
+    limit: 100,
+  });
+  return { messages };
+});
+
+/** Persisted inbound voice-call history for a project (plan §4.5 —
+ *  two-way voice). Operator-facing GET, `assertProjectAccess`-gated. */
+app.get("/v1/projects/:id/voice/calls", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const calls = await cp.listInboundCalls(project.accountId, {
+    projectId: id,
+    limit: 100,
+  });
+  return { calls };
+});
+
+/** Account-wide inbound voice-call history (plan §4.5). */
+app.get("/v1/voice/calls", async (request) => {
+  const calls = await cp.listInboundCalls(resolveAccountId(request), {
+    limit: 100,
+  });
+  return { calls };
+});
+
+/** Inbound voice webhook — the carrier POSTs here on an incoming call;
+ *  the response carries the routing decision (forward / voicemail / …). */
+app.post("/v1/projects/:id/voice/inbound", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const result = await cp.receiveInboundCall(
+    id,
+    rawBodyOf(request),
+    request.headers as Record<string, string>,
+  );
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Read the inbound call-routing rule on a project's number. */
+app.get("/v1/projects/:id/voice/routing", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.getCallRouting(id);
+  if ("error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+const callRoutingSchema = z.object({
+  action: z.enum(["forward", "voicemail", "reject", "app_webhook"]),
+  target: z.string().optional(),
+});
+
+/** Set the inbound call-routing rule on a project's number. */
+app.put("/v1/projects/:id/voice/routing", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const parsed = callRoutingSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.setCallRouting(id, parsed.data);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** SMS delivery-status webhook — the carrier reports the terminal
+ *  delivery state here. Carrier-called: no API key (exempt from the
+ *  auth hook), like the inbound webhooks. */
+app.post("/v1/projects/:id/sms/status", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const result = await cp.receiveSmsStatus(
+    id,
+    rawBodyOf(request),
+    request.headers as Record<string, string>,
+  );
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Voice-call status webhook — the carrier reports call completion,
+ *  voicemail, busy, no-answer, etc. */
+app.post("/v1/projects/:id/voice/status", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const result = await cp.receiveCallStatus(
+    id,
+    rawBodyOf(request),
+    request.headers as Record<string, string>,
+  );
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/* ----- SMS OTP / 2FA (plan §4.5 / §15.2 — phone verification) ----- */
+
+const otpRequestSchema = z.object({
+  phone: z.string().min(4),
+  purpose: z.enum(["login", "two_factor", "phone_verification"]).optional(),
+});
+
+/** Issue a one-time passcode and deliver it over the project's SMS
+ *  number. Outside production the response also carries `devCode` —
+ *  there is no real SMSC behind the stub, so tests need the code. */
+app.post("/v1/projects/:id/sms/otp/request", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const parsed = otpRequestSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.requestSmsOtp(id, parsed.data);
+  if ("error" in result) return reply.code(400).send(result);
+  const body: Record<string, unknown> = { challenge: result.challenge };
+  if (config.nodeEnv !== "production") body.devCode = result.code;
+  return reply.code(201).send(body);
+});
+
+const otpVerifySchema = z.object({
+  challengeId: z.string().optional(),
+  phone: z.string().optional(),
+  code: z.string().min(1),
+});
+
+/** Verify a one-time passcode. Identify the challenge by `challengeId`
+ *  or by `phone` (most recent pending code wins). */
+app.post("/v1/projects/:id/sms/otp/verify", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const parsed = otpVerifySchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  if (!parsed.data.challengeId && !parsed.data.phone) {
+    return reply
+      .code(400)
+      .send({ error: "challengeId or phone is required" });
+  }
+  const result = await cp.verifySmsOtp(id, parsed.data);
+  if ("error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Account-wide OTP rollup — active / verified / failed counts plus the
+ *  recent challenges. Powers the Console SMS page and `cantila otp`. */
+app.get("/v1/sms/otp", async (request) => {
+  return cp.getOtpStats(resolveAccountId(request));
+});
+
+/* ----- number marketplace (plan §4.5 — buy & lease phone numbers) ----- */
+
+const numberTypeEnum = z.enum([
+  "local",
+  "toll_free",
+  "mobile",
+  "short_code",
+]);
+const numberCapEnum = z.enum(["sms", "mms", "voice"]);
+
+/** Search the number marketplace catalog — `?country=US&type=local&
+ *  capability=voice&areaCode=415`. Prices are retail (pricebook). */
+app.get("/v1/numbers/catalog", async (request) => {
+  const q = (request.query ?? {}) as Record<string, string | undefined>;
+  const t = numberTypeEnum.safeParse(q.type);
+  const c = numberCapEnum.safeParse(q.capability);
+  return {
+    numbers: await cp.searchNumberCatalog({
+      country: q.country ?? "US",
+      type: t.success ? t.data : undefined,
+      capability: c.success ? c.data : undefined,
+      areaCode: q.areaCode,
+    }),
+  };
+});
+
+const purchaseNumberSchema = z.object({
+  e164: z.string().min(4),
+  country: z.string().min(2),
+  numberType: numberTypeEnum,
+  capabilities: z.array(numberCapEnum).min(1),
+  projectId: z.string().optional(),
+});
+
+/** Purchase a number from the marketplace. The owning account is the
+ *  caller's; pricing is server-set from the pricebook. */
+app.post("/v1/numbers", async (request, reply) => {
+  const parsed = purchaseNumberSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.purchaseNumber({
+    accountId: resolveAccountId(request),
+    ...parsed.data,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+/** List the marketplace numbers the caller's account owns. */
+app.get("/v1/numbers", async (request) => {
+  return { numbers: await cp.listOwnedNumbers(resolveAccountId(request)) };
+});
+
+/** Release a marketplace number — stops the monthly charge. */
+app.delete("/v1/numbers/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const result = await cp.releaseOwnedNumber(resolveAccountId(request), id);
+  if ("error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+const portInNumberSchema = z.object({
+  e164: z.string().min(4),
+  country: z.string().min(2),
+  numberType: numberTypeEnum,
+  capabilities: z.array(numberCapEnum).min(1),
+  projectId: z.string().optional(),
+});
+
+/** Port in a number the account already owns at another carrier. The
+ *  number is held in `porting` status until `complete-port` confirms it. */
+app.post("/v1/numbers/port-in", async (request, reply) => {
+  const parsed = portInNumberSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.portInNumber({
+    accountId: resolveAccountId(request),
+    ...parsed.data,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+/** Confirm a port-in — the carrier reports the completed port here
+ *  (offline, drive it directly). Flips `porting` → `active`. */
+app.post("/v1/numbers/:id/complete-port", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const result = await cp.completePortIn(resolveAccountId(request), id);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+const transferNumberSchema = z.object({
+  toAccountHandle: z.string().min(1),
+});
+
+/** Transfer an active number to another Cantila account by handle. */
+app.post("/v1/numbers/:id/transfer", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = transferNumberSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.transferNumber({
+    fromAccountId: resolveAccountId(request),
+    numberId: id,
+    toAccountHandle: parsed.data.toAccountHandle,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/* ----- Compute nodes — Bring-Your-Own-VPS (plan §5.5) -----
+ *
+ * Two surfaces here, deliberately separated:
+ *
+ *   Operator API (account-scoped via `resolveAccountId`):
+ *     POST /v1/nodes              — enrol a BYO node; returns the
+ *                                   one-time enrollment token
+ *     GET  /v1/nodes              — list the caller's nodes
+ *     GET  /v1/nodes/:id          — get one
+ *     DELETE /v1/nodes/:id        — retire (one-way)
+ *
+ *   Node-agent API (raw enrollment token is the credential, exempt
+ *   from the API-key auth hook above):
+ *     POST /v1/nodes/complete     — agent completes enrolment
+ *     POST /v1/nodes/heartbeat    — agent posts a heartbeat
+ *
+ * Account isolation is enforced at the CP layer (every operator
+ * method takes `callerAccountId`); the agent endpoints look up by
+ * SHA-256 hash of the raw token, so a token leak is the only path
+ * to another tenant's row. */
+
+const nodeKindEnum = z.enum(["managed", "byo"]);
+
+const enrollNodeSchema = z.object({
+  label: z.string().min(1),
+  region: z.string().optional(),
+  host: z.string().optional(),
+  sshUser: z.string().optional(),
+  capacityInstances: z.number().int().min(1).max(256).optional(),
+  kind: nodeKindEnum.optional(),
+});
+
+app.post("/v1/nodes", async (request, reply) => {
+  const parsed = enrollNodeSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.enrollNode({
+    accountId: resolveAccountId(request),
+    ...parsed.data,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+app.get("/v1/nodes", async (request) => {
+  return { nodes: await cp.listAccountNodes(resolveAccountId(request)) };
+});
+
+/** Per-account fleet summary (plan §5.5 — BYO-VPS lifecycle).
+ *  Counts of nodes by status + the online aggregate capacity. Powers
+ *  the Console `/nodes` summary header and `cantila nodes`'s top
+ *  line. Account-scoped via `resolveAccountId`. */
+app.get("/v1/nodes/summary", async (request) => {
+  return cp.getNodeFleetSummary(resolveAccountId(request));
+});
+
+/** Dev/ops seam — force one heartbeat sweep. The same job runs every
+ *  `NODE_HEARTBEAT_SWEEP_INTERVAL_MS` from `startBackgroundJobs`; this
+ *  route exists so tests and ops can poke it without waiting. */
+app.post("/v1/nodes/sweep", async () => {
+  return cp.runNodeHeartbeatSweep();
+});
+
+app.get("/v1/nodes/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const node = await cp.getNodeForAccount(resolveAccountId(request), id);
+  if (!node) return reply.code(404).send({ error: "node not found" });
+  return { node };
+});
+
+app.delete("/v1/nodes/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const result = await cp.retireNode(resolveAccountId(request), id);
+  if ("error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+const completeNodeSchema = z.object({
+  enrollmentToken: z.string().min(8),
+  publicKeyFingerprint: z.string().min(8),
+  capacityInstances: z.number().int().min(1).max(256).optional(),
+});
+
+app.post("/v1/nodes/complete", async (request, reply) => {
+  const parsed = completeNodeSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.completeNodeEnrollment({
+    rawToken: parsed.data.enrollmentToken,
+    publicKeyFingerprint: parsed.data.publicKeyFingerprint,
+    capacityInstances: parsed.data.capacityInstances,
+  });
+  if ("error" in result) return reply.code(401).send(result);
+  return reply.code(200).send(result);
+});
+
+const nodeHeartbeatSchema = z.object({
+  enrollmentToken: z.string().min(8),
+  instances: z.number().int().min(0).optional(),
+  loadPct: z.number().min(0).max(100).optional(),
+});
+
+app.post("/v1/nodes/heartbeat", async (request, reply) => {
+  const parsed = nodeHeartbeatSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.recordNodeHeartbeat({
+    rawToken: parsed.data.enrollmentToken,
+    instances: parsed.data.instances,
+    loadPct: parsed.data.loadPct,
+  });
+  if ("error" in result) return reply.code(401).send(result);
+  return reply.code(200).send(result);
+});
+
+/* ----- A2P/10DLC carrier registration (plan §4.5) -----
+ *
+ * Brand + campaign records the operator submits to The Campaign
+ * Registry. All routes are account-scoped via `resolveAccountId`.
+ * Loose-JSON payload — the CP enforces required keys per kind, but
+ * the route shape stays additive so the field set can grow without
+ * a schema change. */
+
+const A2P_STATUS_VALUES = [
+  "draft",
+  "submitted",
+  "in_review",
+  "approved",
+  "rejected",
+  "hold",
+] as const;
+
+const registerBrandSchema = z.object({
+  name: z.string().min(1),
+  payload: z.record(z.unknown()),
+});
+
+const registerCampaignSchema = z.object({
+  name: z.string().min(1),
+  brandRegistrationId: z.string().min(1),
+  payload: z.record(z.unknown()),
+});
+
+const a2pStatusSchema = z.object({
+  status: z.enum(A2P_STATUS_VALUES),
+  providerRegistrationId: z.string().optional(),
+  rejectionReason: z.string().optional(),
+});
+
+app.get("/v1/a2p/registrations", async (request) => {
+  const q = (request.query ?? {}) as { kind?: string };
+  const kind =
+    q.kind === "brand" || q.kind === "campaign" ? q.kind : undefined;
+  return {
+    registrations: await cp.listA2pRegistrations(resolveAccountId(request), {
+      kind,
+    }),
+  };
+});
+
+app.post("/v1/a2p/brands", async (request, reply) => {
+  const parsed = registerBrandSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.registerBrand({
+    accountId: resolveAccountId(request),
+    name: parsed.data.name,
+    payload: parsed.data.payload,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+app.post("/v1/a2p/campaigns", async (request, reply) => {
+  const parsed = registerCampaignSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.registerCampaign({
+    accountId: resolveAccountId(request),
+    name: parsed.data.name,
+    brandRegistrationId: parsed.data.brandRegistrationId,
+    payload: parsed.data.payload,
+  });
+  if ("error" in result) {
+    const code = result.error === "brand registration not found" ? 404 : 400;
+    return reply.code(code).send(result);
+  }
+  return reply.code(201).send(result);
+});
+
+app.get("/v1/a2p/registrations/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const registration = await cp.getA2pRegistration(id);
+  if (!registration) {
+    return reply.code(404).send({ error: "registration not found" });
+  }
+  if (registration.accountId !== resolveAccountId(request)) {
+    return reply.code(404).send({ error: "registration not found" });
+  }
+  return registration;
+});
+
+app.patch("/v1/a2p/registrations/:id/status", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = a2pStatusSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.setA2pRegistrationStatus(
+    resolveAccountId(request),
+    id,
+    parsed.data.status,
+    {
+      providerRegistrationId: parsed.data.providerRegistrationId,
+      rejectionReason: parsed.data.rejectionReason,
+    },
+  );
+  if ("error" in result) {
+    const code = result.error === "registration not found" ? 404 : 400;
+    return reply.code(code).send(result);
+  }
+  return result;
+});
+
+/* ----- Cantila Data (plan §4.6) ----- */
+
+// Account-wide list of every project's auto-wired managed database.
+app.get("/v1/databases", async (request) => {
+  return { databases: await cp.listAccountDatabases(resolveAccountId(request)) };
+});
+
+// Account-wide list of buckets.
+app.get("/v1/storage/buckets", async (request) => {
+  return { buckets: await cp.listBuckets(resolveAccountId(request)) };
+});
+
+// Create a bucket. The bucket's project must belong to the caller's account.
+app.post("/v1/storage/buckets", async (request, reply) => {
+  const parsed = createBucketSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, parsed.data.projectId))) return;
+  const result = await cp.createBucket(parsed.data);
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Delete a bucket — verify it belongs to a project the caller owns.
+app.delete("/v1/storage/buckets/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const buckets = await cp.listBuckets(resolveAccountId(request));
+  const owned = buckets.some((b) => b.id === id);
+  if (!owned) {
+    // Either truly missing or owned by another account — same 404 from the
+    // caller's perspective so we don't leak the existence of other accounts.
+    return reply.code(404).send({ error: "bucket not found" });
+  }
+  const ok = await cp.deleteBucket(id);
+  if (!ok) return reply.code(404).send({ error: "bucket not found" });
+  return reply.code(204).send();
+});
+
+/* ----- hosted mailboxes (plan §4.4 — Cantila Mail) ----- */
+
+const createHostedMailboxSchema = z.object({
+  address: z.string().min(3),
+  displayName: z.string().optional(),
+  kind: z.enum(["personal", "shared"]).optional(),
+  quotaMb: z.number().int().positive().optional(),
+});
+
+// Hosted mailboxes on one project.
+app.get("/v1/projects/:id/mailboxes", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return { mailboxes: await cp.listHostedMailboxes(id) };
+});
+
+// Account-wide list of every project's hosted mailboxes.
+app.get("/v1/mailboxes", async (request) => {
+  return {
+    mailboxes: await cp.listAccountHostedMailboxes(resolveAccountId(request)),
+  };
+});
+
+// Create a hosted mailbox on a project.
+app.post("/v1/projects/:id/mailboxes", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const parsed = createHostedMailboxSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.createHostedMailbox({ projectId: id, ...parsed.data });
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Delete a hosted mailbox — scoped to the project the caller owns.
+app.delete(
+  "/v1/projects/:id/mailboxes/:mailboxId",
+  async (request, reply) => {
+    const { id, mailboxId } = request.params as {
+      id: string;
+      mailboxId: string;
+    };
+    if (!(await assertProjectAccess(request, reply, id))) return;
+    const ok = await cp.deleteHostedMailbox(id, mailboxId);
+    if (!ok) return reply.code(404).send({ error: "mailbox not found" });
+    return reply.code(204).send();
+  },
+);
+
+/* ----- mail aliases (plan §4.4 — routing rules) -----
+ *
+ * CRUD over `MailAlias` — the rule a future MTA will honor. Per-project
+ * routes are scope-gated by `assertProjectAccess`; the account-wide
+ * `GET /v1/mail/aliases` mirrors `GET /v1/mailboxes`.
+ */
+
+const createMailAliasSchema = z.object({
+  address: z.string().min(3),
+  target: z.string().min(1),
+  kind: z.enum(["alias", "forward", "catch-all", "parse"]).optional(),
+  description: z.string().optional(),
+});
+
+const updateMailAliasSchema = z.object({
+  target: z.string().min(1).optional(),
+  kind: z.enum(["alias", "forward", "catch-all", "parse"]).optional(),
+  active: z.boolean().optional(),
+  description: z.string().optional(),
+});
+
+// Aliases on one project.
+app.get("/v1/projects/:id/aliases", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return { aliases: await cp.listMailAliases(id) };
+});
+
+// Account-wide list of every project's aliases.
+app.get("/v1/mail/aliases", async (request) => {
+  return {
+    aliases: await cp.listAccountMailAliases(resolveAccountId(request)),
+  };
+});
+
+// Create an alias on a project.
+app.post("/v1/projects/:id/aliases", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const parsed = createMailAliasSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.createMailAlias({ projectId: id, ...parsed.data });
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Patch an alias — target / kind / active / description. Address is
+// immutable; rename via delete + recreate.
+app.patch(
+  "/v1/projects/:id/aliases/:aliasId",
+  async (request, reply) => {
+    const { id, aliasId } = request.params as {
+      id: string;
+      aliasId: string;
+    };
+    if (!(await assertProjectAccess(request, reply, id))) return;
+    const parsed = updateMailAliasSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.flatten() });
+    }
+    const result = await cp.updateMailAlias(id, aliasId, parsed.data);
+    if ("error" in result) {
+      const code = result.error === "alias not found" ? 404 : 400;
+      return reply.code(code).send({ error: result.error });
+    }
+    return result;
+  },
+);
+
+// Delete an alias — scoped to the project the caller owns.
+app.delete(
+  "/v1/projects/:id/aliases/:aliasId",
+  async (request, reply) => {
+    const { id, aliasId } = request.params as {
+      id: string;
+      aliasId: string;
+    };
+    if (!(await assertProjectAccess(request, reply, id))) return;
+    const ok = await cp.deleteMailAlias(id, aliasId);
+    if (!ok) return reply.code(404).send({ error: "alias not found" });
+    return reply.code(204).send();
+  },
+);
+
+/* ----- mail sending-IP pools (plan §4.4 — IP-pool rotation) -----
+ *
+ * Account-scoped CRUD over `MailIpPool`. The future MTA reads from
+ * this table to decide which sending IP an outbound message rides
+ * through. The CP enforces a single-default pool per account at write
+ * time (see `createMailIpPool` / `updateMailIpPool`). */
+
+const POOL_KIND_VALUES = [
+  "warmup",
+  "main",
+  "transactional",
+  "marketing",
+] as const;
+
+const createMailIpPoolSchema = z.object({
+  name: z.string().min(1),
+  kind: z.enum(POOL_KIND_VALUES).optional(),
+  ips: z.array(z.string()).optional(),
+  description: z.string().optional(),
+  setDefault: z.boolean().optional(),
+});
+
+const updateMailIpPoolSchema = z.object({
+  name: z.string().min(1).optional(),
+  kind: z.enum(POOL_KIND_VALUES).optional(),
+  ips: z.array(z.string()).optional(),
+  reputation: z.number().int().min(0).max(100).optional(),
+  active: z.boolean().optional(),
+  isDefault: z.boolean().optional(),
+  description: z.string().optional(),
+});
+
+app.get("/v1/mail/pools", async (request) => {
+  return { pools: await cp.listMailIpPools(resolveAccountId(request)) };
+});
+
+app.post("/v1/mail/pools", async (request, reply) => {
+  const parsed = createMailIpPoolSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.createMailIpPool({
+    accountId: resolveAccountId(request),
+    ...parsed.data,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+app.get("/v1/mail/pools/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const pool = await cp.getMailIpPool(id);
+  if (!pool || pool.accountId !== resolveAccountId(request)) {
+    return reply.code(404).send({ error: "pool not found" });
+  }
+  return pool;
+});
+
+app.patch("/v1/mail/pools/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = updateMailIpPoolSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.updateMailIpPool(
+    resolveAccountId(request),
+    id,
+    parsed.data,
+  );
+  if ("error" in result) {
+    const code = result.error === "pool not found" ? 404 : 400;
+    return reply.code(code).send(result);
+  }
+  return result;
+});
+
+app.delete("/v1/mail/pools/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const ok = await cp.deleteMailIpPool(resolveAccountId(request), id);
+  if (!ok) return reply.code(404).send({ error: "pool not found" });
+  return reply.code(204).send();
+});
+
+/* ----- per-user auth: login, SSO, session (plan §5.4) -----
+ *
+ *  Additive to the scoped-API-key model — these routes are exempt from
+ *  the API-key enforcement hook (you can't authenticate to obtain a
+ *  credential with a credential). Sessions gate the Console; keys gate
+ *  the API. Nothing here touches the existing request-auth path.
+ * ----- */
+
+const loginSchema = z.object({
+  email: z.string().min(3),
+  password: z.string().min(1),
+  name: z.string().optional(),
+});
+
+const registerSchema = z.object({
+  email: z.string().min(3),
+  password: z.string().min(8),
+  name: z.string().optional(),
+});
+
+const ssoStartSchema = z.object({
+  redirectUri: z.string().url(),
+});
+
+const ssoLoginSchema = z.object({
+  code: z.string().optional(),
+  email: z.string().optional(),
+});
+
+const sessionTokenSchema = z.object({
+  token: z.string().min(1),
+});
+
+// Email + password sign-in. An unknown email auto-registers in this
+// prototype draft — see ControlPlane.loginWithPassword.
+app.post("/v1/auth/login", async (request, reply) => {
+  const parsed = loginSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.loginWithPassword(parsed.data);
+  if ("error" in result) return reply.code(401).send({ error: result.error });
+  return reply.code(200).send(result);
+});
+
+// Explicit registration — fails when the email is already taken.
+app.post("/v1/auth/register", async (request, reply) => {
+  const parsed = registerSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.registerUser(parsed.data);
+  if ("error" in result) return reply.code(400).send({ error: result.error });
+  return reply.code(201).send(result);
+});
+
+// Which SSO provider is wired (real OIDC vs the bundled stub) — the
+// Console login page renders this on the "Continue with SSO" button.
+app.get("/v1/auth/sso/info", async () => {
+  return cp.ssoInfo();
+});
+
+// Begin an SSO login — returns the IdP authorize URL.
+app.post("/v1/auth/sso/start", async (request, reply) => {
+  const parsed = ssoStartSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  return reply.code(200).send(cp.beginSsoLogin(parsed.data.redirectUri));
+});
+
+// Complete an SSO login from the IdP callback.
+app.post("/v1/auth/sso/login", async (request, reply) => {
+  const parsed = ssoLoginSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.loginWithSso(parsed.data);
+  if ("error" in result) return reply.code(401).send({ error: result.error });
+  return reply.code(200).send(result);
+});
+
+// Resolve a session token → the signed-in user.
+app.post("/v1/auth/session", async (request, reply) => {
+  const parsed = sessionTokenSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const resolved = await cp.resolveSession(parsed.data.token);
+  if (!resolved) return reply.code(200).send({ authenticated: false });
+  return reply.code(200).send({ authenticated: true, ...resolved });
+});
+
+// Invalidate a session.
+app.post("/v1/auth/logout", async (request, reply) => {
+  const parsed = sessionTokenSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  await cp.logout(parsed.data.token);
+  return reply.code(204).send();
+});
+
+/* ----- registrar (plan §4.7 — Cantila Domains) ----- */
+
+// Search the catalog. Pass ?q=foo to suggest TLDs, or ?q=foo.com for an
+// exact-hostname quote. ?tlds=com,dev,io filters the suggestion list.
+app.get("/v1/domains/search", async (request) => {
+  const parsed = searchDomainsSchema.safeParse(request.query);
+  if (!parsed.success) {
+    return { results: [], error: parsed.error.flatten() };
+  }
+  const tlds = parsed.data.tlds
+    ? parsed.data.tlds.split(",").map((s) => s.trim()).filter(Boolean)
+    : undefined;
+  const results = await cp.searchDomains({ label: parsed.data.q, tlds });
+  return { results };
+});
+
+// Quote a single hostname.
+app.get("/v1/domains/quote", async (request, reply) => {
+  const q = request.query as { hostname?: string };
+  if (!q.hostname) return reply.code(400).send({ error: "hostname required" });
+  const result = await cp.quoteDomain(q.hostname);
+  if ("error" in result) return reply.code(400).send({ error: result.error });
+  return result;
+});
+
+// List the account's registrations.
+app.get("/v1/domains/registrations", async (request) => {
+  return {
+    registrations: await cp.listRegistrations(resolveAccountId(request)),
+  };
+});
+
+// Register a domain. accountId on the body is overridden by the caller's
+// account, and the optional projectId must belong to that account.
+app.post("/v1/domains/registrations", async (request, reply) => {
+  const parsed = registerDomainSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (
+    parsed.data.projectId &&
+    !(await assertProjectAccess(request, reply, parsed.data.projectId))
+  ) {
+    return;
+  }
+  const result = await cp.registerDomain({
+    ...parsed.data,
+    accountId: resolveAccountId(request),
+  });
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Attach a previously-registered domain to a project. The target project
+// must be owned by the caller; cross-account attachment is rejected.
+app.post(
+  "/v1/domains/registrations/:id/attach",
+  async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const parsed = attachRegistrationSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.flatten() });
+    }
+    if (!(await assertProjectAccess(request, reply, parsed.data.projectId))) {
+      return;
+    }
+    const result = await cp.attachRegistration(id, parsed.data.projectId);
+    if ("error" in result) {
+      const code = result.error.includes("not found") ? 404 : 400;
+      return reply.code(code).send({ error: result.error });
+    }
+    return reply.code(201).send(result);
+  },
+);
+
+// Aggregate metrics for the account dashboard (plan §4.8).
+app.get("/v1/metrics/account", async (request) => {
+  return cp.getAccountMetrics(resolveAccountId(request));
+});
+
+/* ----- Cantila Automations + Connections — plan §4.10 + §4.11 ----- */
+
+registerAutomationRoutes(app, {
+  cp,
+  store,
+  registry: engineRegistry,
+  resolveAccountId,
+});
+
+registerConnectionRoutes(app, {
+  store,
+  cp,
+  resolveAccountId,
+  writeSecret: writeConnectionSecret,
+});
+
+/* ----- Cantila Agents — plan §4.9 ----- */
+
+// Brain snapshot: memory, pending proposals, recent actions. ?fresh=1 forces
+// a synchronous tick first so the response always carries this-second state.
+app.get("/v1/agents/status", async (request) => {
+  const q = request.query as { fresh?: string };
+  if (q.fresh === "1") await cp.tickAgents();
+  return cp.agentsStatus();
+});
+
+// Force one tick — useful when a human just made a change and wants the
+// brain to react immediately.
+app.post("/v1/agents/tick", async () => {
+  await cp.tickAgents();
+  return cp.agentsStatus();
+});
+
+app.post("/v1/agents/pause", async () => {
+  cp.pauseAgents();
+  return { paused: true };
+});
+
+app.post("/v1/agents/resume", async () => {
+  cp.resumeAgents();
+  return { paused: false };
+});
+
+// Dev-only debug seam — push a synthetic action into the brain's journal
+// so the learning loop can be exercised end-to-end. Disabled in
+// production. Used by the learning-loop smoke test.
+const injectActionSchema = z.object({
+  agent: z.enum([
+    "uptime",
+    "deploy",
+    "cost",
+    "scale",
+    "security",
+    "capacity",
+    "mail",
+    "sms",
+  ]),
+  kind: z.string().min(1),
+  outcome: z.enum(["ok", "failed"]),
+  verified: z.enum(["n/a", "pending", "ok", "failed"]).optional(),
+  title: z.string().optional(),
+  detail: z.string().optional(),
+  count: z.number().int().min(1).max(50).default(1),
+});
+app.post("/v1/agents/_test/inject-action", async (request, reply) => {
+  if (config.nodeEnv === "production") {
+    return reply.code(404).send({ error: "not found" });
+  }
+  const parsed = injectActionSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const { count, ...rest } = parsed.data;
+  for (let i = 0; i < count; i++) cp._injectAgentAction(rest);
+  return { ok: true, injected: count };
+});
+
+// Dev-only — simulate a process restart for the brain's action journal.
+// Wipes the in-memory ring then rehydrates from the durable store. The
+// snapshot's learnings should be identical before and after.
+app.post("/v1/agents/_test/reload", async (request, reply) => {
+  if (config.nodeEnv === "production") {
+    return reply.code(404).send({ error: "not found" });
+  }
+  await cp._reloadAgentJournalFromDurable();
+  return { ok: true };
+});
+
+/* ----- Remote MCP server (plan §4.3.2 — "Cantila publishes a remote MCP
+ *  server. A user adds it once to Claude. From then on, any app built
+ *  inside Claude can be deployed to Cantila by simply asking.")
+ *
+ *  Wire format is JSON-RPC 2.0, the same the stdio transport speaks. A
+ *  client `POST`s one message (initialize / tools/list / tools/call) and
+ *  gets one response — or 204 for notifications. `GET /v1/mcp` returns
+ *  metadata (server info, protocol version, tool catalog) for operators
+ *  inspecting the endpoint without speaking JSON-RPC.
+ * ----- */
+
+app.get("/v1/mcp", async () => {
+  return mcpServer.describe();
+});
+
+app.post("/v1/mcp", async (request, reply) => {
+  const body = request.body as
+    | { id?: number | string; method?: string; params?: unknown }
+    | null
+    | undefined;
+  if (!body || typeof body !== "object") {
+    return reply.code(400).send({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32600, message: "invalid request" },
+    });
+  }
+  const response = await mcpServer.handleRpc(body);
+  if (!response) {
+    // notification — no reply body, just an empty 204
+    return reply.code(204).send();
+  }
+  return reply.code(200).send(response);
+});
+
+// Fleet capacity rollup (plan §5.2 + §15.1 — CapacityAgent surface). The
+// same data CapacityAgent ticks on; exposed here so the operator can see
+// the picture the agent is reasoning over. Account-scoped — passing
+// `?accountId=` (or relying on the auth-resolved account) returns only
+// the caller's tenant's instances.
+app.get("/v1/capacity", async (request) => {
+  return cp.getFleetCapacity(resolveAccountId(request));
+});
+
+// Activity feed — newest first. ?limit=N caps the response (default 100).
+app.get("/v1/activity", async (request) => {
+  const q = request.query as { limit?: string };
+  const limit = q.limit ? Math.max(1, Math.min(500, Number(q.limit))) : 100;
+  return {
+    events: await cp.listEvents(resolveAccountId(request), { limit }),
+  };
+});
+
+// Billing summary (plan §8) — plan tier, usage meters, recent charges.
+app.get("/v1/billing/summary", async (request) => {
+  return cp.getBillingSummary(resolveAccountId(request));
+});
+
+// Real Stripe invoice history (plan §8.5 — Phase B) — finalised invoices
+// from `stripe.invoices.list`, each with Stripe's hosted-page + PDF links.
+// A GET read, account-scoped via `resolveAccountId` like the summary.
+app.get("/v1/billing/invoices", async (request) => {
+  const invoices = await cp.listBillingInvoices(resolveAccountId(request), {
+    limit: 24,
+  });
+  return { invoices };
+});
+
+/* ----- AI adapter info (plan §5.6 / §15.1) ----- */
+
+/** Which AI analyser is wired (rule-based stub vs an LLM-backed one).
+ *  The Console can render a "(stub)" badge on the troubleshoot panel
+ *  when `live: false`. */
+app.get("/v1/ai/info", async () => {
+  return cp.aiInfo();
+});
+
+/** Which MailProvider is wired — stub today, Mailcow when the
+ *  carrier env vars are set. Plan §4.4 / §17.2. */
+app.get("/v1/mail/info", async () => {
+  return cp.mailInfo();
+});
+
+/* ----- Stripe rail (plan §8 / §15.1) ----- */
+
+/** Which Stripe adapter is wired (stub vs live). Mirrors `/v1/ai/info`
+ *  so the Console can render a "(stub)" badge on the Billing page when
+ *  STRIPE_SECRET_KEY isn't set. */
+app.get("/v1/billing/info", async () => {
+  return {
+    label: stripe.label,
+    live: stripe.live,
+    // Publishable key (`pk_…`) — safe to expose; the Console uses it to
+    // mount embedded Checkout (plan §8.5 — Phase D). Absent on the stub.
+    publishableKey: stripe.publishableKey,
+  };
+});
+
+const checkoutSessionSchema = z.object({
+  tier: z.enum(["hobby", "starter", "pro", "agency"]),
+  // `hosted` → a redirect URL; `embedded` → an in-page client secret
+  // (plan §8.5 — Phase D).
+  uiMode: z.enum(["hosted", "embedded"]).default("hosted"),
+  successUrl: z
+    .string()
+    .url()
+    .default("https://app.cantila.cloud/billing?checkout=success"),
+  cancelUrl: z
+    .string()
+    .url()
+    .default("https://app.cantila.cloud/billing?checkout=cancelled"),
+  returnUrl: z
+    .string()
+    .url()
+    .default("https://app.cantila.cloud/billing?checkout=success"),
+});
+
+/** Create a hosted checkout session for upgrading the caller's account
+ *  to a higher tier. Returns `{url}` — Console / CLI redirects the
+ *  buyer to it; the Stripe webhook flips the plan once payment lands. */
+app.post("/v1/billing/checkout-session", async (request, reply) => {
+  const accountId = requireBillingPrincipal(request, reply);
+  if (accountId === null) return reply;
+  const parsed = checkoutSessionSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.createCheckoutSession({
+    accountId,
+    tier: parsed.data.tier,
+    uiMode: parsed.data.uiMode,
+    successUrl: parsed.data.successUrl,
+    cancelUrl: parsed.data.cancelUrl,
+    returnUrl: parsed.data.returnUrl,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+const billingPortalSessionSchema = z.object({
+  returnUrl: z.string().url().default("https://app.cantila.cloud/billing"),
+});
+
+/** Create a Stripe billing-portal session for the caller's account — the
+ *  hosted page where they manage payment method, plan and invoice
+ *  history. Returns `{url}`; the Console / CLI redirects the customer. */
+app.post("/v1/billing/portal-session", async (request, reply) => {
+  const accountId = requireBillingPrincipal(request, reply);
+  if (accountId === null) return reply;
+  const parsed = billingPortalSessionSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.createBillingPortalSession({
+    accountId,
+    returnUrl: parsed.data.returnUrl,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+/* ----- mid-period proration (plan §8 / §15.2 — plan changes) ----- */
+
+const planChangeSchema = z.object({
+  tier: z.enum(["hobby", "starter", "pro", "agency"]),
+  prorationBehavior: z
+    .enum(["create_prorations", "always_invoice", "none"])
+    .optional(),
+});
+
+/** Preview the proration for a mid-period plan change — what switching
+ *  to `tier` costs (or credits) right now, without committing it. */
+app.post("/v1/billing/plan-change/preview", async (request, reply) => {
+  const accountId = requireBillingPrincipal(request, reply);
+  if (accountId === null) return reply;
+  const parsed = planChangeSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.previewPlanChange({
+    accountId,
+    toTier: parsed.data.tier,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Commit a mid-period plan change with proration. `prorationBehavior`
+ *  defaults to `create_prorations` (the proration rolls onto the next
+ *  invoice). The owning account is moved onto the new tier on success. */
+app.post("/v1/billing/plan-change", async (request, reply) => {
+  const accountId = requireBillingPrincipal(request, reply);
+  if (accountId === null) return reply;
+  const parsed = planChangeSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.changePlan({
+    accountId,
+    toTier: parsed.data.tier,
+    prorationBehavior: parsed.data.prorationBehavior,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Stripe webhook receiver. The raw body is needed for signature
+ *  verification — we already capture it for git webhooks (same
+ *  reason). Always returns 200 once parsed so Stripe doesn't retry on
+ *  events for accounts we don't know about. Signature failures land
+ *  as 400 so the operator notices a misconfigured webhook secret. */
+app.post("/v1/stripe/webhook", async (request, reply) => {
+  const signature =
+    typeof request.headers["stripe-signature"] === "string"
+      ? (request.headers["stripe-signature"] as string)
+      : undefined;
+  const result = await cp.handleStripeWebhook({
+    rawBody: rawBodyOf(request),
+    signature,
+  });
+  if ("error" in result) return reply.code(result.code).send(result);
+  return reply.code(200).send(result);
+});
+
+/* ----- dunning (plan §8 / §15.2 — failed-payment handling) ----- */
+
+/** Billing-health readout for the caller's account — billing status,
+ *  dunning attempts, the grace clock, and the rendered dunning emails.
+ *  Powers the Console billing banner and `cantila billing dunning`. */
+app.get("/v1/billing/dunning", async (request) => {
+  return cp.getDunningStatus(resolveAccountId(request));
+});
+
+/** Run the dunning grace-expiry sweep on demand — escalates `past_due`
+ *  accounts past their grace window to `suspended`. The same sweep runs
+ *  on a timer; this is for ops / cron. */
+app.post("/v1/billing/dunning/sweep", async () => {
+  return cp.runDunningSweep();
+});
+
+const dunningTestEventSchema = z.object({
+  accountId: z.string().min(1),
+  kind: z.enum(["failed", "succeeded", "grace-expiry"]),
+});
+
+/** Dev/test seam — drive the dunning state machine without a real
+ *  Stripe webhook. 404 in production, mirroring the agent test seams. */
+app.post("/v1/billing/_test/payment-event", async (request, reply) => {
+  if (config.nodeEnv === "production") {
+    return reply.code(404).send({ error: "not found" });
+  }
+  const parsed = dunningTestEventSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp._simulateDunningEvent(
+    parsed.data.accountId,
+    parsed.data.kind,
+  );
+  if ("error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+// Cost optimisation report (plan §5.6 — AI cost optimiser).
+app.get("/v1/cost/optimise", async (request) => {
+  return cp.getCostOptimisation(resolveAccountId(request));
+});
+
+// Monitoring (plan §5.3) — uptime monitors + active alerts + summary.
+// ?fresh=1 forces a sweep right now (slower but the snapshot is current to
+// the millisecond). Without it, the snapshot is whatever the periodic
+// background sweep last produced.
+app.get("/v1/monitoring", async (request) => {
+  const q = request.query as { fresh?: string };
+  if (q.fresh === "1") await cp.refreshMonitoring();
+  return cp.getMonitoring(resolveAccountId(request));
+});
+
+/* ----- team (plan §5.5) ----- */
+
+app.get("/v1/team/members", async (request) => {
+  return { members: await cp.listMembers(resolveAccountId(request)) };
+});
+
+app.post("/v1/team/members", async (request, reply) => {
+  const parsed = addMemberSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.addMember({
+    ...parsed.data,
+    accountId: resolveAccountId(request),
+  });
+  if ("error" in result) return reply.code(400).send({ error: result.error });
+  return reply.code(201).send(result);
+});
+
+app.patch("/v1/team/members/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = updateMemberRoleSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const accountId = resolveAccountId(request);
+  // Membership rows are looked up by id but ownership matters: a caller
+  // for account A must not be able to mutate a member of account B.
+  const members = await cp.listMembers(accountId);
+  if (!members.some((m) => m.id === id)) {
+    return reply.code(404).send({ error: "member not found" });
+  }
+  const result = await cp.updateMemberRole(accountId, id, parsed.data.role);
+  if ("error" in result) {
+    return reply.code(404).send({ error: result.error });
+  }
+  return result;
+});
+
+app.delete("/v1/team/members/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const accountId = resolveAccountId(request);
+  const members = await cp.listMembers(accountId);
+  if (!members.some((m) => m.id === id)) {
+    return reply.code(404).send({ error: "member not found" });
+  }
+  const ok = await cp.removeMember(accountId, id);
+  if (!ok) return reply.code(404).send({ error: "member not found" });
+  return reply.code(204).send();
+});
+
+/* ----- invites (plan §5.4 — per-user invite flow) -----
+ *
+ * Two of these routes are public — the lookup-by-token reads the invite
+ * for the accept page, and the accept POST takes the token in the body.
+ * They are exempt from the API-key/session auth gate in the onRequest
+ * hook above; the token itself is the credential. The three management
+ * routes (list / create / revoke) require a real principal and scope
+ * to the caller's account via `resolveAccountId`. */
+
+app.get("/v1/invites", async (request) => {
+  return { invites: await cp.listInvites(resolveAccountId(request)) };
+});
+
+app.post("/v1/invites", async (request, reply) => {
+  const parsed = createInviteSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const accountId = resolveAccountId(request);
+  // Best-effort attribution: pull the inviting user id off the session
+  // if one is present. API-key callers leave it undefined.
+  const session = (request as { session?: { userId: string } }).session;
+  const result = await cp.createInvite({
+    accountId,
+    email: parsed.data.email,
+    role: parsed.data.role,
+    invitedByUserId: session?.userId,
+  });
+  if ("error" in result) return reply.code(400).send({ error: result.error });
+  return reply.code(201).send(result);
+});
+
+app.delete("/v1/invites/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const accountId = resolveAccountId(request);
+  const result = await cp.revokeInvite(accountId, id);
+  if ("error" in result) {
+    const code = result.error === "invite not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return result;
+});
+
+app.get("/v1/invites/by-token/:token", async (request, reply) => {
+  const { token } = request.params as { token: string };
+  const result = await cp.lookupInviteByToken(token);
+  if ("error" in result) return reply.code(404).send({ error: result.error });
+  return result;
+});
+
+app.post("/v1/invites/accept", async (request, reply) => {
+  const parsed = acceptInviteSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.acceptInvite(parsed.data);
+  if ("error" in result) return reply.code(400).send({ error: result.error });
+  return reply.code(201).send(result);
+});
+
+/* ----- API keys (plan §5.4 — scoped API keys) ----- */
+
+// Strip the on-disk hash from the wire payload — we never return it via HTTP.
+function publicKey(k: import("./domain/types").ApiKey) {
+  const { hash: _hash, ...safe } = k;
+  return safe;
+}
+
+app.get("/v1/api-keys", async (request) => {
+  const keys = await cp.listApiKeys(resolveAccountId(request));
+  return { keys: keys.map(publicKey) };
+});
+
+app.post("/v1/api-keys", async (request, reply) => {
+  const callerKey = getApiKey(request);
+
+  // Bootstrap window: no caller key + no Account rows yet → the body must
+  // describe the *account* being created, not just the key. We provision
+  // the Account + first admin key atomically. After this call the window
+  // closes and future POSTs follow the normal "add a key to your own
+  // account" path below.
+  if (!callerKey) {
+    const accountCount = await cp.countAccounts();
+    if (accountCount === 0) {
+      const parsed = bootstrapAccountSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({
+          error: parsed.error.flatten(),
+          hint:
+            "First call must include accountName + accountHandle to provision the tenant.",
+        });
+      }
+      const result = await cp.bootstrapAccountAndKey(parsed.data);
+      if ("error" in result) {
+        return reply.code(400).send({ error: result.error });
+      }
+      return reply.code(201).send({
+        account: result.account,
+        key: publicKey(result.key),
+        rawKey: result.rawKey,
+      });
+    }
+  }
+
+  const parsed = createApiKeySchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  // Past the bootstrap window the authenticated caller's account wins;
+  // the body's `accountId` is ignored. This prevents an admin on account
+  // A from minting keys for account B — to onboard a new tenant, the
+  // operator must use `POST /v1/accounts` instead.
+  const accountId = callerKey?.accountId ?? parsed.data.accountId;
+  const result = await cp.createApiKey({ ...parsed.data, accountId });
+  if ("error" in result) {
+    return reply.code(400).send({ error: result.error });
+  }
+  return reply.code(201).send({
+    key: publicKey(result.key),
+    rawKey: result.rawKey, // shown exactly once to the caller
+  });
+});
+
+/* ----- accounts (plan §5.4 — tenant onboarding) ----- */
+
+// Read the caller's account. Authenticated callers see their own row;
+// without auth the demo account record is returned if it exists.
+app.get("/v1/accounts/me", async (request, reply) => {
+  const accountId = resolveAccountId(request);
+  const account = await cp.getAccount(accountId);
+  if (!account) {
+    return reply.code(404).send({ error: "account not found", accountId });
+  }
+  return account;
+});
+
+/* ----- white-label / reseller — sub-accounts (plan §5.5) ----- */
+
+const createSubAccountSchema = z.object({
+  name: z.string().min(1),
+  handle: z.string().min(3).max(40),
+  plan: z.enum(["hobby", "starter", "pro", "agency", "dedicated"]).optional(),
+  keyName: z.string().min(1).optional(),
+  keyScope: z.enum(["read", "deploy", "admin"]).optional(),
+});
+
+/** Mint a sub-account under the caller's parent (plan §5.5 — white-label).
+ *  The caller's account must be on a reseller-eligible plan (agency /
+ *  dedicated); see `cp.RESELLER_PLANS`. Returns the new account + its
+ *  first admin key + the raw key (one-time reveal). */
+app.post("/v1/accounts/sub", async (request, reply) => {
+  const parentAccountId = resolveAccountId(request);
+  const parsed = createSubAccountSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.createSubAccount({
+    parentAccountId,
+    ...parsed.data,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send({
+    account: result.account,
+    key: result.key,
+    rawKey: result.rawKey, // shown exactly once
+  });
+});
+
+/** List sub-accounts under the caller (plan §5.5). Returns `[]` for a
+ *  top-level account with no children. */
+app.get("/v1/accounts/sub", async (request) => {
+  const parentAccountId = resolveAccountId(request);
+  return { accounts: await cp.listSubAccounts(parentAccountId) };
+});
+
+/* ----- Per-account Anthropic API key (plan §4.3.1) ----- */
+
+const setAnthropicKeySchema = z.object({
+  apiKey: z.string().min(20),
+});
+
+/** Set / rotate the per-tenant Anthropic API key. Spend on AI analyses
+ *  for this account is then billed to the tenant's Anthropic account,
+ *  not Cantila's. The key is stored plaintext on the Account row today
+ *  (production swap-in: KMS-backed envelope encryption). */
+app.post("/v1/accounts/me/anthropic-key", async (request, reply) => {
+  const accountId = resolveAccountId(request);
+  const parsed = setAnthropicKeySchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.setAnthropicApiKey(accountId, parsed.data.apiKey);
+  if (result && "error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Clear the per-tenant key — revert to the platform-default analyser. */
+app.delete("/v1/accounts/me/anthropic-key", async (request, reply) => {
+  const accountId = resolveAccountId(request);
+  const result = await cp.clearAnthropicApiKey(accountId);
+  if (result && "error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+/* ----- White-label branding (plan §5.5).
+ *
+ *   Two routes for one operation: `/v1/accounts/me/branding` patches
+ *   the active account (which itself respects X-Cantila-Act-As — so a
+ *   parent acting as a sub-account hits this same path to edit that
+ *   sub-account's branding); `/v1/accounts/:id/branding` is the
+ *   explicit form for editing a NAMED child without flipping the
+ *   act-as scope first. Both call into `cp.updateAccountBranding`
+ *   which enforces `canActOnAccount` and validates colour / URL
+ *   shape. Empty-string in any field clears that field.
+ * ----- */
+
+const brandingPatchSchema = z.object({
+  brandPrimaryColor: z.string().max(7).optional(),
+  brandAccentColor: z.string().max(7).optional(),
+  brandLogoUrl: z.string().max(500).optional(),
+  brandDisplayName: z.string().max(64).optional(),
+});
+
+app.patch("/v1/accounts/me/branding", async (request, reply) => {
+  const parsed = brandingPatchSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const targetAccountId = resolveAccountId(request);
+  const callerAccountId = resolveActorAccountId(request);
+  const result = await cp.updateAccountBranding({
+    callerAccountId,
+    targetAccountId,
+    patch: parsed.data,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return result;
+});
+
+app.patch("/v1/accounts/:id/branding", async (request, reply) => {
+  const { id: targetAccountId } = request.params as { id: string };
+  const parsed = brandingPatchSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const callerAccountId = resolveActorAccountId(request);
+  const result = await cp.updateAccountBranding({
+    callerAccountId,
+    targetAccountId,
+    patch: parsed.data,
+  });
+  if ("error" in result) return reply.code(403).send(result);
+  return result;
+});
+
+/* ----- White-label billing-rollup (plan §5.5).
+ *
+ *   POST /v1/accounts/:id/billing-rollup       — enrol a sub-account
+ *   DELETE /v1/accounts/:id/billing-rollup     — leave the rollup
+ *
+ *   Both gate at the ControlPlane layer on "caller is the parent",
+ *   so a sub-account can't enrol another sub or take itself off the
+ *   bill. The :id is the SUB-ACCOUNT to operate on; the caller's
+ *   resolved account is the parent. (Act-as is intentionally
+ *   ignored here — `resolveActorAccountId` returns the caller's true
+ *   account so a parent can't accidentally enrol a sub onto a child
+ *   account by having flipped their act-as scope first.)
+ * ----- */
+app.post("/v1/accounts/:id/billing-rollup", async (request, reply) => {
+  const { id: targetAccountId } = request.params as { id: string };
+  const callerAccountId = resolveActorAccountId(request);
+  const result = await cp.enrollInBillingRollup({
+    callerAccountId,
+    targetAccountId,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return result;
+});
+
+app.delete("/v1/accounts/:id/billing-rollup", async (request, reply) => {
+  const { id: targetAccountId } = request.params as { id: string };
+  const callerAccountId = resolveActorAccountId(request);
+  const result = await cp.leaveBillingRollup({
+    callerAccountId,
+    targetAccountId,
+  });
+  if ("error" in result) return reply.code(400).send(result);
+  return result;
+});
+
+// Provision a new tenant. The auth-resolve + enforcement hooks handle
+// "is the caller allowed to hit this URL":
+//   - Bootstrap window (zero Account rows): unauthenticated POST allowed.
+//   - Auth on, key present: hook lets it through; the scope guard below
+//     enforces admin (so a deploy-scope key can't spawn sibling tenants).
+//   - Auth on, no key, accounts exist: hook returns 401 before we run.
+//   - Auth off: dev mode, no gate at all.
+app.post("/v1/accounts", async (request, reply) => {
+  const caller = getApiKey(request);
+  if (caller && caller.scope !== "admin") {
+    return reply
+      .code(403)
+      .send({ error: "creating accounts requires an admin-scope key" });
+  }
+  const parsed = bootstrapAccountSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.bootstrapAccountAndKey(parsed.data);
+  if ("error" in result) {
+    return reply.code(400).send({ error: result.error });
+  }
+  return reply.code(201).send({
+    account: result.account,
+    key: publicKey(result.key),
+    rawKey: result.rawKey, // shown exactly once
+  });
+});
+
+app.delete("/v1/api-keys/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  // Pass the caller's accountId when authed so we can't drop a key
+  // belonging to another account.
+  const callerKey = getApiKey(request);
+  const result = await cp.revokeApiKey(id, callerKey?.accountId);
+  if ("error" in result) {
+    const code = result.code === "not_found" ? 404 : 403;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(204).send();
+});
+
+// Identify the caller. Used by both the Console "who am I" panel and the
+// CLI's `cantila whoami`. Reads the key the auth-resolve hook attached
+// and joins it with the Account row so callers see their tenant name,
+// handle and plan in a single response.
+app.get("/v1/me", async (request) => {
+  const key = getApiKey(request);
+  if (!key) {
+    return { authenticated: false };
+  }
+  const account = await cp.getAccount(key.accountId);
+  return {
+    authenticated: true,
+    accountId: key.accountId,
+    keyName: key.name,
+    scope: key.scope,
+    prefix: key.prefix,
+    account: account ?? null,
+  };
+});
+
+/* ----- multi-org tenancy (plan §18 — Option B) -----
+ *  These routes are session-only (a Bearer `cts_…` is required); they
+ *  let a logged-in user see every org they belong to, switch active org,
+ *  and leave an org. API keys are scoped to one account by construction,
+ *  so they never need these surfaces. */
+
+// List every account the caller belongs to. Used by the Console
+// org-switcher dropdown.
+app.get("/v1/me/orgs", async (request, reply) => {
+  const session = getSessionAuth(request);
+  if (!session) {
+    return reply.code(401).send({
+      error: "session required (Bearer cts_ token)",
+    });
+  }
+  const orgs = await cp.listMyOrgs(session.userId);
+  return { orgs, currentAccountId: session.accountId };
+});
+
+// Switch active org. Body: { accountId }. The control plane verifies
+// membership before flipping the session's `currentAccountId`.
+const switchOrgSchema = z.object({ accountId: z.string().min(1) });
+app.post("/v1/me/orgs/switch", async (request, reply) => {
+  const session = getSessionAuth(request);
+  if (!session) {
+    return reply.code(401).send({
+      error: "session required (Bearer cts_ token)",
+    });
+  }
+  const parsed = switchOrgSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.switchOrg({
+    sessionId: session.sessionId,
+    userId: session.userId,
+    accountId: parsed.data.accountId,
+  });
+  if ("error" in result) {
+    return reply.code(403).send({ error: result.error });
+  }
+  return result;
+});
+
+// Leave an org. Body: { accountId }. The last owner cannot leave;
+// promote someone first.
+const leaveOrgSchema = z.object({ accountId: z.string().min(1) });
+app.post("/v1/me/orgs/leave", async (request, reply) => {
+  const session = getSessionAuth(request);
+  if (!session) {
+    return reply.code(401).send({
+      error: "session required (Bearer cts_ token)",
+    });
+  }
+  const parsed = leaveOrgSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const result = await cp.leaveOrg({
+    sessionId: session.sessionId,
+    userId: session.userId,
+    accountId: parsed.data.accountId,
+  });
+  if ("error" in result) {
+    return reply.code(400).send({ error: result.error });
+  }
+  return result;
+});
+
+// Connect a git repository (plan §5.1 — git-based deploys). Response
+// carries the per-project HMAC `webhookSecret` exactly once; future
+// `GET /v1/projects/:id` calls never include it (it's not persisted in
+// the read path) so the caller must capture it now.
+app.post("/v1/projects/:id/git", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = connectGitSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.connectGit(id, parsed.data);
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Rotate the per-project webhook HMAC secret. Use this when a secret
+// leaks or as a routine credential-rotation. The previous secret stops
+// working immediately.
+app.post("/v1/projects/:id/git/rotate-secret", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.rotateWebhookSecret(id);
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+/* ----- backups (plan §5.5) ----- */
+
+const createBackupSchema = z.object({
+  note: z.string().max(280).optional(),
+});
+
+// List a project's backups, newest first.
+app.get("/v1/projects/:id/backups", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return { backups: await cp.listBackups(id) };
+});
+
+// Take a backup of the current live deployment + env vars.
+app.post("/v1/projects/:id/backups", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = createBackupSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.createBackup(id, {
+    note: parsed.data.note,
+    trigger: "manual",
+  });
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Restore from a backup — re-applies env vars + rolls back deployment.
+app.post(
+  "/v1/projects/:id/backups/:backupId/restore",
+  async (request, reply) => {
+    const { id, backupId } = request.params as {
+      id: string;
+      backupId: string;
+    };
+    if (!(await assertProjectAccess(request, reply, id))) return;
+    const result = await cp.restoreBackup(id, backupId);
+    if ("error" in result) {
+      const code = result.error.includes("not found") ? 404 : 400;
+      return reply.code(code).send({ error: result.error });
+    }
+    return reply.code(201).send(result);
+  },
+);
+
+// Drop a backup.
+app.delete(
+  "/v1/projects/:id/backups/:backupId",
+  async (request, reply) => {
+    const { id, backupId } = request.params as {
+      id: string;
+      backupId: string;
+    };
+    if (!(await assertProjectAccess(request, reply, id))) return;
+    // Cross-check the backup actually belongs to this project before the
+    // CP layer's delete fires — the CP method doesn't take a projectId so
+    // the guard lives here.
+    const backup = await cp.getBackup(backupId);
+    if (!backup || backup.projectId !== id) {
+      return reply.code(404).send({ error: "backup not found" });
+    }
+    const result = await cp.deleteBackup(backupId);
+    if ("error" in result) {
+      return reply.code(404).send({ error: result.error });
+    }
+    return reply.code(204).send();
+  },
+);
+
+/* ----- preview environments (plan §5.1) ----- */
+
+// List a project's live preview deployments. Each preview lives at its
+// own subdomain — see `Deployment.url`.
+app.get("/v1/projects/:id/previews", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  return { previews: await cp.listPreviews(id) };
+});
+
+const deployPreviewSchema = z.object({
+  branch: z.string().min(1),
+  commit: z
+    .object({
+      hash: z.string().optional(),
+      message: z.string().optional(),
+    })
+    .optional(),
+});
+
+// Manually spin up a preview environment from a branch. The webhook
+// receiver does this automatically for non-tracked branches; this route
+// is for testing without setting up a real git host.
+app.post("/v1/projects/:id/previews", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = deployPreviewSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.deployPreview(id, parsed.data.branch, {
+    trigger: "cli",
+    commit: parsed.data.commit,
+  });
+  if ("error" in result) {
+    return reply.code(404).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Tear down a preview environment by its deployment id.
+app.delete(
+  "/v1/projects/:id/previews/:deploymentId",
+  async (request, reply) => {
+    const { id, deploymentId } = request.params as {
+      id: string;
+      deploymentId: string;
+    };
+    if (!(await assertProjectAccess(request, reply, id))) return;
+    const result = await cp.destroyPreview(id, deploymentId);
+    if ("error" in result) {
+      const code = result.error.includes("not found") ? 404 : 400;
+      return reply.code(code).send({ error: result.error });
+    }
+    return reply.code(200).send(result);
+  },
+);
+
+// Detach the connected repo.
+app.delete("/v1/projects/:id/git", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.disconnectGit(id);
+  if (!result) return reply.code(404).send({ error: "project not found" });
+  return result;
+});
+
+// Git push webhook receiver. The body shape is a small, provider-neutral
+// envelope; a real adapter for GitHub / GitLab / Bitbucket would translate
+// the provider payload to this shape on the way in.
+//
+// Auth: this route is NOT gated by `assertProjectAccess` — external git
+// providers don't carry Cantila API keys. Instead, every project that
+// goes through `POST /v1/projects/:id/git` is issued a `webhookSecret`,
+// and the sender must HMAC-SHA256 the raw body and pass it as either
+// `X-Hub-Signature-256: sha256=<hex>` (GitHub's convention) or
+// `X-Cantila-Signature: <hex>`. Without a valid signature the receiver
+// returns 401, so knowing a project id alone is not enough to fire
+// deploys.
+app.post("/v1/projects/:id/git/webhook", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = pushWebhookSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  const headers = request.headers;
+  const sigHeader =
+    (Array.isArray(headers["x-hub-signature-256"])
+      ? headers["x-hub-signature-256"][0]
+      : headers["x-hub-signature-256"]) ??
+    (Array.isArray(headers["x-cantila-signature"])
+      ? headers["x-cantila-signature"][0]
+      : headers["x-cantila-signature"]);
+  const result = await cp.handlePushWebhook(id, parsed.data, {
+    rawBody: rawBodyOf(request),
+    signature: typeof sigHeader === "string" ? sigHeader : undefined,
+  });
+  if ("error" in result) {
+    // Signature-related rejections are 401 (authentication problem);
+    // everything else stays 400 / 202 as before.
+    const isSig =
+      result.code === "rejected" &&
+      (result.error.includes("signature") || result.error.includes("Bearer"));
+    const code = isSig ? 401 : result.code === "rejected" ? 400 : 202;
+    return reply.code(code).send({ skipped: result.code === "skipped", error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Provision the bundled managed database (idempotent — returns existing if present).
+app.post("/v1/projects/:id/database", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = provisionDbSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.provisionDb(id, parsed.data.engine);
+  if ("error" in result) {
+    return reply.code(404).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+/* ----- boot ----- */
+
+app
+  .listen({ port: config.port, host: "0.0.0.0" })
+  .then(() => {
+    app.log.info(
+      `cantila-control-plane listening on :${config.port} · store=${config.store}`,
+    );
+    cp.startBackgroundJobs();
+    app.log.info("background jobs started (uptime sweeps every 30s)");
+  })
+  .catch((err) => {
+    app.log.error(err);
+    process.exit(1);
+  });
