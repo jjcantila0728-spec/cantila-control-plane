@@ -20,6 +20,11 @@ export const config = {
   store: storeKind(),
   /** Platform database URL — required when store is "prisma". */
   databaseUrl: process.env.DATABASE_URL ?? "",
+  /** Escape hatch for the production safety guard in `createStore` —
+   *  when true, an ephemeral `STORE=memory` is allowed in prod (used
+   *  by short-lived diagnostic / smoke containers). Default is to
+   *  refuse so the durable backend can't be forgotten by accident. */
+  allowMemoryInProd: flag(process.env.CANTILA_ALLOW_MEMORY_IN_PROD),
   /** When true, write routes (POST/PUT/PATCH/DELETE) require a valid bearer
    *  token with sufficient scope (plan §5.4). Defaults to false so the
    *  in-process demo flow needs no setup. Recommended for any deployment
