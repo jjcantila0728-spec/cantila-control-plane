@@ -51,27 +51,36 @@ let ok = 0;
 let fail = 0;
 for (const name of names) {
   process.stdout.write(`  • ${name} … `);
+  // `shell: true` is required on Windows where `npx` is a `.cmd`
+  // shim; on POSIX it's a harmless extra `sh -c`. Prisma's success
+  // message goes to stdout, errors to stderr.
   const r = spawnSync(
     "npx",
     ["--yes", "prisma", "migrate", "resolve", "--applied", name],
     {
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
+      shell: true,
     },
   );
+  const stdout = (r.stdout ?? Buffer.from("")).toString("utf8");
+  const stderr = (r.stderr ?? Buffer.from("")).toString("utf8");
   if (r.status === 0) {
-    console.log("ok");
+    // Prisma prints "marked as applied" on first apply; subsequent
+    // calls go through without that line and still exit 0.
+    console.log(/marked as applied/i.test(stdout) ? "ok" : "already applied");
     ok++;
   } else {
-    const stderr = (r.stderr ?? Buffer.from("")).toString("utf8");
-    // Prisma reports "is already recorded as applied" on re-run —
-    // treat as success since the desired state is reached.
-    if (/already recorded/i.test(stderr)) {
+    // Some Prisma versions report "is already recorded as applied"
+    // via stderr + non-zero exit on re-run — treat that as success
+    // since the desired state is reached.
+    if (/already recorded/i.test(stderr) || /already recorded/i.test(stdout)) {
       console.log("already applied");
       ok++;
     } else {
       console.log("FAILED");
-      console.error(stderr.split("\n").map((l) => `      ${l}`).join("\n"));
+      const combined = (stderr + stdout).split("\n").filter(Boolean);
+      console.error(combined.map((l) => `      ${l}`).join("\n"));
       fail++;
     }
   }
