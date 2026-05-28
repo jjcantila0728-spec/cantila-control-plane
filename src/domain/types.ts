@@ -212,6 +212,14 @@ export interface AuthUser {
    *  creation — it makes a session a real, account-scoped API credential.
    *  Absent on legacy rows; readers fall back to the default account. */
   accountId?: string;
+  /** ISO timestamp when the user verified their email via the
+   *  `email_verify` one-shot token flow (plan §5.4). `undefined`
+   *  before verification — the column is nullable + back-compat
+   *  for legacy rows. Today the verification gate is advisory
+   *  (the Console renders a banner); it is NOT yet a hard sign-in
+   *  block — that decision lives at the route layer when Mail
+   *  goes live and bounces become a real signal. */
+  emailVerifiedAt?: string;
   createdAt: string;
 }
 

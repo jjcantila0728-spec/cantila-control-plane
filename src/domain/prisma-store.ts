@@ -1374,6 +1374,17 @@ export class PrismaStore implements Store {
     return toAuthUser(row);
   }
 
+  async setUserEmailVerifiedAt(
+    userId: string,
+    verifiedAt: string,
+  ): Promise<AuthUser> {
+    const row = await this.db.user.update({
+      where: { id: userId },
+      data: { emailVerifiedAt: new Date(verifiedAt) },
+    });
+    return toAuthUser(row);
+  }
+
   async createSession(s: Session): Promise<Session> {
     const row = await this.db.session.create({
       data: {
@@ -2235,6 +2246,7 @@ function toAuthUser(r: DbUser): AuthUser {
     passwordHash: r.passwordHash ?? undefined,
     twoFactorEnabled: r.twoFactorEnabled,
     accountId: r.accountId ?? undefined,
+    emailVerifiedAt: r.emailVerifiedAt?.toISOString(),
     createdAt: r.createdAt.toISOString(),
   };
 }

@@ -255,15 +255,19 @@ model Account {
 }
 
 model User {
-  id               String   @id @default(cuid())
-  email            String   @unique
+  id               String    @id @default(cuid())
+  email            String    @unique
   name             String
   passwordHash     String?
-  twoFactorEnabled Boolean  @default(false)
+  twoFactorEnabled Boolean   @default(false)
   /// The account this user belongs to (plan §5.4) — makes a session a
   /// real, account-scoped API credential. Nullable for legacy rows.
   accountId        String?
-  createdAt        DateTime @default(now())
+  /// ISO timestamp when the user verified their email via the
+  /// `email_verify` one-shot token flow (plan §5.4 / v1.18). Nullable;
+  /// legacy rows read as unverified.
+  emailVerifiedAt  DateTime?
+  createdAt        DateTime  @default(now())
 
   memberships Membership[]
   sessions    Session[]

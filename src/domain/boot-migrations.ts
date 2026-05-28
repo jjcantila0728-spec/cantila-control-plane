@@ -24,6 +24,11 @@
    - Destructive changes (DROP, NOT NULL backfill, type narrow)
      still require explicit operator action — never auto-applied.
    - Once `prisma migrate deploy` is wired, this runner retires.
+     The cutover path is documented at
+     `docs/PRISMA-MIGRATE-BASELINE.md` (v1.18 / F): run
+     `npm run prisma:baseline` once to mark every existing
+     migration as applied, then switch the boot path to
+     `prisma migrate deploy` and delete this file.
    ============================================================ */
 
 import type { PrismaClient } from "@prisma/client";
@@ -51,6 +56,12 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
     description:
       "Project.coolifyAppUuid — persisted Coolify Application UUID so the live data plane skips the /applications rescan on every restart (v1.17 / §19).",
     sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "coolifyAppUuid" TEXT;',
+  },
+  {
+    id: "20260528010000_add_user_email_verified_at",
+    description:
+      "User.emailVerifiedAt — ISO timestamp the user completed email_verify (v1.18 / §5.4). Nullable; absent on legacy rows reads as unverified.",
+    sql: 'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "emailVerifiedAt" TIMESTAMP(3);',
   },
 ];
 

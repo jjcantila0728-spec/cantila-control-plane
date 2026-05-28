@@ -25,10 +25,11 @@
 
 import type { Project, ProjectMetricSample, Region, Runtime } from "../domain/types";
 import type { DataPlane, DeploySource } from "../deploy/pipeline";
+import type { MetricsCollector } from "./metrics-collector";
 
 /** Per-region Coolify panel binding (plan §19.8 multi-server). Phase 3
  *  uses one Coolify panel per region — this carries each panel's URL,
- *  token, server and project uuid. The base options' `apiUrl` /
+ *  token, server(s) and project uuid. The base options' `apiUrl` /
  *  `apiToken` act as defaults when a region entry omits them. */
 export interface CoolifyRegionConfig {
   /** Optional override of the default `apiUrl` for this region.
@@ -36,8 +37,16 @@ export interface CoolifyRegionConfig {
   apiUrl?: string;
   /** Optional override of the default `apiToken` for this region. */
   apiToken?: string;
-  /** Coolify Server UUID for this region. */
-  serverUuid: string;
+  /** Coolify Server UUID for this region (single-node back-compat).
+   *  Either this or `servers` must be set. */
+  serverUuid?: string;
+  /** Multiple Coolify Server UUIDs in this region (within-region
+   *  multi-node, plan §19.8). When ≥ 2 are set, project-to-server
+   *  binding is deterministic by `hash(project.id) % servers.length`
+   *  — no extra bookkeeping, a control-plane restart still routes
+   *  every project to the same server. Takes precedence over
+   *  `serverUuid` when both are set. */
+  servers?: string[];
   /** Coolify Project UUID for this region. */
   projectUuid: string;
 }
@@ -76,6 +85,13 @@ export interface CoolifyDataPlaneOptions {
    *  the in-process cache rehydrate). When absent the cache still works,
    *  just rebuilt lazily on restart. */
   persistAppUuid?: (projectId: string, appUuid: string) => Promise<void>;
+  /** Optional real-metrics collector (plan §19.7). When wired,
+   *  `sampleMetrics()` asks the collector first; on `null` or any
+   *  failure it falls back to the existing status-aware synthesis.
+   *  Today's implementation is `SshDockerStatsCollector` — SSH'ing to
+   *  the Coolify host and reading `docker stats` filtered by
+   *  Coolify's `coolify.applicationId` label. */
+  metricsCollector?: MetricsCollector;
 }
 
 /** Concrete per-project routing — apiUrl/apiToken/serverUuid/projectUuid
@@ -87,6 +103,16 @@ interface ResolvedRegion {
   projectUuid: string;
 }
 
+/** Region-level binding with multiple servers — `regionFor()` picks
+ *  one per project deterministically and returns a `ResolvedRegion`. */
+interface ResolvedRegionGroup {
+  apiUrl: string;
+  apiToken: string;
+  /** Non-empty list of Coolify Server UUIDs in this region. */
+  servers: string[];
+  projectUuid: string;
+}
+
 export class CoolifyDataPlane implements DataPlane {
   private readonly defaultApiUrl: string;
   private readonly defaultApiToken: string;
@@ -95,8 +121,9 @@ export class CoolifyDataPlane implements DataPlane {
   /** Per-region routing table. Always populated — when the caller
    *  passes only `serverUuid` + `projectUuid` (legacy single-region
    *  setup), it gets folded into a one-entry table keyed by
-   *  `defaultRegion`. */
-  private readonly regions: ReadonlyMap<Region, ResolvedRegion>;
+   *  `defaultRegion`. Each entry can carry one or more servers
+   *  (within-region multi-node, plan §19.8). */
+  private readonly regions: ReadonlyMap<Region, ResolvedRegionGroup>;
   private readonly defaultRegion: Region;
   /** projectId → Coolify Application UUID. Authoritative copy lives on
    *  `Project.coolifyAppUuid` (column added 2026-05-28); this is a
@@ -108,6 +135,7 @@ export class CoolifyDataPlane implements DataPlane {
     projectId: string,
     appUuid: string,
   ) => Promise<void>;
+  private readonly metricsCollector?: MetricsCollector;
 
   constructor(opts: CoolifyDataPlaneOptions) {
     this.defaultApiUrl = opts.apiUrl.replace(/\/+$/, "");
@@ -115,17 +143,24 @@ export class CoolifyDataPlane implements DataPlane {
     this.environmentName = opts.environmentName ?? "production";
     this.apexDomain = opts.apexDomain ?? "cantila.app";
     this.persistAppUuid = opts.persistAppUuid;
+    this.metricsCollector = opts.metricsCollector;
 
-    const regions = new Map<Region, ResolvedRegion>();
+    const regions = new Map<Region, ResolvedRegionGroup>();
     if (opts.regions && Object.keys(opts.regions).length > 0) {
       for (const [region, cfg] of Object.entries(opts.regions) as [
         Region,
         CoolifyRegionConfig,
       ][]) {
+        const servers = resolveRegionServers(cfg);
+        if (servers.length === 0) {
+          throw new Error(
+            `CoolifyDataPlane: region "${region}" has no serverUuid / servers configured`,
+          );
+        }
         regions.set(region, {
           apiUrl: (cfg.apiUrl ?? this.defaultApiUrl).replace(/\/+$/, ""),
           apiToken: cfg.apiToken ?? this.defaultApiToken,
-          serverUuid: cfg.serverUuid,
+          servers,
           projectUuid: cfg.projectUuid,
         });
       }
@@ -137,7 +172,7 @@ export class CoolifyDataPlane implements DataPlane {
       regions.set(region, {
         apiUrl: this.defaultApiUrl,
         apiToken: this.defaultApiToken,
-        serverUuid: opts.serverUuid,
+        servers: [opts.serverUuid],
         projectUuid: opts.projectUuid,
       });
     } else {
@@ -152,14 +187,27 @@ export class CoolifyDataPlane implements DataPlane {
         : (regions.keys().next().value as Region);
   }
 
-  /** Resolve the per-region routing for a project. Falls back to
-   *  `defaultRegion` when the project's region has no entry — that
-   *  keeps the legacy single-region setup working unchanged. */
+  /** Resolve the per-region routing for a project, picking one
+   *  server from the region's group deterministically by
+   *  `hash(project.id) % servers.length` so the same project always
+   *  lands on the same node across control-plane restarts (plan
+   *  §19.8 within-region multi-node). Falls back to `defaultRegion`
+   *  when the project's region has no entry — that keeps the legacy
+   *  single-region setup working unchanged. */
   private regionFor(project: Project): ResolvedRegion {
-    return (
+    const group =
       this.regions.get(project.region) ??
-      this.regions.get(this.defaultRegion)!
-    );
+      this.regions.get(this.defaultRegion)!;
+    const serverUuid =
+      group.servers.length === 1
+        ? group.servers[0]!
+        : group.servers[hashSeed(project.id) % group.servers.length]!;
+    return {
+      apiUrl: group.apiUrl,
+      apiToken: group.apiToken,
+      serverUuid,
+      projectUuid: group.projectUuid,
+    };
   }
 
   async detectStack(source: DeploySource): Promise<Runtime> {
@@ -255,28 +303,46 @@ export class CoolifyDataPlane implements DataPlane {
   }
 
   async sampleMetrics(project: Project): Promise<ProjectMetricSample[]> {
-    // Status check (real) → synthetic fill (deterministic). The Coolify
-    // v4 public REST surface does NOT expose per-app or per-server
-    // CPU/memory series — those numbers are collected by Coolify's
-    // internal "Sentinel" agent and only surfaced in the dashboard UI.
-    // `/api/v1/servers/{uuid}/metrics` returns 404 even with
-    // `is_metrics_enabled: true`. Probed against the live Coolify
-    // (qy01zelvuwhlxwzya73pavwl) on 2026-05-28 — confirmed gap, not
-    // a configuration problem.
+    // Two-tier read:
+    //   1. `metricsCollector` (when wired) returns a real CPU/memory
+    //      reading sampled from the container — today via SSH +
+    //      `docker stats`. The reading replaces the latest synthesis
+    //      sample so gauges + ScaleAgent see ground truth; the
+    //      preceding samples in the returned series still smooth-jitter
+    //      around the reading so the sparkline doesn't look like a flat
+    //      line on every poll.
+    //   2. Status-aware synthesis falls in when the collector returns
+    //      `null` (unconfigured, no running replicas, transport
+    //      failure). Coolify v4's public REST does not expose per-app
+    //      or per-server CPU/memory series — both
+    //      `/applications/{uuid}/metrics` and
+    //      `/servers/{uuid}/metrics` 404 even with metrics enabled
+    //      (probed against the live Coolify on 2026-05-28). The
+    //      synthesis path is the honest "we still don't know" output.
     //
-    // Until either (a) Sentinel exposes a public metrics endpoint,
-    // (b) we add an SSH path that scrapes `docker stats` off the node,
-    // or (c) we run our own node_exporter sidecar, the honest move is
-    // to keep emitting plausible samples derived from the project's
-    // real status — `running:unknown` → live numbers, `exited` → zeros.
-    // We DO call `/servers/{uuid}/resources` so the synthesis at least
-    // respects what Coolify reports about the container's lifecycle
-    // instead of guessing from the Cantila-side `Project.status` (which
-    // can lag the data plane by a few seconds).
+    // RPS is still synthesised in both branches — `docker stats`
+    // doesn't carry HTTP counters, and Coolify's bundled Traefik
+    // doesn't expose per-router metrics through the v4 REST API
+    // either. A node_exporter / Traefik-metrics drop unblocks that
+    // independently; the collector seam stays the same.
     const liveStatus = await this.fetchResourceStatus(project).catch(
       () => undefined,
     );
-    return synthesiseMetrics(project, liveStatus);
+    let reading = null;
+    if (this.metricsCollector) {
+      const appUuid =
+        this.appUuids.get(project.id) ?? project.coolifyAppUuid ?? undefined;
+      if (appUuid) {
+        reading = await this.metricsCollector
+          .collect({
+            appUuid,
+            appName: appNameFor(project),
+            region: project.region,
+          })
+          .catch(() => null);
+      }
+    }
+    return synthesiseMetrics(project, liveStatus, reading);
   }
 
   // -- private helpers --------------------------------------------------
@@ -535,6 +601,7 @@ function splitImageRef(ref: string): { image: string; tag: string } {
 function synthesiseMetrics(
   project: Project,
   liveStatus?: string,
+  reading?: { cpuPct: number; memPct: number; replicas: number } | null,
 ): ProjectMetricSample[] {
   const SAMPLE_COUNT = 12;
   const INTERVAL_MS = 5_000;
@@ -543,8 +610,13 @@ function synthesiseMetrics(
   // Coolify is the source of truth for whether the container is up
   // when we have its status; otherwise fall back to the Cantila side.
   const effectiveStatus = mapCoolifyStatus(liveStatus) ?? project.status;
-  const baseCpu =
-    effectiveStatus === "live"
+  // When a real reading is available, anchor CPU + memory to it so
+  // gauges + ScaleAgent see ground truth on the latest sample. The
+  // historical samples still smooth around it so the sparkline reads
+  // like a series, not a single dot.
+  const baseCpu = reading
+    ? reading.cpuPct
+    : effectiveStatus === "live"
       ? 25 + (seed % 30)
       : effectiveStatus === "sleeping"
         ? 2 + (seed % 5)
@@ -555,27 +627,39 @@ function synthesiseMetrics(
       : effectiveStatus === "sleeping"
         ? 0.1 + (seed % 5) / 10
         : 0;
-  const baseMem =
-    effectiveStatus === "live" || effectiveStatus === "sleeping"
+  const baseMem = reading
+    ? reading.memPct
+    : effectiveStatus === "live" || effectiveStatus === "sleeping"
       ? 35 + (seed % 25)
       : 0;
   const out: ProjectMetricSample[] = [];
   for (let i = SAMPLE_COUNT - 1; i >= 0; i--) {
     const at = new Date(now - i * INTERVAL_MS).toISOString();
+    // Without a real reading, a "down" status zeroes everything.
+    // With a real reading, we trust the container — `docker stats`
+    // only emits a row when the container is running, so a reading
+    // implies live.
     if (
-      effectiveStatus === "crashed" ||
-      effectiveStatus === "paused" ||
-      effectiveStatus === "provisioning" ||
-      effectiveStatus === "building"
+      !reading &&
+      (effectiveStatus === "crashed" ||
+        effectiveStatus === "paused" ||
+        effectiveStatus === "provisioning" ||
+        effectiveStatus === "building")
     ) {
       out.push({ at, cpuPct: 0, memPct: 0, rps: 0 });
       continue;
     }
     const jitter = (Math.random() - 0.5) * 0.2;
+    // The newest sample (i === 0) lands exactly on the real reading
+    // when present — no jitter — so the Console gauge and the
+    // /metrics endpoint match what the operator would see on the
+    // host directly. The older samples get smooth-jitter.
+    const cpuJ = i === 0 && reading ? 0 : jitter;
+    const memJ = i === 0 && reading ? 0 : jitter * 0.5;
     out.push({
       at,
-      cpuPct: Math.round(clamp(baseCpu * (1 + jitter), 0, 100) * 10) / 10,
-      memPct: Math.round(clamp(baseMem * (1 + jitter * 0.5), 0, 100) * 10) / 10,
+      cpuPct: Math.round(clamp(baseCpu * (1 + cpuJ), 0, 100) * 10) / 10,
+      memPct: Math.round(clamp(baseMem * (1 + memJ), 0, 100) * 10) / 10,
       rps: Math.round(Math.max(0, baseRps * (1 + jitter)) * 10) / 10,
     });
   }
@@ -603,6 +687,27 @@ function hashSeed(s: string): number {
   let h = 0;
   for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
   return Math.abs(h);
+}
+
+/** Collapse the (possibly redundant) single-server + multi-server
+ *  fields on a `CoolifyRegionConfig` into one deduped, ordered list.
+ *  `servers` wins when both are set (the explicit-multi form); a lone
+ *  `serverUuid` becomes a single-element list (back-compat). */
+function resolveRegionServers(cfg: CoolifyRegionConfig): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const add = (s: string | undefined) => {
+    const t = s?.trim();
+    if (!t || seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
+  };
+  if (cfg.servers && cfg.servers.length > 0) {
+    for (const s of cfg.servers) add(s);
+  } else if (cfg.serverUuid) {
+    add(cfg.serverUuid);
+  }
+  return out;
 }
 
 function clamp(v: number, lo: number, hi: number): number {

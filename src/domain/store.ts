@@ -245,6 +245,13 @@ export interface Store {
    *  (plan §5.4 follow-up); the real /forgot flow will use the same
    *  store call once email delivery is live. */
   updateUserPassword(userId: string, passwordHash: string): Promise<AuthUser>;
+  /** Mark a user's email as verified (plan §5.4 / v1.18 — email-verify
+   *  one-shot token flow). Idempotent — re-verifying simply overwrites
+   *  the timestamp. */
+  setUserEmailVerifiedAt(
+    userId: string,
+    verifiedAt: string,
+  ): Promise<AuthUser>;
   createSession(s: Session): Promise<Session>;
   findSessionByTokenHash(tokenHash: string): Promise<Session | null>;
   deleteSession(id: string): Promise<boolean>;
@@ -1269,6 +1276,17 @@ export class InMemoryStore implements Store {
     const existing = this.users.get(userId);
     if (!existing) throw new Error(`user ${userId} not found`);
     const updated: AuthUser = { ...existing, passwordHash };
+    this.users.set(userId, updated);
+    return updated;
+  }
+
+  async setUserEmailVerifiedAt(
+    userId: string,
+    verifiedAt: string,
+  ): Promise<AuthUser> {
+    const existing = this.users.get(userId);
+    if (!existing) throw new Error(`user ${userId} not found`);
+    const updated: AuthUser = { ...existing, emailVerifiedAt: verifiedAt };
     this.users.set(userId, updated);
     return updated;
   }

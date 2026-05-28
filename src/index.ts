@@ -191,6 +191,16 @@ const EXEMPT_PATHS = new Set([
   // page server-fetches. No sensitive data — keeping it un-authed so an
   // un-authed visitor (and the apex page itself) can render the catalog.
   "/v1/billing/info",
+  // Password reset flow (plan §5.4 / v1.18): the user is signed-out by
+  // definition. Enumeration-safe — both endpoints return a uniform
+  // success shape regardless of whether the email/token is valid.
+  "/v1/auth/forgot",
+  "/v1/auth/reset-password",
+  // Email-verify completion (plan §5.4 / v1.18): the click-through
+  // from the email arrives without a session (e.g. on the user's
+  // phone where they're not signed in). The verify-request endpoint
+  // is session-gated separately at the route.
+  "/v1/auth/verify-email/confirm",
 ]);
 
 function scopeAllows(
@@ -2213,6 +2223,77 @@ app.post("/v1/auth/admin/reset-password", async (request, reply) => {
       .code(400)
       .send({ error: err instanceof Error ? err.message : "reset failed" });
   }
+});
+
+// Real /forgot flow (plan §5.4 / v1.18): mint a one-shot password-reset
+// token, hand it to the MailProvider. Always returns `{ ok: true }` so
+// the caller can't enumerate the user table. When the bundled stub MTA
+// is wired (no live mail yet), the response also carries `debugLink` so
+// the developer / smoke test can exercise the end-to-end flow without an
+// inbox; the production live-MTA path never returns the link.
+app.post("/v1/auth/forgot", async (request, reply) => {
+  const body = (request.body ?? {}) as { email?: unknown };
+  if (typeof body.email !== "string") {
+    return reply.code(400).send({ error: "email (string) required" });
+  }
+  const result = await cp.requestPasswordReset({ email: body.email });
+  return reply.code(200).send(result);
+});
+
+// Complete the /forgot flow — verify the token, swap the password.
+// The Console renders `/reset/[token]` and POSTs here. We collapse all
+// error shapes into a uniform 400 so a wrong-token / expired-token /
+// weak-password response doesn't leak which one a guess hit.
+app.post("/v1/auth/reset-password", async (request, reply) => {
+  const body = (request.body ?? {}) as {
+    token?: unknown;
+    newPassword?: unknown;
+  };
+  if (typeof body.token !== "string" || typeof body.newPassword !== "string") {
+    return reply
+      .code(400)
+      .send({ error: "token and newPassword (string) required" });
+  }
+  const result = await cp.completePasswordReset({
+    token: body.token,
+    newPassword: body.newPassword,
+  });
+  if ("error" in result) {
+    return reply.code(400).send({ error: result.error });
+  }
+  return reply.code(200).send(result);
+});
+
+// Email verification — request a fresh verify link for the currently
+// signed-in user. Session-gated because the endpoint touches a known
+// account; the click-through completion endpoint is exempt (the link
+// itself is the credential).
+app.post("/v1/auth/verify-email/request", async (request, reply) => {
+  const session = await getSessionAuth(request);
+  if (!session) {
+    return reply
+      .code(401)
+      .send({ error: "session required (Bearer cts_ token)" });
+  }
+  const result = await cp.requestEmailVerification({ userId: session.userId });
+  if ("error" in result) {
+    return reply.code(400).send({ error: result.error });
+  }
+  return reply.code(200).send(result);
+});
+
+// Complete the email-verify flow — exempt from auth so the click-through
+// works from a signed-out device.
+app.post("/v1/auth/verify-email/confirm", async (request, reply) => {
+  const body = (request.body ?? {}) as { token?: unknown };
+  if (typeof body.token !== "string") {
+    return reply.code(400).send({ error: "token (string) required" });
+  }
+  const result = await cp.completeEmailVerification({ token: body.token });
+  if ("error" in result) {
+    return reply.code(400).send({ error: result.error });
+  }
+  return reply.code(200).send(result);
 });
 
 // Which SSO provider is wired (real OIDC vs the bundled stub) — the

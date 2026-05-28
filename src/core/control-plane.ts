@@ -93,6 +93,16 @@ import { getRequestContext } from "../lib/request-context";
 import { decryptSecret, encryptSecret, isEncryptedSecret } from "../lib/secrets";
 import { hashPassword, verifyPassword } from "../auth/passwords";
 import { ssoProvider, type SsoProfile } from "../auth/sso";
+import {
+  mintOneShotToken,
+  parsePresentedToken,
+  evaluateTokenVerification,
+  effectiveTokenStatus,
+  TOKEN_POLICY,
+  type OneShotToken,
+  type TokenPurpose,
+  type TokenVerifyOutcome,
+} from "../auth/tokens";
 import { mailProvider } from "../mail/provider";
 import {
   DUNNING_POLICY,
@@ -1137,6 +1147,12 @@ export class ControlPlane {
    *  restart just means a customer re-requests. Production would use
    *  Redis with native TTLs, or a swept database table. */
   private otpChallenges = new Map<string, OtpChallenge>();
+  /** Live one-shot tokens for password reset + email verify
+   *  (plan §5.4 / v1.18). In-memory + TTL-pruned — these are
+   *  short-lived and a process restart just means the user
+   *  re-requests. Keyed by token id. The raw token never lands
+   *  here — only `sha256(<id>:<raw>)`. */
+  private oneShotTokens = new Map<string, OneShotToken>();
 
   constructor(private deps: ControlPlaneDeps) {
     this.uptimeChecker = new UptimeChecker(
@@ -4791,6 +4807,268 @@ export class ControlPlane {
       hashPassword(input.newPassword),
     );
     return { email, userId: existing.id };
+  }
+
+  /* ----- one-shot tokens: password reset + email verify (plan §5.4 / v1.18) ----- */
+
+  /** Begin a password reset for the given email. Mints a single-use
+   *  token, stores its hash with a 1h TTL, and hands it to the mail
+   *  provider for delivery. Always returns `{ ok: true }` regardless
+   *  of whether the email exists — leaking that signal would let
+   *  anyone enumerate the user table. The Console renders a generic
+   *  "if an account exists, we sent a link" toast. */
+  async requestPasswordReset(input: {
+    email: string;
+  }): Promise<{ ok: true; debugLink?: string }> {
+    const email = input.email.trim().toLowerCase();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      return { ok: true };
+    }
+    const user = await this.deps.store.findUserByEmail(email);
+    if (!user) {
+      return { ok: true };
+    }
+    // Rate-limit per email — bound on policy.maxPerWindow within
+    // policy.rateWindowMs (1h for password reset).
+    const policy = TOKEN_POLICY.password_reset;
+    const recent = this.countRecentOneShotTokens(
+      user.id,
+      "password_reset",
+      policy.rateWindowMs,
+    );
+    if (recent >= policy.maxPerWindow) {
+      // Same `ok: true` shape — don't surface rate-limit signal to
+      // unauthenticated callers either.
+      return { ok: true };
+    }
+
+    const { raw, stored } = mintOneShotToken({
+      purpose: "password_reset",
+      userId: user.id,
+    });
+    this.oneShotTokens.set(stored.id, stored);
+    this.pruneOneShotTokens();
+
+    const resetLink = this.buildResetLink("/reset", raw);
+    // Send via the MailProvider seam. Stub returns a deterministic
+    // outcome and still "delivers" (in-memory); a future Mailcow
+    // adapter actually emails. We deliberately ignore the outcome —
+    // if Mail is down, the operator can always run
+    // `adminResetPassword` instead.
+    await mailProvider
+      .sendMail({
+        from: this.systemSenderAddress(),
+        to: email,
+        subject: "Reset your Cantila password",
+        body: this.renderResetEmail({ name: user.name, link: resetLink }),
+      })
+      .catch(() => {});
+
+    // Stub-MTA mode (live === false) → expose the link in the
+    // response so the developer / smoke test can complete the flow
+    // without a real inbox. Never exposed in production-live mode.
+    const debugLink = mailProvider.live ? undefined : resetLink;
+    return { ok: true, debugLink };
+  }
+
+  /** Complete a password reset — verify the token + set the new
+   *  password. Returns `{error}` for any reason the new password
+   *  isn't accepted (bad token, weak password); the caller surfaces
+   *  the generic "this link is invalid or expired" toast. */
+  async completePasswordReset(input: {
+    token: string;
+    newPassword: string;
+  }): Promise<{ userId: string } | { error: TokenVerifyOutcome | "weak_password" }> {
+    if (input.newPassword.length < 8) {
+      return { error: "weak_password" };
+    }
+    const verdict = this.consumeOneShotToken(input.token, "password_reset");
+    if ("error" in verdict) return { error: verdict.error };
+
+    await this.deps.store.updateUserPassword(
+      verdict.userId,
+      hashPassword(input.newPassword),
+    );
+    return { userId: verdict.userId };
+  }
+
+  /** Begin an email-verify for the currently signed-in user. Mints
+   *  a 24h token, stores its hash, and hands it to the mail provider
+   *  for delivery to the user's current email address. Idempotent —
+   *  a verified user can request another link (re-verification) but
+   *  the policy cap still applies. */
+  async requestEmailVerification(input: {
+    userId: string;
+  }): Promise<{ ok: true; debugLink?: string } | { error: string }> {
+    const user = await this.deps.store.getUser(input.userId);
+    if (!user) return { error: "user not found" };
+
+    const policy = TOKEN_POLICY.email_verify;
+    const recent = this.countRecentOneShotTokens(
+      user.id,
+      "email_verify",
+      policy.rateWindowMs,
+    );
+    if (recent >= policy.maxPerWindow) {
+      return { error: "verification email rate limit hit; try again later" };
+    }
+
+    const { raw, stored } = mintOneShotToken({
+      purpose: "email_verify",
+      userId: user.id,
+    });
+    this.oneShotTokens.set(stored.id, stored);
+    this.pruneOneShotTokens();
+
+    const verifyLink = this.buildResetLink("/verify", raw);
+    await mailProvider
+      .sendMail({
+        from: this.systemSenderAddress(),
+        to: user.email,
+        subject: "Verify your Cantila email",
+        body: this.renderVerifyEmail({ name: user.name, link: verifyLink }),
+      })
+      .catch(() => {});
+
+    const debugLink = mailProvider.live ? undefined : verifyLink;
+    return { ok: true, debugLink };
+  }
+
+  /** Complete the email-verify flow — verify the token and stamp
+   *  the `emailVerifiedAt` timestamp on the user row. */
+  async completeEmailVerification(input: {
+    token: string;
+  }): Promise<{ userId: string; verifiedAt: string } | { error: TokenVerifyOutcome }> {
+    const verdict = this.consumeOneShotToken(input.token, "email_verify");
+    if ("error" in verdict) return { error: verdict.error };
+
+    const verifiedAt = new Date().toISOString();
+    await this.deps.store.setUserEmailVerifiedAt(verdict.userId, verifiedAt);
+    return { userId: verdict.userId, verifiedAt };
+  }
+
+  /** Pure helper — verify a presented token, mark it used on
+   *  success, return either the user id or an error verdict. Shared
+   *  by both reset + verify so the verdict shape is uniform. */
+  private consumeOneShotToken(
+    presented: string,
+    expectedPurpose: TokenPurpose,
+  ):
+    | { userId: string }
+    | { error: TokenVerifyOutcome } {
+    const parsed = parsePresentedToken(presented);
+    if (!parsed) return { error: "wrong_token" };
+    const stored = this.oneShotTokens.get(parsed.id);
+    if (!stored || stored.purpose !== expectedPurpose) {
+      return { error: "wrong_token" };
+    }
+    const now = new Date();
+    const outcome = evaluateTokenVerification(stored, parsed, now);
+    if (outcome !== "verified") {
+      // Burn expired tokens — they can't come back to life and we
+      // shouldn't keep growing the map.
+      if (
+        outcome === "expired" &&
+        effectiveTokenStatus(stored, now) === "expired"
+      ) {
+        this.oneShotTokens.delete(stored.id);
+      }
+      return { error: outcome };
+    }
+    // Mark used so a second submit of the same token fails as
+    // `already_used` instead of `verified`.
+    this.oneShotTokens.set(stored.id, { ...stored, status: "used" });
+    return { userId: stored.userId };
+  }
+
+  /** Count the user's recent one-shot tokens of a given purpose
+   *  within the policy window — back-end of rate-limiting. */
+  private countRecentOneShotTokens(
+    userId: string,
+    purpose: TokenPurpose,
+    windowMs: number,
+  ): number {
+    const cutoff = Date.now() - windowMs;
+    let n = 0;
+    for (const t of this.oneShotTokens.values()) {
+      if (t.userId !== userId || t.purpose !== purpose) continue;
+      if (new Date(t.createdAt).getTime() < cutoff) continue;
+      n++;
+    }
+    return n;
+  }
+
+  /** Drop expired token records — bounded sweep so the map can't
+   *  grow without limit. */
+  private pruneOneShotTokens(): void {
+    const now = Date.now();
+    for (const [id, t] of this.oneShotTokens) {
+      if (new Date(t.expiresAt).getTime() < now && t.status !== "used") {
+        this.oneShotTokens.delete(id);
+      }
+    }
+  }
+
+  /** Compose a public URL for a one-shot token link. The path is
+   *  the Console route (e.g. `/reset/<token>`) — the Console base
+   *  URL is the marketing apex (where the auth-public group lives).
+   *  Falls back to the relative path so a manual operator paste
+   *  into a localhost dev session still works. */
+  private buildResetLink(routePrefix: string, rawToken: string): string {
+    const apex = (
+      process.env.CANTILA_PUBLIC_HOST ||
+      process.env.CANTILA_APEX_DOMAIN ||
+      ""
+    ).trim();
+    const path = `${routePrefix}/${encodeURIComponent(rawToken)}`;
+    if (!apex) return path;
+    const host = apex.replace(/^https?:\/\//, "").replace(/\/+$/, "");
+    return `https://${host}${path}`;
+  }
+
+  /** From-address for system mail. Falls back to a sensible apex
+   *  default — once `cp.sendMail`'s real mailbox abstraction grows
+   *  a "system" reserved address, this collapses into that. */
+  private systemSenderAddress(): string {
+    const apex = (
+      process.env.CANTILA_APEX_DOMAIN ||
+      process.env.CANTILA_PUBLIC_HOST ||
+      "cantila.app"
+    )
+      .trim()
+      .replace(/^https?:\/\//, "")
+      .replace(/\/+$/, "");
+    return `noreply@${apex}`;
+  }
+
+  private renderResetEmail(input: { name: string; link: string }): string {
+    return [
+      `Hi ${input.name || "there"},`,
+      "",
+      "We received a request to reset your Cantila password.",
+      "Click the link below to set a new one — it expires in 1 hour.",
+      "",
+      input.link,
+      "",
+      "If you didn't request this, you can safely ignore this email.",
+      "",
+      "— Cantila",
+    ].join("\n");
+  }
+
+  private renderVerifyEmail(input: { name: string; link: string }): string {
+    return [
+      `Hi ${input.name || "there"},`,
+      "",
+      "Confirm this email address belongs to you by clicking the link below.",
+      "It expires in 24 hours.",
+      "",
+      input.link,
+      "",
+      "If you didn't sign up for Cantila, you can safely ignore this email.",
+      "",
+      "— Cantila",
+    ].join("\n");
   }
 
   async registerUser(input: {
