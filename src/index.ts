@@ -61,7 +61,11 @@ const store = createStore();
 // COOLIFY_SERVER_UUID + COOLIFY_PROJECT_UUID (plan §19). Without all
 // four, the stub data plane runs and the deploy pipeline simulates
 // builds locally — same offline contract as v1.3.
-const dataPlaneSelection = selectDataPlane();
+// The store reference is passed so the Coolify data plane persists
+// each project's Coolify Application UUID on `Project.coolifyAppUuid`
+// instead of rebuilding the in-process cache from a full /applications
+// scan after every restart (plan §19).
+const dataPlaneSelection = selectDataPlane(process.env, { store });
 const dataPlane = dataPlaneSelection.dataPlane;
 console.log(`[dataplane] ${dataPlaneSelection.label} (${dataPlaneSelection.live ? "live" : "stub"})`);
 
@@ -2538,14 +2542,20 @@ app.get("/v1/mail/info", async () => {
 
 /** Which Stripe adapter is wired (stub vs live). Mirrors `/v1/ai/info`
  *  so the Console can render a "(stub)" badge on the Billing page when
- *  STRIPE_SECRET_KEY isn't set. */
+ *  STRIPE_SECRET_KEY isn't set. Also carries the public marketing
+ *  pricing catalog (plan §4.7 / §8.2) so the apex /pricing page reads
+ *  from the same source as the control plane's `TLD_CATALOG`. */
 app.get("/v1/billing/info", async () => {
+  const catalog = cp.getPublicBillingCatalog();
   return {
     label: stripe.label,
     live: stripe.live,
     // Publishable key (`pk_…`) — safe to expose; the Console uses it to
     // mount embedded Checkout (plan §8.5 — Phase D). Absent on the stub.
     publishableKey: stripe.publishableKey,
+    // Marketing catalogs — both shapes the apex /pricing page needs.
+    tldPrices: catalog.tldPrices,
+    planTiers: catalog.planTiers,
   };
 });
 

@@ -359,6 +359,13 @@ export interface Project {
    *  about into the project's env. Opaque to the core types so adding a
    *  new kind never edits this type. */
   automationConfig?: Record<string, unknown>;
+  /** UUID of the corresponding Coolify Application (plan §19). Populated
+   *  on first deploy through `CoolifyDataPlane` and re-used on every
+   *  subsequent deploy / redeploy so we don't need to scan the full
+   *  Coolify app list to look the project back up after a control-plane
+   *  restart. Unset until the live data plane is in play (stub never
+   *  writes it; offline builds leave the column null). */
+  coolifyAppUuid?: string;
   createdAt: string;
 }
 

@@ -26,9 +26,10 @@ async function main(): Promise<void> {
         webhookSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "",
       })
     : new StubStripeAdapter();
-  const { dataPlane } = selectDataPlane();
+  const store = new InMemoryStore();
+  const { dataPlane } = selectDataPlane(process.env, { store });
   const cp = new ControlPlane({
-    store: new InMemoryStore(),
+    store,
     provisioner: stubProvisioner,
     dataPlane,
     stripe,

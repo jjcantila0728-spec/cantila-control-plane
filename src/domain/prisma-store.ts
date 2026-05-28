@@ -116,6 +116,7 @@ function toProject(r: DbProject): Project {
       r.automationConfig === null
         ? undefined
         : (r.automationConfig as Record<string, unknown>),
+    coolifyAppUuid: r.coolifyAppUuid ?? undefined,
     createdAt: r.createdAt.toISOString(),
   };
 }
@@ -498,6 +499,7 @@ export class PrismaStore implements Store {
           ? Prisma.JsonNull
           : (patch.automationConfig as Prisma.InputJsonValue);
     }
+    if (patch.coolifyAppUuid !== undefined) data.coolifyAppUuid = patch.coolifyAppUuid;
     const row = await this.db.project.update({ where: { id }, data });
     return toProject(row);
   }

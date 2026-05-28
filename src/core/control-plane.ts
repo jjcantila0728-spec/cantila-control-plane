@@ -469,6 +469,213 @@ export const TLD_CATALOG: Record<string, { pricePerYearCents: number }> = {
   me: { pricePerYearCents: 999 }, //  $9.99
 };
 
+/* ----- public marketing pricebook (plan §4.7 / §8.2) -----
+ *
+ *  The Console's /billing surface reads its own per-account state from
+ *  the live Stripe rail; the apex marketing pages at cantila.app/pricing
+ *  used to ship a static mirror of these numbers in
+ *  `cantila-console/src/data/{tld-prices,plan-tiers}.ts`. That left two
+ *  drift surfaces — the catalog above and the marketing copy — that had
+ *  to be hand-kept in sync every time §4.7/§8.2 moved. We close the loop
+ *  by exposing both shapes on `GET /v1/billing/info`; the marketing
+ *  page server-fetches at request time, with the vendored static file as
+ *  a last-resort fallback when the control plane is unreachable. */
+
+/** Retail benchmark + marketing note for each TLD in `TLD_CATALOG`.
+ *  Display prices are derived from `pricePerYearCents` at serve time so
+ *  there's no second number to drift. Keep new TLDs added to the catalog
+ *  in this map too, or the API just omits the retail/note for them. */
+const TLD_MARKETING_META: Record<
+  string,
+  { retail?: string; note?: string }
+> = {
+  com: { retail: "$12–20", note: "Below every major retail registrar" },
+  net: { retail: "$15" },
+  org: { retail: "$12–15" },
+  io: { retail: "$40–50" },
+  dev: { retail: "$15" },
+  app: { retail: "$18" },
+  ai: { retail: "$80–100" },
+  co: { retail: "$30" },
+  shop: { retail: "$35" },
+  store: { retail: "$50" },
+  xyz: { retail: "$9–12", note: "Cheapest in catalog" },
+  build: { retail: "$30" },
+  site: { retail: "$25" },
+  online: { retail: "$30" },
+  tech: { retail: "$40" },
+  me: { retail: "$20" },
+};
+
+/** Stable order for the marketing table — ascending by Cantila price. */
+const TLD_MARKETING_ORDER: readonly string[] = [
+  "xyz",
+  "site",
+  "online",
+  "tech",
+  "com",
+  "org",
+  "me",
+  "net",
+  "dev",
+  "app",
+  "build",
+  "store",
+  "shop",
+  "co",
+  "io",
+  "ai",
+];
+
+/** Marketing-table row — what the public pricing page renders. */
+export interface PublicTldPrice {
+  tld: string; //  e.g. ".com"
+  perYear: string; //  e.g. "$8.99"
+  retail?: string; //  e.g. "$12–20"
+  note?: string;
+}
+
+/** Build the public marketing pricebook from `TLD_CATALOG` + the
+ *  benchmark metadata. Single source of truth for cents-per-year. */
+function buildPublicTldPricebook(): PublicTldPrice[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const tld of TLD_MARKETING_ORDER) {
+    if (TLD_CATALOG[tld]) {
+      ordered.push(tld);
+      seen.add(tld);
+    }
+  }
+  // Any TLD added to the catalog but not yet in the marketing order
+  // still appears (sorted by price ascending) — better than silently
+  // dropping it from the public table.
+  const extras = Object.keys(TLD_CATALOG)
+    .filter((t) => !seen.has(t))
+    .sort(
+      (a, b) =>
+        TLD_CATALOG[a]!.pricePerYearCents - TLD_CATALOG[b]!.pricePerYearCents,
+    );
+  for (const tld of extras) ordered.push(tld);
+
+  return ordered.map((tld) => {
+    const cents = TLD_CATALOG[tld]!.pricePerYearCents;
+    const meta = TLD_MARKETING_META[tld] ?? {};
+    return {
+      tld: `.${tld}`,
+      perYear: `$${(cents / 100).toFixed(2)}`,
+      retail: meta.retail,
+      note: meta.note,
+    };
+  });
+}
+
+/** Marketing tier — what the public /pricing page renders. The Console's
+ *  in-app billing surface reads per-account state from Stripe; this is
+ *  the catalog the un-authed visitor sees. */
+export interface PublicPlanTier {
+  slug: "hobby" | "starter" | "pro" | "agency" | "dedicated";
+  name: string;
+  price: string;
+  priceCadence?: string;
+  best: string;
+  bullets: string[];
+  cta: { label: string; href: string };
+  featured?: boolean;
+}
+
+/** Marketing pricing catalog — mirrors plan §8.2. Numbers are
+ *  illustrative against measured infra cost; the exact figure on the
+ *  invoice is whatever Stripe says it is. */
+export const PUBLIC_PLAN_TIERS: PublicPlanTier[] = [
+  {
+    slug: "hobby",
+    name: "Hobby",
+    price: "$0",
+    priceCadence: "/ mo",
+    best: "Trying Cantila and side projects.",
+    bullets: [
+      "1 small app on a *.cantila.app subdomain",
+      "Sleeps when idle",
+      "Auto-wired Postgres, ready in the env",
+      "Community support",
+    ],
+    cta: { label: "Start free", href: "/signup" },
+  },
+  {
+    slug: "starter",
+    name: "Starter",
+    price: "~$10",
+    priceCadence: "/ mo",
+    best: "Indie hackers shipping a real product.",
+    bullets: [
+      "A few always-on apps",
+      "1 custom domain included",
+      "1 managed database",
+      "Email + SMS quotas, metered overage",
+      "Build minutes + 50 GB transfer",
+    ],
+    cta: { label: "Start on Starter", href: "/signup?plan=starter" },
+    featured: true,
+  },
+  {
+    slug: "pro",
+    name: "Pro",
+    price: "~$35",
+    priceCadence: "/ mo",
+    best: "Serious solo builders and small teams.",
+    bullets: [
+      "More apps and more resources per app",
+      "Auto-scaling and preview environments",
+      "Multiple databases, branching, point-in-time restore",
+      "Priority support",
+    ],
+    cta: { label: "Start on Pro", href: "/signup?plan=pro" },
+  },
+  {
+    slug: "agency",
+    name: "Agency",
+    price: "~$99+",
+    priceCadence: "/ mo",
+    best: "Agencies and resellers.",
+    bullets: [
+      "White-label sub-accounts",
+      "Team seats and role-based access",
+      "Wholesale add-on pricing",
+      "Per-account branding and billing rollup",
+    ],
+    cta: { label: "Talk to sales", href: "/contact?topic=agency" },
+  },
+  {
+    slug: "dedicated",
+    name: "Dedicated",
+    price: "Custom",
+    best: "Workloads needing isolation or an SLA.",
+    bullets: [
+      "Dedicated VPS nodes",
+      "SSO and audit log export",
+      "Uptime SLA",
+      "Hands-on support",
+    ],
+    cta: { label: "Contact us", href: "/contact?topic=dedicated" },
+  },
+];
+
+/** Public-facing billing catalog — both shapes the apex /pricing page
+ *  needs. Stable contract: the marketing page server-fetches this and
+ *  falls back to its own vendored copy if the control plane is
+ *  unreachable. Plan §4.7 / §8.2. */
+export interface PublicBillingCatalog {
+  tldPrices: PublicTldPrice[];
+  planTiers: PublicPlanTier[];
+}
+
+export function getPublicBillingCatalog(): PublicBillingCatalog {
+  return {
+    tldPrices: buildPublicTldPricebook(),
+    planTiers: PUBLIC_PLAN_TIERS,
+  };
+}
+
 export interface DomainQuote {
   hostname: string;
   tld: string;
@@ -4286,6 +4493,13 @@ export class ControlPlane {
       label: this.deps.aiAnalyser.label,
       live: this.deps.aiAnalyser.live,
     };
+  }
+
+  /** The public marketing pricing catalog (plan §4.7 / §8.2). Method
+   *  rather than free import so it sits with `aiInfo` / `mailInfo` and
+   *  the HTTP layer never reaches into the module-level pricebook. */
+  getPublicBillingCatalog(): PublicBillingCatalog {
+    return getPublicBillingCatalog();
   }
 
   /** Resolve the AI analyser that should serve this account. When the

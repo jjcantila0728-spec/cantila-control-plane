@@ -34,6 +34,13 @@ export interface CoolifyDataPlaneOptions {
   environmentName?: string;
   /** Apex used for auto-assigned FQDNs, default `cantila.app`. */
   apexDomain?: string;
+  /** Optional persistence hook for the Cantila Project → Coolify
+   *  Application UUID mapping. When wired, `startContainer` persists the
+   *  uuid on first deploy so a control-plane restart doesn't need to
+   *  re-scan `/applications` to find each tenant app (plan §19 — drops
+   *  the in-process cache rehydrate). When absent the cache still works,
+   *  just rebuilt lazily on restart. */
+  persistAppUuid?: (projectId: string, appUuid: string) => Promise<void>;
 }
 
 export class CoolifyDataPlane implements DataPlane {
@@ -43,11 +50,16 @@ export class CoolifyDataPlane implements DataPlane {
   private readonly projectUuid: string;
   private readonly environmentName: string;
   private readonly apexDomain: string;
-  /** projectId → Coolify Application UUID. Populated on create and on
-   *  the first lookup that hits Coolify's list endpoint. In-process only;
-   *  a restart re-hydrates from Coolify's list, so no DB column needed
-   *  for the first slice. */
+  /** projectId → Coolify Application UUID. Authoritative copy lives on
+   *  `Project.coolifyAppUuid` (column added 2026-05-28); this is a
+   *  per-process read-through cache so the hot path doesn't re-hit the
+   *  DB on every deploy. Misses fall back to the persisted field, then
+   *  the Coolify `/applications` list, then create. */
   private readonly appUuids = new Map<string, string>();
+  private readonly persistAppUuid?: (
+    projectId: string,
+    appUuid: string,
+  ) => Promise<void>;
 
   constructor(opts: CoolifyDataPlaneOptions) {
     this.apiUrl = opts.apiUrl.replace(/\/+$/, "");
@@ -56,6 +68,7 @@ export class CoolifyDataPlane implements DataPlane {
     this.projectUuid = opts.projectUuid;
     this.environmentName = opts.environmentName ?? "production";
     this.apexDomain = opts.apexDomain ?? "cantila.app";
+    this.persistAppUuid = opts.persistAppUuid;
   }
 
   async detectStack(source: DeploySource): Promise<Runtime> {
@@ -88,11 +101,23 @@ export class CoolifyDataPlane implements DataPlane {
     _nodeId: string,
     env: Record<string, string>,
   ): Promise<void> {
-    // First check the cache + Coolify for an existing app; create if absent.
+    // Lookup precedence: in-memory cache → persisted Project column →
+    // Coolify's app list (slow, scanned by name) → create.
     let uuid = await this.findAppUuid(project);
     if (!uuid) {
       uuid = await this.createApp(project);
-      this.appUuids.set(project.id, uuid);
+    }
+    // Memoize + persist whatever uuid we ended up with so the next
+    // deploy / restart skips straight to env-sync + redeploy.
+    this.appUuids.set(project.id, uuid);
+    if (project.coolifyAppUuid !== uuid && this.persistAppUuid) {
+      // Best-effort — never fail a deploy because the bookkeeping write
+      // failed. The cache still works for the rest of the process.
+      try {
+        await this.persistAppUuid(project.id, uuid);
+      } catch {
+        /* swallow — telemetry is the right place to flag this */
+      }
     }
 
     // Push env vars (best-effort — Coolify returns 200 even for already-set keys).
@@ -134,6 +159,12 @@ export class CoolifyDataPlane implements DataPlane {
   private async findAppUuid(project: Project): Promise<string | undefined> {
     const cached = this.appUuids.get(project.id);
     if (cached) return cached;
+    // Persisted column — populated on previous deploys (plan §19). Skip
+    // the full app-list scan when we already know the uuid.
+    if (project.coolifyAppUuid) {
+      this.appUuids.set(project.id, project.coolifyAppUuid);
+      return project.coolifyAppUuid;
+    }
     const name = appNameFor(project);
     const list = await this.request<CoolifyApp[]>("GET", "/applications");
     const found = list.find((a) => a.name === name);

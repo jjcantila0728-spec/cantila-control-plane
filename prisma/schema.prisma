@@ -390,6 +390,11 @@ model Project {
   /// auth-token rotation state). Stored as JSON so schema doesn't need
   /// to grow with the engine catalog.
   automationConfig Json?
+  /// UUID of the corresponding Coolify Application (plan §19). Written
+  /// on first deploy through `CoolifyDataPlane`; lets the live data
+  /// plane look the project back up across restarts without scanning
+  /// the full /applications list. Null on stub-only environments.
+  coolifyAppUuid   String?
   createdAt DateTime      @default(now())
 
   deployments     Deployment[]
