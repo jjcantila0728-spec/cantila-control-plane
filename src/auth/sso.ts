@@ -30,6 +30,9 @@ export interface SsoProfile {
   email: string;
   /** Display name, when the IdP supplies one. */
   name?: string;
+  /** Profile picture URL from the IdP (Google `picture`, GitHub
+   *  `avatar_url`), when supplied. */
+  avatarUrl?: string;
   /** Opaque provider label — recorded on the audit trail. */
   provider: string;
 }

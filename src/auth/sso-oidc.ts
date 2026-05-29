@@ -143,7 +143,11 @@ export class OidcSsoProvider implements SsoProvider {
       typeof claims.name === "string" && claims.name
         ? claims.name
         : email.split("@")[0];
-    return { email, name, provider: this.label };
+    const avatarUrl =
+      typeof claims.picture === "string" && claims.picture
+        ? claims.picture
+        : undefined;
+    return { email, name, avatarUrl, provider: this.label };
   }
 }
 

@@ -99,16 +99,27 @@ export class GitHubOAuthProvider implements SsoProvider {
     }
 
     let name: string | undefined;
+    let avatarUrl: string | undefined;
     const userRes = await fetch(USER_URL, { headers: authHeaders });
     if (userRes.ok) {
       const profile = (await userRes.json().catch(() => null)) as {
         name?: unknown;
         login?: unknown;
+        avatar_url?: unknown;
       } | null;
       name =
         (typeof profile?.name === "string" && profile.name) ||
         (typeof profile?.login === "string" ? profile.login : undefined);
+      avatarUrl =
+        typeof profile?.avatar_url === "string" && profile.avatar_url
+          ? profile.avatar_url
+          : undefined;
     }
-    return { email, name: name ?? email.split("@")[0], provider: this.label };
+    return {
+      email,
+      name: name ?? email.split("@")[0],
+      avatarUrl,
+      provider: this.label,
+    };
   }
 }
