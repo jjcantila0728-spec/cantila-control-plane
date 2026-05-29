@@ -17,14 +17,19 @@
    boundary keeps the option open to bring more of the carrier stack
    in-house later with no call-site changes.
 
-   STATUS — interfaces + stub only. Real SMS/voice delivery, inbound
-   routing, and A2P/10DLC registration are INFRASTRUCTURE-BLOCKED: they
-   need a carrier/aggregator account. `StubTelephonyProvider` makes the
-   whole surface — including the inbound-webhook shapes — testable
-   offline. Wiring the control plane's existing inline `sendSms` /
-   `recordSmsOptOut` and the SMS OTP engine through this port, and adding
-   the inbound SMS / voice webhook routes, is the follow-up once a
-   carrier account exists.
+   STATUS — live adapter shipped (plan §21). `TelnyxTelephonyProvider`
+   (in `./telnyx`) implements the full surface against the Telnyx v2 API
+   — numbers, SMS, voice, A2P/10DLC, and AI voice agents (Telnyx AI
+   Assistants). `createTelephonyProvider()` env-gates the selection:
+   `TELNYX_API_KEY` present → Telnyx; absent → `StubTelephonyProvider`,
+   which keeps the whole surface (including inbound-webhook shapes)
+   testable offline and is the default for dev/test. The control plane,
+   OTP engine, and the inbound SMS/voice/agent webhook routes are all
+   wired through this port. Going live needs only the Telnyx credentials
+   (`TELNYX_API_KEY`, `TELNYX_PUBLIC_KEY`, messaging-profile / voice-
+   connection ids) — no code change. Compliance (A2P/10DLC, PH sender-id)
+   is enforced by the carrier downstream; the control plane surfaces a
+   graceful `sms_compliance_required` rather than bypassing it.
    ============================================================ */
 
 import { TelnyxTelephonyProvider } from "./telnyx";
