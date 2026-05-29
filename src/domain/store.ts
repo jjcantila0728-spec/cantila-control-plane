@@ -262,6 +262,9 @@ export interface Store {
   createSession(s: Session): Promise<Session>;
   findSessionByTokenHash(tokenHash: string): Promise<Session | null>;
   deleteSession(id: string): Promise<boolean>;
+  /** Delete every session for a user (e.g. on password change). Returns
+   *  the number removed. */
+  deleteSessionsByUser(userId: string): Promise<number>;
 
   /* ----- invites (plan §5.4 — per-user invite flow) -----
    *  The one-time accept link binds a new user to the inviting account
@@ -1337,6 +1340,17 @@ export class InMemoryStore implements Store {
 
   async deleteSession(id: string): Promise<boolean> {
     return this.sessions.delete(id);
+  }
+
+  async deleteSessionsByUser(userId: string): Promise<number> {
+    let n = 0;
+    for (const [id, s] of this.sessions) {
+      if (s.userId === userId) {
+        this.sessions.delete(id);
+        n += 1;
+      }
+    }
+    return n;
   }
 
   /* ----- invites (plan §5.4) ----- */

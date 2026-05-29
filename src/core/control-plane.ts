@@ -5050,6 +5050,9 @@ export class ControlPlane {
       input.userId,
       hashPassword(input.newPassword),
     );
+    // Rotate: invalidate every existing session so a stolen cookie can't
+    // outlive a password change. The caller re-authenticates.
+    await this.deps.store.deleteSessionsByUser(input.userId);
     return { userId: input.userId };
   }
 

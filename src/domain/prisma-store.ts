@@ -1441,6 +1441,11 @@ export class PrismaStore implements Store {
     }
   }
 
+  async deleteSessionsByUser(userId: string): Promise<number> {
+    const res = await this.db.session.deleteMany({ where: { userId } });
+    return res.count;
+  }
+
   /* ----- invites (plan §5.4) ----- */
 
   async createInvite(i: Invite): Promise<Invite> {
