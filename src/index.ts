@@ -25,6 +25,12 @@ import { ProjectOrchestrator } from "./agents/project-orchestrator";
 import { buildDefaultRegistry } from "./automations/registry";
 import { registerAutomationRoutes } from "./automations/routes";
 import { registerConnectionRoutes } from "./connections/routes";
+import {
+  registerCantilapayRoutes,
+  selectPaymentProcessor,
+  startDeliveryWorker as startCantilapayDeliveryWorker,
+} from "./cantilapay";
+import { getPrisma } from "./lib/prisma";
 
 /** The default account used when CANTILA_REQUIRE_AUTH is off — keeps the
  *  no-auth dev story identical to v1.3 (the Console / CLI both work without
@@ -201,6 +207,9 @@ const EXEMPT_PATHS = new Set([
   // phone where they're not signed in). The verify-request endpoint
   // is session-gated separately at the route.
   "/v1/auth/verify-email/confirm",
+  // Cantilapay health probe — surfaces the adapter label so an operator
+  // can confirm the live rail is wired. No sensitive data (plan §25).
+  "/v1/cantilapay/health",
 ]);
 
 function scopeAllows(
@@ -419,6 +428,13 @@ if (config.requireAuth) {
     ) {
       return;
     }
+    // Cantilapay inbound PSP webhooks — Adyen can't present an API key;
+    // signature verification on the raw body is the credential (plan
+    // §25). The cantilapay routes also use their OWN tenant key chain
+    // (`cpk_…` / `csk_…`) for tenant traffic, separate from Cantila
+    // admin keys; the route layer handles that gate itself, so /v1/cantilapay/*
+    // bypasses this top-level enforcement.
+    if (url.startsWith("/v1/cantilapay/")) return;
     // Node-agent endpoints (plan §5.5 — BYO-VPS). The agent on the
     // tenant's box doesn't hold an API key — the raw enrollment token
     // it presents in the body is the credential, and the CP looks it
@@ -3217,6 +3233,31 @@ app.delete("/v1/api-keys/:id", async (request, reply) => {
 app.get("/v1/me", async (request) => {
   const key = getApiKey(request);
   if (!key) {
+    // Session-only callers: surface the user row so the Console can
+    // render verify-email banners + `Hi <name>` chrome (plan §5.4 /
+    // v1.18). Same `authenticated: true` shape — the Console reads
+    // `user?` defensively.
+    const session = await getSessionAuth(request);
+    if (session) {
+      const user = await cp.getAuthUser(session.userId);
+      const account = await cp.getAccount(session.accountId);
+      return {
+        authenticated: true,
+        accountId: session.accountId,
+        keyName: "session",
+        scope: "admin" as const,
+        prefix: "cts_",
+        account: account ?? null,
+        user: user
+          ? {
+              id: user.id,
+              email: user.email,
+              name: user.name,
+              emailVerifiedAt: user.emailVerifiedAt ?? null,
+            }
+          : null,
+      };
+    }
     return { authenticated: false };
   }
   const account = await cp.getAccount(key.accountId);
@@ -3529,6 +3570,44 @@ app.post("/v1/projects/:id/database", async (request, reply) => {
   }
   return reply.code(201).send(result);
 });
+
+/* ----- boot ----- */
+
+// ----- cantilapay (plan §25 — the 12th product surface) -----
+//
+// Phase 0 wires the foundation: tenant API keys, idempotency,
+// webhook framework (in + out), audit log, sub-merchant skeleton.
+// Selects Adyen for Platforms when ADYEN_* env is configured;
+// stub otherwise — same env-gated discipline as every other
+// Cantila adapter. The Console-managed surface (`/enable`,
+// `/api_keys`, …) gates on the existing Cantila Account
+// credential (admin key or Console session); the tenant API
+// surface gates on the cantilapay `csk_…` secret key.
+
+const cantilapaySelection = selectPaymentProcessor(process.env);
+console.log(
+  `[cantilapay] ${cantilapaySelection.label} (${cantilapaySelection.live ? "live" : "stub"})`,
+);
+
+registerCantilapayRoutes(app, {
+  prisma: getPrisma(),
+  selection: cantilapaySelection,
+  // Source of truth for "which Cantila tenant is on the request" for
+  // Console-managed cantilapay routes. Returns null when no credentialed
+  // principal — the Console-managed routes treat that as 401 (no
+  // fallback to DEFAULT_ACCOUNT_ID, by design).
+  resolveConsoleAccountId: (req) => {
+    const key = getApiKey(req);
+    if (key) return key.accountId;
+    const session = getSessionAuth(req);
+    if (session) return session.accountId;
+    return null;
+  },
+});
+
+const stopCantilapayWorker = startCantilapayDeliveryWorker(getPrisma());
+process.on("SIGINT", () => stopCantilapayWorker());
+process.on("SIGTERM", () => stopCantilapayWorker());
 
 /* ----- boot ----- */
 

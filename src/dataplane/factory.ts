@@ -15,6 +15,10 @@ import {
   SshDockerStatsCollector,
   type SshTarget,
 } from "./ssh-docker-stats";
+import {
+  TraefikRpsCollector,
+  type TraefikTarget,
+} from "./traefik-rps";
 
 export interface DataPlaneSelection {
   dataPlane: DataPlane;
@@ -128,6 +132,42 @@ function parsePort(raw: string | undefined): number | undefined {
   return Number.isInteger(n) && n > 0 && n < 65_536 ? n : undefined;
 }
 
+/** Per-region Traefik /metrics URL map for the RPS collector
+ *  (plan §19.7 — H). Per-region env vars:
+ *    COOLIFY_REGION_<R>_TRAEFIK_METRICS_URL
+ *    COOLIFY_REGION_<R>_TRAEFIK_METRICS_TOKEN  (optional bearer)
+ *
+ *  Single-region back-compat:
+ *    COOLIFY_TRAEFIK_METRICS_URL
+ *    COOLIFY_TRAEFIK_METRICS_TOKEN
+ *
+ *  Returns an empty object when nothing is set — the caller skips
+ *  constructing the collector and the data plane falls back to
+ *  the synthesised RPS baseline. */
+function parseTraefikTargets(
+  env: NodeJS.ProcessEnv,
+  defaultRegion: Region,
+): Partial<Record<Region, TraefikTarget>> {
+  const out: Partial<Record<Region, TraefikTarget>> = {};
+  for (const region of REGIONS) {
+    const prefix = `COOLIFY_REGION_${region.toUpperCase()}_TRAEFIK_METRICS_`;
+    const url = env[`${prefix}URL`]?.trim();
+    if (!url) continue;
+    out[region] = {
+      metricsUrl: url,
+      bearerToken: env[`${prefix}TOKEN`]?.trim() || undefined,
+    };
+  }
+  const legacyUrl = env.COOLIFY_TRAEFIK_METRICS_URL?.trim();
+  if (legacyUrl && !out[defaultRegion]) {
+    out[defaultRegion] = {
+      metricsUrl: legacyUrl,
+      bearerToken: env.COOLIFY_TRAEFIK_METRICS_TOKEN?.trim() || undefined,
+    };
+  }
+  return out;
+}
+
 export function selectDataPlane(
   env: NodeJS.ProcessEnv = process.env,
   opts: SelectDataPlaneOptions = {},
@@ -185,6 +225,12 @@ export function selectDataPlane(
         ? new SshDockerStatsCollector({ targets: sshTargets })
         : undefined;
 
+    const traefikTargets = parseTraefikTargets(env, fallbackDefault);
+    const rpsCollector =
+      Object.keys(traefikTargets).length > 0
+        ? new TraefikRpsCollector({ targets: traefikTargets })
+        : undefined;
+
     // Multi-node when any region has > 1 server OR the legacy
     // single-region path opted into `COOLIFY_SERVER_UUIDS`.
     const hasMultiNode = regions
@@ -197,6 +243,7 @@ export function selectDataPlane(
       multiRegion: !!regions && Object.keys(regions).length > 1,
       multiNode: hasMultiNode,
       realMetrics: !!metricsCollector,
+      realRps: !!rpsCollector,
     });
 
     return {
@@ -211,6 +258,7 @@ export function selectDataPlane(
         apexDomain: env.CANTILA_APEX_DOMAIN?.trim() || undefined,
         persistAppUuid,
         metricsCollector,
+        rpsCollector,
       }),
       label: liveLabel,
       live: true,
@@ -223,10 +271,12 @@ function buildLiveLabel(flags: {
   multiRegion: boolean;
   multiNode: boolean;
   realMetrics: boolean;
+  realRps: boolean;
 }): string {
   const parts: string[] = [];
   if (flags.multiRegion) parts.push("multi-region");
   if (flags.multiNode) parts.push("multi-node");
   if (flags.realMetrics) parts.push("real metrics");
+  if (flags.realRps) parts.push("real rps");
   return parts.length === 0 ? "Coolify" : `Coolify (${parts.join(", ")})`;
 }

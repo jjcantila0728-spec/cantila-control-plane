@@ -4892,6 +4892,12 @@ export class ControlPlane {
     return { userId: verdict.userId };
   }
 
+  /** Fetch the AuthUser row by id. Surfaces the session-bound user
+   *  to read-only callers like `/v1/me`. */
+  async getAuthUser(userId: string) {
+    return this.deps.store.getUser(userId);
+  }
+
   /** Begin an email-verify for the currently signed-in user. Mints
    *  a 24h token, stores its hash, and hands it to the mail provider
    *  for delivery to the user's current email address. Idempotent —

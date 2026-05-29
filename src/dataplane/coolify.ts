@@ -26,6 +26,7 @@
 import type { Project, ProjectMetricSample, Region, Runtime } from "../domain/types";
 import type { DataPlane, DeploySource } from "../deploy/pipeline";
 import type { MetricsCollector } from "./metrics-collector";
+import type { RpsCollector } from "./rps-collector";
 
 /** Per-region Coolify panel binding (plan §19.8 multi-server). Phase 3
  *  uses one Coolify panel per region — this carries each panel's URL,
@@ -92,6 +93,12 @@ export interface CoolifyDataPlaneOptions {
    *  the Coolify host and reading `docker stats` filtered by
    *  Coolify's `coolify.applicationId` label. */
   metricsCollector?: MetricsCollector;
+  /** Optional real-RPS collector (plan §19.7). Separate seam from
+   *  `metricsCollector` because HTTP counters are a different
+   *  transport / wire-shape from `docker stats`. Today's
+   *  implementation is `TraefikRpsCollector` — Prometheus scrape
+   *  of Coolify's bundled Traefik. */
+  rpsCollector?: RpsCollector;
 }
 
 /** Concrete per-project routing — apiUrl/apiToken/serverUuid/projectUuid
@@ -136,6 +143,7 @@ export class CoolifyDataPlane implements DataPlane {
     appUuid: string,
   ) => Promise<void>;
   private readonly metricsCollector?: MetricsCollector;
+  private readonly rpsCollector?: RpsCollector;
 
   constructor(opts: CoolifyDataPlaneOptions) {
     this.defaultApiUrl = opts.apiUrl.replace(/\/+$/, "");
@@ -144,6 +152,7 @@ export class CoolifyDataPlane implements DataPlane {
     this.apexDomain = opts.apexDomain ?? "cantila.app";
     this.persistAppUuid = opts.persistAppUuid;
     this.metricsCollector = opts.metricsCollector;
+    this.rpsCollector = opts.rpsCollector;
 
     const regions = new Map<Region, ResolvedRegionGroup>();
     if (opts.regions && Object.keys(opts.regions).length > 0) {
@@ -328,21 +337,28 @@ export class CoolifyDataPlane implements DataPlane {
     const liveStatus = await this.fetchResourceStatus(project).catch(
       () => undefined,
     );
-    let reading = null;
-    if (this.metricsCollector) {
-      const appUuid =
-        this.appUuids.get(project.id) ?? project.coolifyAppUuid ?? undefined;
-      if (appUuid) {
-        reading = await this.metricsCollector
-          .collect({
-            appUuid,
-            appName: appNameFor(project),
-            region: project.region,
-          })
-          .catch(() => null);
-      }
-    }
-    return synthesiseMetrics(project, liveStatus, reading);
+    const appUuid =
+      this.appUuids.get(project.id) ?? project.coolifyAppUuid ?? undefined;
+    const appName = appNameFor(project);
+
+    // CPU/memory reading (SSH `docker stats`) and RPS reading
+    // (Traefik /metrics) are fetched in parallel — both target the
+    // same Coolify host and the data plane is on the metrics-API
+    // request path, so a serial call would double the latency.
+    const [metricsReading, rpsReading] = await Promise.all([
+      this.metricsCollector && appUuid
+        ? this.metricsCollector
+            .collect({ appUuid, appName, region: project.region })
+            .catch(() => null)
+        : Promise.resolve(null),
+      this.rpsCollector && appUuid
+        ? this.rpsCollector
+            .collect({ appUuid, appName, region: project.region })
+            .catch(() => null)
+        : Promise.resolve(null),
+    ]);
+
+    return synthesiseMetrics(project, liveStatus, metricsReading, rpsReading);
   }
 
   // -- private helpers --------------------------------------------------
@@ -602,6 +618,7 @@ function synthesiseMetrics(
   project: Project,
   liveStatus?: string,
   reading?: { cpuPct: number; memPct: number; replicas: number } | null,
+  rpsReading?: { rps: number } | null,
 ): ProjectMetricSample[] {
   const SAMPLE_COUNT = 12;
   const INTERVAL_MS = 5_000;
@@ -621,8 +638,14 @@ function synthesiseMetrics(
       : effectiveStatus === "sleeping"
         ? 2 + (seed % 5)
         : 0;
-  const baseRps =
-    effectiveStatus === "live"
+  // Anchor RPS to the real Traefik reading when available; otherwise
+  // fall back to the status-derived baseline. A reading of exactly 0
+  // is still a real measurement (the app is up but idle), so we
+  // accept zero through the conditional rather than degrading to
+  // synthesis.
+  const baseRps = rpsReading
+    ? rpsReading.rps
+    : effectiveStatus === "live"
       ? 4 + (seed % 12)
       : effectiveStatus === "sleeping"
         ? 0.1 + (seed % 5) / 10
@@ -656,11 +679,15 @@ function synthesiseMetrics(
     // host directly. The older samples get smooth-jitter.
     const cpuJ = i === 0 && reading ? 0 : jitter;
     const memJ = i === 0 && reading ? 0 : jitter * 0.5;
+    // Newest sample anchors to the real Traefik RPS (no jitter) when
+    // a reading is present; older samples smooth around it like CPU
+    // + memory do.
+    const rpsJ = i === 0 && rpsReading ? 0 : jitter;
     out.push({
       at,
       cpuPct: Math.round(clamp(baseCpu * (1 + cpuJ), 0, 100) * 10) / 10,
       memPct: Math.round(clamp(baseMem * (1 + memJ), 0, 100) * 10) / 10,
-      rps: Math.round(Math.max(0, baseRps * (1 + jitter)) * 10) / 10,
+      rps: Math.round(Math.max(0, baseRps * (1 + rpsJ)) * 10) / 10,
     });
   }
   return out;
