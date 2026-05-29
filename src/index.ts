@@ -2219,8 +2219,9 @@ const sessionTokenSchema = z.object({
   token: z.string().min(1),
 });
 
-// Email + password sign-in. An unknown email auto-registers in this
-// prototype draft — see ControlPlane.loginWithPassword.
+// Email + password sign-in. Unknown emails are rejected (no auto-register)
+// — new users sign up explicitly via /v1/auth/register. See
+// ControlPlane.loginWithPassword.
 app.post("/v1/auth/login", async (request, reply) => {
   const parsed = loginSchema.safeParse(request.body);
   if (!parsed.success) {
