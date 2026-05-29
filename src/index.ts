@@ -2486,6 +2486,74 @@ app.post("/v1/agents/resume", async () => {
   return { paused: false };
 });
 
+/* ----- Owner-queued agent proposals (admin-only, in-memory v1).
+ *  These let the founder add new agent ideas from the Console chat;
+ *  they appear as dimmed satellites on the agents canvas until a real
+ *  TS class lands under cantila-control-plane/src/agents/. Storage is
+ *  in-memory here on purpose — promoting to a Prisma model is a
+ *  follow-up so the agent registry can survive restarts and gain
+ *  status transitions (proposed → implemented → rejected). ----- */
+
+interface AgentProposalRow {
+  id: string;
+  name: string;
+  blurb: string;
+  scope?: string;
+  status: "proposed" | "implemented" | "rejected";
+  createdByEmail: string;
+  createdAt: string;
+}
+
+const agentProposals = new Map<string, AgentProposalRow>();
+
+const OWNER_EMAIL = (process.env.CANTILA_OWNER_EMAIL ?? "jjcantila0728@gmail.com")
+  .trim()
+  .toLowerCase();
+
+async function sessionEmail(req: FastifyRequest): Promise<string | null> {
+  const session = getSessionAuth(req);
+  if (!session) return null;
+  const user = await cp.getAuthUser(session.userId);
+  return user?.email?.trim().toLowerCase() ?? null;
+}
+
+const createAgentProposalSchema = z.object({
+  name: z.string().min(1).max(80),
+  blurb: z.string().min(1).max(280),
+  scope: z.string().max(80).optional(),
+});
+
+app.post("/v1/agents/proposals", async (request, reply) => {
+  const email = await sessionEmail(request);
+  if (email !== OWNER_EMAIL) {
+    return reply.code(403).send({ error: "owner only" });
+  }
+  const parsed = createAgentProposalSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const id = `apl_${Math.random().toString(36).slice(2, 12)}`;
+  const row: AgentProposalRow = {
+    id,
+    name: parsed.data.name,
+    blurb: parsed.data.blurb,
+    scope: parsed.data.scope,
+    status: "proposed",
+    createdByEmail: email,
+    createdAt: new Date().toISOString(),
+  };
+  agentProposals.set(id, row);
+  return row;
+});
+
+app.get("/v1/agents/proposals", async () => {
+  return {
+    proposals: Array.from(agentProposals.values()).sort((a, b) =>
+      a.createdAt < b.createdAt ? 1 : -1,
+    ),
+  };
+});
+
 /* ----- SeoAgent — plan §4.9 extension (10th brain swarm agent).
  *  Filters the brain snapshot to just the SEO slice so the Console
  *  can render a dedicated SEO panel without paging through every
