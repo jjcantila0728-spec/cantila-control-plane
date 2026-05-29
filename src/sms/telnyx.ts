@@ -80,7 +80,12 @@ export class TelnyxClient {
     if (!res.ok) {
       throw new TelnyxError(res.status, path, text);
     }
-    return text ? (JSON.parse(text) as unknown) : {};
+    if (!text) return {};
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      throw new TelnyxError(res.status, path, `Non-JSON response body: ${text.slice(0, 200)}`);
+    }
   }
 }
 
@@ -88,6 +93,7 @@ export class TelnyxError extends Error {
   constructor(
     readonly status: number,
     readonly path: string,
+    /** Full, untruncated response body — may be large on HTML error pages. */
     readonly bodyText: string,
   ) {
     super(`Telnyx ${status} on ${path}: ${bodyText.slice(0, 300)}`);
@@ -107,8 +113,13 @@ export function verifyTelnyxSignature(
   timestamp: string,
   rawBody: string,
 ): boolean {
+  const rawKey = Buffer.from(publicKeyB64, "base64");
+  if (rawKey.length !== 32) {
+    throw new Error(
+      "TELNYX_PUBLIC_KEY is missing or malformed (expected base64 of a 32-byte Ed25519 key)",
+    );
+  }
   try {
-    const rawKey = Buffer.from(publicKeyB64, "base64");
     const der = Buffer.concat([ED25519_SPKI_PREFIX, rawKey]);
     const keyObj = createPublicKey({ key: der, format: "der", type: "spki" });
     return edVerify(
