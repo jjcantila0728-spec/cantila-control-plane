@@ -15,3 +15,5 @@ export type { AdyenClients, AdyenClientConfig } from "./client";
 export { mapAdyenRefusalReason, type MappedRefusal } from "./error-mapping";
 
 export { confirmPayment, capturePayment, refundPayment, cancelPayment } from "./payments";
+
+export { parseAdyenNotification } from "./webhooks";
