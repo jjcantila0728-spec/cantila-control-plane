@@ -7,10 +7,11 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import { config } from "./config";
 import { createStore } from "./domain/create-store";
+import { seedOwnerAccount } from "./domain/seed-owner";
 import { stubProvisioner } from "./dataplane/stub";
 import { selectDataPlane } from "./dataplane/factory";
 import { ControlPlane } from "./core/control-plane";
-import type { ApiKey } from "./domain/types";
+import type { ApiKey, AccountPlan } from "./domain/types";
 import { now } from "./lib/ids";
 import { setRequestContext } from "./lib/request-context";
 import { McpServer } from "./mcp/server";
@@ -3696,10 +3697,30 @@ process.on("SIGTERM", () => {
 
 app
   .listen({ port: config.port, host: "0.0.0.0" })
-  .then(() => {
+  .then(async () => {
     app.log.info(
       `cantila-control-plane listening on :${config.port} · store=${config.store}`,
     );
+    // Owner-account seed (plan §18). When CANTILA_OWNER_PASSWORD is set,
+    // ensure the owner email is a real OWNER of a real account so the
+    // Console scopes to it instead of falling back to the demo account.
+    // Idempotent — safe on every boot. The in-memory store wipes on
+    // restart, so this is what makes the owner durable across restarts.
+    const ownerPassword = process.env.CANTILA_OWNER_PASSWORD;
+    if (ownerPassword) {
+      const result = await seedOwnerAccount(store, {
+        email: process.env.CANTILA_OWNER_EMAIL ?? "jjcantila0728@gmail.com",
+        password: ownerPassword,
+        name: process.env.CANTILA_OWNER_NAME ?? "JJ Cantila",
+        accountId: process.env.CANTILA_OWNER_ACCOUNT_ID ?? "acc_cantila",
+        accountName: process.env.CANTILA_OWNER_ACCOUNT_NAME ?? "Cantila",
+        handle: process.env.CANTILA_OWNER_ACCOUNT_HANDLE ?? "cantila",
+        plan: (process.env.CANTILA_OWNER_ACCOUNT_PLAN as AccountPlan) ?? "dedicated",
+      });
+      app.log.info(
+        `owner seed: account=${result.accountId} created=${JSON.stringify(result.created)}`,
+      );
+    }
     cp.startBackgroundJobs();
     app.log.info("background jobs started (uptime sweeps every 30s)");
   })

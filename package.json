@@ -4,10 +4,10 @@
   "private": true,
   "description": "Cantila control plane — the API, deploy pipeline and MCP server behind the Cantila hosting cloud.",
   "scripts": {
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx watch --env-file-if-exists=.env.local src/index.ts",
     "mcp": "tsx src/mcp/index.ts",
     "build": "prisma generate && tsc",
-    "start": "npm run prisma:baseline && npm run prisma:deploy && node dist/index.js",
+    "start": "npm run prisma:baseline && npm run prisma:deploy && node --env-file-if-exists=.env.local dist/index.js",
     "postinstall": "prisma generate",
     "typecheck": "tsc --noEmit",
     "prisma:generate": "prisma generate",
