@@ -17,3 +17,9 @@ export { mapAdyenRefusalReason, type MappedRefusal } from "./error-mapping";
 export { confirmPayment, capturePayment, refundPayment, cancelPayment } from "./payments";
 
 export { parseAdyenNotification } from "./webhooks";
+
+export {
+  createSubMerchant,
+  getSubMerchant,
+  createOnboardingLink,
+} from "./submerchants";
