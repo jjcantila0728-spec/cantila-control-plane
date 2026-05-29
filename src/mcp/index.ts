@@ -5,6 +5,7 @@
    ============================================================ */
 
 import { InMemoryStore } from "../domain/store";
+import { ownerAccountId } from "../lib/owner-account";
 import { stubProvisioner } from "../dataplane/stub";
 import { selectDataPlane } from "../dataplane/factory";
 import { ControlPlane } from "../core/control-plane";
@@ -40,7 +41,7 @@ async function main(): Promise<void> {
   // store. In production every transport shares the platform database.
   const demo = await cp.createProject({
     name: "demo-app",
-    accountId: "acc_demo",
+    accountId: ownerAccountId(),
     runtime: "node",
     region: "fsn1",
   });

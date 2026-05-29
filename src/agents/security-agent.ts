@@ -85,7 +85,7 @@ export class SecurityAgent implements Agent {
 
     // Stale keys — needs to walk every account. countAccounts is cheap;
     // listAccounts gives us every tenant. (SecurityAgent is the one cross-
-    // account observer in the brain; other agents are scoped to acc_demo.)
+    // account observer in the brain; other agents are scoped to the owner account.)
     const accounts = await cp.listAccounts();
     for (const account of accounts) {
       const keys = await cp.listApiKeys(account.id);

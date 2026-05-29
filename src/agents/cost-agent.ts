@@ -18,8 +18,9 @@
 import type { ControlPlane } from "../core/control-plane";
 import { id as makeId, now } from "../lib/ids";
 import type { Agent, ActionClass, Confidence, Observation, Proposal } from "./types";
+import { ownerAccountId } from "../lib/owner-account";
 
-const ACCOUNT = "acc_demo";
+const ACCOUNT = ownerAccountId();
 
 const KIND_POLICY: Record<
   string,

@@ -26,8 +26,9 @@
 import type { ControlPlane } from "../core/control-plane";
 import { id as makeId, now } from "../lib/ids";
 import type { Agent, Observation, Proposal } from "./types";
+import { ownerAccountId } from "../lib/owner-account";
 
-const ACCOUNT = "acc_demo";
+const ACCOUNT = ownerAccountId();
 const WINDOW_MS = 60 * 60 * 1000; // last hour
 /** Minimum terminal events before we trust the rate (avoids "1/1 bounced
  *  → 100% bounce rate" noise on a quiet day). */

@@ -26,8 +26,9 @@ import type { ControlPlane } from "../core/control-plane";
 import { id as makeId, now } from "../lib/ids";
 import type { Agent, Observation, Proposal } from "./types";
 import type { ProjectMetricSample } from "../domain/types";
+import { ownerAccountId } from "../lib/owner-account";
 
-const ACCOUNT = "acc_demo";
+const ACCOUNT = ownerAccountId();
 /** Sustained-load thresholds. `MIN_SAMPLES` keeps the agent from acting
  *  on a single spike — sustained means N consecutive samples above /
  *  below the line. The numbers match the §15.2 ScaleAgent follow-up:

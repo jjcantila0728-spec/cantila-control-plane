@@ -12,6 +12,7 @@
 import type { Store } from "../domain/store";
 import type { DataPlane } from "../deploy/pipeline";
 import type { Project } from "../domain/types";
+import { ownerAccountId } from "../lib/owner-account";
 
 export type CheckStatus = "up" | "degraded" | "down";
 
@@ -67,7 +68,7 @@ export class UptimeChecker {
   /** Run one health-check sweep across every project for an account. */
   async sweep(): Promise<void> {
     // Single-tenant for now — match the rest of the CP demo flow.
-    const projects = await this.deps.store.listProjects("acc_demo");
+    const projects = await this.deps.store.listProjects(ownerAccountId());
     for (const p of projects) {
       await this.checkProject(p);
     }
