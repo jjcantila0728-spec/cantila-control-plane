@@ -30,6 +30,11 @@ import {
   refundPayment as refundImpl,
   cancelPayment as cancelImpl,
 } from "./adyen-impl/payments";
+import {
+  createSubMerchant as createSubMerchantImpl,
+  getSubMerchant as getSubMerchantImpl,
+  createOnboardingLink as createOnboardingLinkImpl,
+} from "./adyen-impl/submerchants";
 import { parseAdyenNotification } from "./adyen-impl/webhooks";
 
 export interface AdyenForPlatformsConfig {
@@ -136,34 +141,28 @@ export class AdyenForPlatformsAdapter implements PaymentProcessor {
     return events[0];
   }
 
-  // ----- sub-merchants (v1.1.1 — Tasks 9-10 wire these) -----
+  // ----- sub-merchants (v1.1.1 — LEM + Balance Platform + Hosted Onboarding) -----
 
-  async createSubMerchant(_input: {
+  createSubMerchant(input: {
     country: string;
     externalRef: string;
     mode: CantilapayMode;
   }): Promise<PspSubMerchant> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.createSubMerchant — implemented in v1.1.1 (Task 9-10).",
-    );
+    return createSubMerchantImpl(this.clients(input.mode), input);
   }
 
-  async getSubMerchant(_input: {
+  getSubMerchant(input: {
     id: string;
     mode: CantilapayMode;
   }): Promise<PspSubMerchant> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.getSubMerchant — implemented in v1.1.1 (Task 9-10).",
-    );
+    return getSubMerchantImpl(this.clients(input.mode), input);
   }
 
-  async createOnboardingLink(_input: {
+  createOnboardingLink(input: {
     subMerchantId: string;
     mode: CantilapayMode;
     returnUrl: string;
   }): Promise<{ url: string; expiresAt: string }> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.createOnboardingLink — implemented in v1.1.1 (Task 9-10).",
-    );
+    return createOnboardingLinkImpl(this.clients(input.mode), input);
   }
 }
