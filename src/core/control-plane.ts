@@ -4807,10 +4807,11 @@ export class ControlPlane {
     return { token, expiresAt };
   }
 
-  /** Sign in with email + password. In this prototype draft an unknown
-   *  email auto-registers (matching the legacy "any credentials open the
-   *  Console" behaviour); a known email must present the right password.
-   *  Production should split register and login. */
+  /** Sign in with email + password. An unknown email or a wrong password
+   *  both fail with the same generic message — there is no auto-register,
+   *  so the endpoint can't be used to enumerate accounts. New users sign
+   *  up explicitly via /v1/auth/register. The `name` field is ignored
+   *  here and kept only for signature compatibility. */
   async loginWithPassword(input: {
     email: string;
     password: string;
@@ -4831,22 +4832,17 @@ export class ControlPlane {
       return { error: "a password is required" };
     }
     const existing = await this.deps.store.findUserByEmail(email);
-    let user: AuthUser;
-    if (existing) {
-      if (
-        !existing.passwordHash ||
-        !verifyPassword(input.password, existing.passwordHash)
-      ) {
-        return { error: "incorrect email or password" };
-      }
-      user = existing;
-    } else {
-      user = await this.findOrCreateUser({
-        email,
-        name: input.name,
-        passwordHash: hashPassword(input.password),
-      });
+    if (
+      !existing ||
+      !existing.passwordHash ||
+      !verifyPassword(input.password, existing.passwordHash)
+    ) {
+      // No auto-register: unknown email and wrong password are
+      // indistinguishable, so an attacker can't enumerate accounts.
+      // New users sign up explicitly via /v1/auth/register.
+      return { error: "incorrect email or password" };
     }
+    const user = existing;
     const { token, expiresAt } = await this.mintSession(user.id);
     return {
       token,
