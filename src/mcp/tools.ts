@@ -92,7 +92,7 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
           const lines = [
             `Deploy ${outcome.status} — ${outcome.url}`,
             `Deployment: ${outcome.deploymentId}`,
-            `Auto-wired this run — database: ${p.databaseCreated}, email: ${p.mailboxCreated}, sms: ${p.phoneNumberCreated}`,
+            `Auto-wired this run — database: ${p.databaseCreated}, email: ${p.mailboxCreated}`,
             p.injectedEnv.length > 0
               ? `Injected env: ${p.injectedEnv.join(", ")}`
               : "Services already wired — no new env injected.",

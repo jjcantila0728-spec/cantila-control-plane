@@ -285,6 +285,7 @@ function toPhoneNumber(r: DbPhoneNumber): PhoneNumber {
     region: r.region,
     status: r.status,
     apiKey: r.apiKey,
+    marketplaceNumberId: r.marketplaceNumberId ?? undefined,
     capabilities: r.capabilities
       .split(",")
       .filter(Boolean) as NumberCapability[],
@@ -1008,11 +1009,16 @@ export class PrismaStore implements Store {
         region: n.region,
         status: n.status,
         apiKey: n.apiKey,
+        marketplaceNumberId: n.marketplaceNumberId ?? null,
         capabilities: n.capabilities.join(","),
         createdAt: new Date(n.createdAt),
       },
     });
     return toPhoneNumber(row);
+  }
+
+  async deletePhoneNumber(projectId: string): Promise<void> {
+    await this.db.phoneNumber.deleteMany({ where: { projectId } });
   }
 
   async updatePhoneNumber(
@@ -1068,6 +1074,13 @@ export class PrismaStore implements Store {
       },
     });
     return toEnvVar(row);
+  }
+
+  async deleteEnvVar(projectId: string, key: string): Promise<void> {
+    // Drops the var across every scope — the injected SMS vars use a
+    // single `all` scope, but deleting by (projectId, key) is the safe
+    // superset for deactivation.
+    await this.db.envVar.deleteMany({ where: { projectId, key } });
   }
 
   /* ----- deployments ----- */

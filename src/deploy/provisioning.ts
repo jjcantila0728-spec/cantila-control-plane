@@ -1,7 +1,10 @@
 /* ============================================================
    Auto-wired services — the headline behaviour (plan §4.2).
-   Every project gets its OWN database, email and SMS, connected
-   before the first build runs.
+   Every project gets its OWN database and email, connected before
+   the first build runs. SMS is NOT auto-wired — it is opt-in per
+   project: a tenant activates SMS explicitly (see
+   `ControlPlane.activateSms`), which provisions a real Telnyx number
+   and injects `CANTILA_SMS_*` on demand.
    ============================================================ */
 
 import type { Store } from "../domain/store";
@@ -26,26 +29,22 @@ export interface ServiceProvisioner {
     smtpUser: string;
     smtpPassword: string;
   }>;
-  allocateNumber(project: Project): Promise<{
-    e164: string;
-    apiKey: string;
-  }>;
 }
 
 export interface ProvisionResult {
   databaseCreated: boolean;
   mailboxCreated: boolean;
-  phoneNumberCreated: boolean;
   /** Names of the env vars injected into the project this run. */
   injectedEnv: string[];
 }
 
 /**
  * Auto-wires a project's bundled services. Idempotent — safe to run on
- * every deploy. On the first deploy it creates the project's own database,
- * mailbox and SMS number, then injects their credentials into the project
- * environment as secrets so the app is connected before it builds. On later
- * deploys every service already exists and this is a fast no-op.
+ * every deploy. On the first deploy it creates the project's own database
+ * and mailbox, then injects their credentials into the project environment
+ * as secrets so the app is connected before it builds. On later deploys
+ * every service already exists and this is a fast no-op. SMS is opt-in and
+ * is provisioned separately by `ControlPlane.activateSms`.
  */
 export async function provisionProjectServices(
   store: Store,
@@ -55,7 +54,6 @@ export async function provisionProjectServices(
   const injectedEnv: string[] = [];
   let databaseCreated = false;
   let mailboxCreated = false;
-  let phoneNumberCreated = false;
 
   async function inject(key: string, value: string): Promise<void> {
     await store.upsertEnvVar({
@@ -111,25 +109,9 @@ export async function provisionProjectServices(
     mailboxCreated = true;
   }
 
-  // --- dedicated SMS number ---
-  const existingNumber = await store.getPhoneNumberByProject(project.id);
-  if (!existingNumber) {
-    const p = await provisioner.allocateNumber(project);
-    const phone = await store.createPhoneNumber({
-      id: id("num"),
-      projectId: project.id,
-      e164: p.e164,
-      region: project.region,
-      status: "active",
-      apiKey: p.apiKey,
-      // Auto-wired numbers are full-capability (plan §4.5).
-      capabilities: ["sms", "mms", "voice"],
-      createdAt: now(),
-    });
-    await inject("CANTILA_SMS_NUMBER", phone.e164);
-    await inject("CANTILA_SMS_API_KEY", phone.apiKey);
-    phoneNumberCreated = true;
-  }
+  // SMS is opt-in — no number is allocated here. See
+  // `ControlPlane.activateSms`, which provisions a real Telnyx number and
+  // injects `CANTILA_SMS_NUMBER` / `CANTILA_SMS_API_KEY` on demand.
 
-  return { databaseCreated, mailboxCreated, phoneNumberCreated, injectedEnv };
+  return { databaseCreated, mailboxCreated, injectedEnv };
 }

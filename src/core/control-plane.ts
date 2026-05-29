@@ -2599,6 +2599,163 @@ export class ControlPlane {
     });
   }
 
+  /* ----- per-project SMS activation (opt-in) -----
+   *
+   *  SMS is no longer auto-wired at deploy. A tenant activates it on a
+   *  project, which provisions a real number through the carrier (the
+   *  marketplace `purchaseNumber` path — Telnyx in prod, the stub offline)
+   *  and bridges it to the project's `PhoneNumber` row so the existing
+   *  send / inbound / voice / OTP call sites work unchanged. */
+
+  /** Activate SMS on a project. Idempotent — returns the existing number
+   *  if SMS is already on. Provisions a real carrier number (billed
+   *  monthly), records it as a project `PhoneNumber`, and injects
+   *  `CANTILA_SMS_NUMBER` / `CANTILA_SMS_API_KEY` so the app picks them up
+   *  on its next deploy. When `e164` is omitted, the first available
+   *  number in `country` (of `numberType`) is chosen. */
+  async activateSms(
+    accountId: string,
+    projectId: string,
+    input: {
+      country: string;
+      numberType?: NumberType;
+      capabilities?: NumberCapability[];
+      e164?: string;
+    },
+  ): Promise<PhoneNumber | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project || project.accountId !== accountId) {
+      return { error: "project not found" };
+    }
+
+    // Idempotent — SMS already active.
+    const existing = await this.deps.store.getPhoneNumberByProject(projectId);
+    if (existing) return maskNumber(existing) as PhoneNumber;
+
+    const numberType: NumberType = input.numberType ?? "local";
+    const capabilities: NumberCapability[] =
+      input.capabilities && input.capabilities.length > 0
+        ? input.capabilities
+        : ["sms", "mms", "voice"];
+
+    // Resolve a concrete number to provision.
+    let e164 = input.e164?.trim();
+    if (!e164) {
+      const available = await this.searchNumberCatalog({
+        country: input.country,
+        type: numberType,
+        capability: "sms",
+      });
+      if (available.length === 0) {
+        return { error: "no numbers available for that country" };
+      }
+      e164 = available[0].e164;
+    }
+
+    // Provision + bill the real number via the marketplace path.
+    const purchased = await this.purchaseNumber({
+      accountId,
+      e164,
+      country: input.country,
+      numberType,
+      capabilities,
+      projectId,
+    });
+    if ("error" in purchased) return purchased;
+
+    // Bridge to the project send path: the project's own `PhoneNumber`.
+    const phone = await this.deps.store.createPhoneNumber({
+      id: id("num"),
+      projectId,
+      e164: purchased.e164,
+      region: project.region,
+      status: "active",
+      apiKey: `ct_sms_${secret().slice(0, 24)}`,
+      marketplaceNumberId: purchased.id,
+      capabilities,
+      createdAt: now(),
+    });
+
+    // Inject the project env so the app is wired on its next deploy.
+    await this.injectSmsEnv(projectId, phone.e164, phone.apiKey);
+
+    await this.recordEvent(
+      accountId,
+      "system",
+      `SMS activated — ${phone.e164}`,
+      `${numberType} · ${capabilities.join("/")}`,
+      projectId,
+    );
+    return maskNumber(phone) as PhoneNumber;
+  }
+
+  /** Deactivate SMS on a project — releases the carrier number (stops the
+   *  monthly charge), removes the project `PhoneNumber`, and strips the
+   *  injected env. Idempotent — a no-op when SMS is already off. */
+  async deactivateSms(
+    accountId: string,
+    projectId: string,
+  ): Promise<{ ok: true } | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project || project.accountId !== accountId) {
+      return { error: "project not found" };
+    }
+    const phone = await this.deps.store.getPhoneNumberByProject(projectId);
+    if (!phone) return { ok: true };
+
+    // Release the carrier lease + stop billing. Best-effort: a release
+    // failure must not strand the project with an un-removable number.
+    if (phone.marketplaceNumberId) {
+      const released = await this.releaseOwnedNumber(
+        accountId,
+        phone.marketplaceNumberId,
+      );
+      if ("error" in released && released.error !== "number is already released") {
+        return { error: released.error };
+      }
+    }
+
+    await this.deps.store.deletePhoneNumber(projectId);
+    await this.deps.store.deleteEnvVar(projectId, "CANTILA_SMS_NUMBER");
+    await this.deps.store.deleteEnvVar(projectId, "CANTILA_SMS_API_KEY");
+
+    await this.recordEvent(
+      accountId,
+      "system",
+      "SMS deactivated",
+      `${phone.e164} released`,
+      projectId,
+    );
+    return { ok: true };
+  }
+
+  /** Inject the SMS env pair as project secrets (scope `all`). Mirrors the
+   *  keys the deploy auto-wiring used to inject before SMS became opt-in. */
+  private async injectSmsEnv(
+    projectId: string,
+    e164: string,
+    apiKey: string,
+  ): Promise<void> {
+    await this.deps.store.upsertEnvVar({
+      id: id("env"),
+      projectId,
+      key: "CANTILA_SMS_NUMBER",
+      value: e164,
+      secret: true,
+      scope: "all",
+      updatedAt: now(),
+    });
+    await this.deps.store.upsertEnvVar({
+      id: id("env"),
+      projectId,
+      key: "CANTILA_SMS_API_KEY",
+      value: apiKey,
+      secret: true,
+      scope: "all",
+      updatedAt: now(),
+    });
+  }
+
   /** Purchase a number from the marketplace — provision it with the
    *  carrier, persist an account-owned `MarketplaceNumber`, and record a
    *  billable purchase event. Pricing is server-authoritative (from the

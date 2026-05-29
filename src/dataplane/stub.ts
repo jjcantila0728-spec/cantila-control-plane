@@ -11,8 +11,6 @@ import type { ServiceProvisioner } from "../deploy/provisioning";
 import type { DataPlane, DeploySource } from "../deploy/pipeline";
 import { id, secret } from "../lib/ids";
 
-let numberSeq = 142;
-
 export const stubProvisioner: ServiceProvisioner = {
   async createDatabase(project: Project) {
     return {
@@ -30,15 +28,6 @@ export const stubProvisioner: ServiceProvisioner = {
       smtpHost: "smtp.cantila.email",
       smtpUser: project.slug,
       smtpPassword: secret().slice(0, 32),
-    };
-  },
-
-  async allocateNumber(_project: Project) {
-    numberSeq += 1;
-    const tail = String(numberSeq).padStart(4, "0");
-    return {
-      e164: `+1415555${tail}`,
-      apiKey: `ct_sms_${secret().slice(0, 24)}`,
     };
   },
 };

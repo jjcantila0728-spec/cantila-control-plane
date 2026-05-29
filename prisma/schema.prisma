@@ -487,6 +487,9 @@ model PhoneNumber {
   status    ServiceStatus @default(provisioning)
   // SMS API key — stored encrypted at rest
   apiKey    String
+  /// The MarketplaceNumber this project number was provisioned from when
+  /// SMS was activated (deactivate releases it). Null on legacy rows.
+  marketplaceNumberId String?
   /// Capabilities as a comma-separated list, e.g. "sms,mms,voice" (plan §4.5).
   capabilities String @default("sms,mms,voice")
   // Inbound-call routing (plan §4.5). Defaults to voicemail.

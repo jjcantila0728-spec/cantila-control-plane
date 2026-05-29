@@ -1301,6 +1301,40 @@ app.post("/v1/projects/:id/sms/send", async (request, reply) => {
   return reply.code(202).send(result);
 });
 
+const activateSmsSchema = z.object({
+  country: z.string().min(2).max(2),
+  numberType: z.enum(["local", "toll_free", "mobile", "short_code"]).optional(),
+  capabilities: z.array(z.enum(["sms", "mms", "voice"])).optional(),
+  e164: z.string().min(4).optional(),
+});
+
+/** Activate SMS on a project — opt-in (plan §4.5). Provisions a real
+ *  carrier number, records it as the project's number, and injects
+ *  `CANTILA_SMS_*`. Idempotent: returns the existing number if already on. */
+app.post("/v1/projects/:id/sms/activate", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const parsed = activateSmsSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.activateSms(project.accountId, id, parsed.data);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+/** Deactivate SMS on a project — releases the number, stops billing, and
+ *  strips the injected env. Idempotent. */
+app.post("/v1/projects/:id/sms/deactivate", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const result = await cp.deactivateSms(project.accountId, id);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
 const optOutSchema = z.object({
   from: z.string().min(4),
 });

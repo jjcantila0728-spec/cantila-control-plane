@@ -644,6 +644,11 @@ export interface PhoneNumber {
   region: Region;
   status: ServiceStatus;
   apiKey: string; // secret
+  /** The account-owned `MarketplaceNumber` this project number was
+   *  provisioned from, when SMS was activated via `activateSms`. Used by
+   *  `deactivateSms` to release the Telnyx lease + stop billing. Absent on
+   *  legacy auto-wired rows. */
+  marketplaceNumberId?: string;
   /** What the number can do — SMS / MMS / voice (plan §4.5). Absent on
    *  legacy rows; read as the full `["sms","mms","voice"]` default. */
   capabilities: NumberCapability[];

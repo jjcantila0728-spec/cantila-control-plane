@@ -201,9 +201,13 @@ export interface Store {
     projectId: string,
     patch: Partial<PhoneNumber>,
   ): Promise<PhoneNumber>;
+  /** Remove a project's SMS number — used by `deactivateSms`. */
+  deletePhoneNumber(projectId: string): Promise<void>;
 
   listEnvVars(projectId: string): Promise<EnvVar[]>;
   upsertEnvVar(v: EnvVar): Promise<EnvVar>;
+  /** Delete a project env var by key (all scopes) — used by `deactivateSms`. */
+  deleteEnvVar(projectId: string, key: string): Promise<void>;
 
   createDeployment(d: Deployment): Promise<Deployment>;
   updateDeployment(id: string, patch: Partial<Deployment>): Promise<Deployment>;
@@ -828,6 +832,10 @@ export class InMemoryStore implements Store {
     return updated;
   }
 
+  async deletePhoneNumber(projectId: string): Promise<void> {
+    this.phoneNumbers.delete(projectId);
+  }
+
   async listEnvVars(projectId: string): Promise<EnvVar[]> {
     return [...this.envVars.values()].filter((v) => v.projectId === projectId);
   }
@@ -843,6 +851,14 @@ export class InMemoryStore implements Store {
     const row: EnvVar = existing ? { ...v, id: existing.id } : v;
     this.envVars.set(row.id, row);
     return row;
+  }
+
+  async deleteEnvVar(projectId: string, key: string): Promise<void> {
+    for (const [mapId, v] of this.envVars) {
+      if (v.projectId === projectId && v.key === key) {
+        this.envVars.delete(mapId);
+      }
+    }
   }
 
   async createDeployment(d: Deployment): Promise<Deployment> {
