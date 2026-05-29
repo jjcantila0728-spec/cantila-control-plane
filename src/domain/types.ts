@@ -193,6 +193,8 @@ export interface TeamMember {
   name: string;
   role: MemberRole;
   joinedAt: string;
+  /** Optional — the user's avatar URL (from SSO profile or upload). */
+  avatarUrl?: string;
   /** Optional — most recent activity (touched by `recordEvent` later). */
   lastActiveAt?: string;
 }

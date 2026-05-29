@@ -5445,6 +5445,7 @@ export class ControlPlane {
           id: string;
           email: string;
           name: string;
+          avatarUrl?: string;
           accountId?: string;
         };
         expiresAt: string;
@@ -5473,6 +5474,7 @@ export class ControlPlane {
         id: user.id,
         email: user.email,
         name: user.name,
+        avatarUrl: user.avatarUrl,
         accountId: user.accountId,
       },
       expiresAt: session.expiresAt,

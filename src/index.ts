@@ -3434,6 +3434,7 @@ app.get("/v1/me", async (request) => {
               email: user.email,
               name: user.name,
               emailVerifiedAt: user.emailVerifiedAt ?? null,
+              avatarUrl: user.avatarUrl ?? null,
             }
           : null,
       };

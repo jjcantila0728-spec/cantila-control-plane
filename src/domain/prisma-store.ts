@@ -1269,6 +1269,7 @@ export class PrismaStore implements Store {
       userId: r.userId,
       email: r.user.email,
       name: r.user.name,
+      avatarUrl: r.user.avatarUrl ?? undefined,
       role: r.role,
       joinedAt: r.user.createdAt.toISOString(),
     }));
