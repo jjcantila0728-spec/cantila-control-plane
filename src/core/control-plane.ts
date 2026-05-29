@@ -138,6 +138,8 @@ import {
   type CallRouting,
   type SmsStatusUpdate,
   type CallStatusUpdate,
+  type VoiceAgentConfig,
+  type VoiceAgentEvent,
 } from "../sms/provider";
 import { isComplianceRejection } from "../sms/telnyx";
 
@@ -1126,6 +1128,21 @@ const STUB_SMS_BASELINE = {
   undelivered: 0.02,
 } as const;
 
+/** Decide whether an agent event should be forwarded to the tenant's tool
+ *  webhook, and build the request. Returns null when there is nothing to
+ *  forward (not a tool call, or no tenant URL configured). Pure — unit-tested
+ *  directly. */
+export function agentToolForward(
+  ev: VoiceAgentEvent,
+  toolWebhookUrl: string | undefined,
+): { url: string; body: Record<string, unknown> } | null {
+  if (ev.kind !== "tool_call" || !toolWebhookUrl) return null;
+  return {
+    url: toolWebhookUrl,
+    body: { toolName: ev.toolName, payload: ev.payload, callId: ev.callId },
+  };
+}
+
 export class ControlPlane {
   private uptimeChecker: UptimeChecker;
   private brain: AgentBrain;
@@ -1880,6 +1897,80 @@ export class ControlPlane {
       projectId,
     );
     return { ok: true, from: maskPhone(msg.from), keyword: msg.keyword };
+  }
+
+  /** Create a hosted AI voice agent for a project. */
+  async createVoiceAgent(
+    projectId: string,
+    input: VoiceAgentConfig,
+  ): Promise<{ agentId: string; name: string } | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+    return telephonyProvider.createVoiceAgent(input);
+  }
+
+  /** Update a project's voice agent. */
+  async updateVoiceAgent(
+    projectId: string,
+    agentId: string,
+    input: Partial<VoiceAgentConfig>,
+  ): Promise<{ agentId: string; name: string } | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+    return telephonyProvider.updateVoiceAgent({ agentId, ...input });
+  }
+
+  /** Delete a project's voice agent. */
+  async deleteVoiceAgent(
+    projectId: string,
+    agentId: string,
+  ): Promise<{ ok: true } | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+    await telephonyProvider.deleteVoiceAgent({ agentId });
+    return { ok: true };
+  }
+
+  /** Bind a voice agent to the project's phone number. */
+  async attachVoiceAgent(
+    projectId: string,
+    agentId: string,
+  ): Promise<{ ok: true } | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+    const number = await this.deps.store.getPhoneNumberByProject(projectId);
+    if (!number) return { error: "project has no phone number" };
+    await telephonyProvider.attachAgentToNumber({ agentId, e164: number.e164 });
+    return { ok: true };
+  }
+
+  /** Handle an agent/tool webhook: parse + (for tool calls) forward to the
+   *  tenant's tool webhook. `opts` is test-injectable; production reads the
+   *  per-project tool URL + uses global fetch. */
+  async receiveAgentEvent(
+    projectId: string,
+    rawBody: string,
+    headers: Record<string, string>,
+    opts?: { fetchImpl?: typeof fetch; toolWebhookUrl?: string },
+  ): Promise<{ ok: true; kind: VoiceAgentEvent["kind"] } | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+    let ev: VoiceAgentEvent;
+    try {
+      ev = telephonyProvider.parseAgentEvent(rawBody, headers);
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : "invalid agent event" };
+    }
+    const fwd = agentToolForward(ev, opts?.toolWebhookUrl);
+    if (fwd) {
+      const f = opts?.fetchImpl ?? fetch;
+      await f(fwd.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(fwd.body),
+      });
+    }
+    return { ok: true, kind: ev.kind };
   }
 
   /** Handle an inbound mail webhook (plan §4.4 — two-way mail). The real
