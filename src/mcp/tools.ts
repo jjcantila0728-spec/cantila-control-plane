@@ -5,6 +5,7 @@
    ============================================================ */
 
 import type { ControlPlane } from "../core/control-plane";
+import { ownerAccountId } from "../lib/owner-account";
 import type { ToolDefinition, ToolResult } from "./server";
 import type {
   DbEngine,
@@ -117,12 +118,12 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
         properties: {
           accountId: {
             type: "string",
-            description: "Account id to scope the listing to. Defaults to acc_demo.",
+            description: "Account id to scope the listing to. Defaults to the configured owner account.",
           },
         },
       },
       handler: async (args) => {
-        const accountId = String(args.accountId ?? "acc_demo");
+        const accountId = String(args.accountId ?? ownerAccountId());
         const projects = await cp.listProjects(accountId);
         if (projects.length === 0) {
           return text(`No projects in account ${accountId}.`);
@@ -454,12 +455,12 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
         properties: {
           accountId: {
             type: "string",
-            description: "Account id (defaults to acc_demo).",
+            description: "Account id (defaults to the configured owner account).",
           },
         },
       },
       handler: async (args) => {
-        const accountId = String(args.accountId ?? "acc_demo");
+        const accountId = String(args.accountId ?? ownerAccountId());
         const report = await cp.getCostOptimisation(accountId);
         if (report.recommendations.length === 0) {
           return text(
@@ -851,7 +852,7 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
           },
           accountId: {
             type: "string",
-            description: "Owning account id. Defaults to acc_demo.",
+            description: "Owning account id. Defaults to the configured owner account.",
           },
         },
         required: ["name"],
@@ -861,7 +862,7 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
         if (!name) return errorText("name is required.");
         const project = await cp.createProject({
           name,
-          accountId: String(args.accountId ?? "acc_demo"),
+          accountId: String(args.accountId ?? ownerAccountId()),
           runtime: asRuntime(args.runtime),
           region: asRegion(args.region),
         });
@@ -896,7 +897,7 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
           },
           accountId: {
             type: "string",
-            description: "Owning account id. Defaults to acc_demo.",
+            description: "Owning account id. Defaults to the configured owner account.",
           },
         },
         required: ["name", "kind"],
@@ -909,7 +910,7 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
           return errorText("kind must be 'n8n' or 'openclaw'.");
         }
         const project = await cp.createAutomation({
-          accountId: String(args.accountId ?? "acc_demo"),
+          accountId: String(args.accountId ?? ownerAccountId()),
           name,
           kind: kindRaw,
           region: asRegion(args.region),
@@ -934,12 +935,12 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
         properties: {
           accountId: {
             type: "string",
-            description: "Account id. Defaults to acc_demo.",
+            description: "Account id. Defaults to the configured owner account.",
           },
         },
       },
       handler: async (args) => {
-        const accountId = String(args.accountId ?? "acc_demo");
+        const accountId = String(args.accountId ?? ownerAccountId());
         const list = await cp.listAutomations(accountId);
         if (list.length === 0) {
           return text(`No automations in account ${accountId}.`);
@@ -965,12 +966,12 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
         properties: {
           accountId: {
             type: "string",
-            description: "Account id. Defaults to acc_demo.",
+            description: "Account id. Defaults to the configured owner account.",
           },
         },
       },
       handler: async (args) => {
-        const accountId = String(args.accountId ?? "acc_demo");
+        const accountId = String(args.accountId ?? ownerAccountId());
         const list = await cp.listConnections(accountId);
         if (list.length === 0) {
           return text(`No connections in account ${accountId}.`);
@@ -1006,7 +1007,7 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
           },
           accountId: {
             type: "string",
-            description: "Account id. Defaults to acc_demo.",
+            description: "Account id. Defaults to the configured owner account.",
           },
         },
         required: ["provider", "name", "fields"],
@@ -1027,7 +1028,7 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
         // HTTP route's in-memory secret store / future secrets manager
         // to resolve it at run time.
         const conn = await cp.createApiKeyConnection({
-          accountId: String(args.accountId ?? "acc_demo"),
+          accountId: String(args.accountId ?? ownerAccountId()),
           provider,
           name,
           authKind: "api_key",

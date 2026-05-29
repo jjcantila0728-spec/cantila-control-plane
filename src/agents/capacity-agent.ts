@@ -23,9 +23,10 @@
 
 import type { ControlPlane } from "../core/control-plane";
 import { id as makeId, now } from "../lib/ids";
+import { ownerAccountId } from "../lib/owner-account";
 import type { Agent, Observation, Proposal } from "./types";
 
-const ACCOUNT = "acc_demo";
+const ACCOUNT = ownerAccountId();
 const HOT_LOAD_PCT = 75;
 const SATURATED_LOAD_PCT = 90;
 const REGION_IMBALANCE_PCT = 70;

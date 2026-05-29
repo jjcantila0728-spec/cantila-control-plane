@@ -454,18 +454,9 @@ export class PrismaStore implements Store {
         platform: p.platform ?? false,
         createdAt: new Date(p.createdAt),
         // The ControlPlane only carries an accountId. Connect to the owning
-        // account, creating a placeholder if it does not exist yet, so the
-        // scaffold's demo flows run against a fresh database unchanged.
-        account: {
-          connectOrCreate: {
-            where: { id: p.accountId },
-            create: {
-              id: p.accountId,
-              name: "Demo Account",
-              handle: p.accountId,
-            },
-          },
-        },
+        // account — it must already exist. A missing account is a real FK
+        // error, never auto-vivified into a placeholder "Demo Account".
+        account: { connect: { id: p.accountId } },
       },
     });
     return toProject(row);
@@ -1269,6 +1260,7 @@ export class PrismaStore implements Store {
       userId: r.userId,
       email: r.user.email,
       name: r.user.name,
+      avatarUrl: r.user.avatarUrl ?? undefined,
       role: r.role,
       joinedAt: r.user.createdAt.toISOString(),
     }));
@@ -1287,16 +1279,10 @@ export class PrismaStore implements Store {
       create: { email, name: input.name },
       update: { name: input.name },
     });
-    // Make sure the account exists (single-tenant demo connectOrCreate).
-    await this.db.account.upsert({
-      where: { id: input.accountId },
-      create: {
-        id: input.accountId,
-        name: "Demo Account",
-        handle: input.accountId,
-      },
-      update: {},
-    });
+    // The account must already exist — we do NOT auto-create a placeholder
+    // here. The membership upsert below references `input.accountId`
+    // directly, so a missing account surfaces as a real FK error rather
+    // than silently vivifying a "Demo Account".
     // Upsert membership at the chosen role.
     const membership = await this.db.membership.upsert({
       where: {
@@ -1372,6 +1358,7 @@ export class PrismaStore implements Store {
         passwordHash: u.passwordHash,
         twoFactorEnabled: u.twoFactorEnabled,
         accountId: u.accountId,
+        avatarUrl: u.avatarUrl,
         createdAt: new Date(u.createdAt),
       },
     });
@@ -1385,6 +1372,17 @@ export class PrismaStore implements Store {
     const row = await this.db.user.update({
       where: { id: userId },
       data: { passwordHash },
+    });
+    return toAuthUser(row);
+  }
+
+  async setUserAvatarUrl(
+    userId: string,
+    avatarUrl: string,
+  ): Promise<AuthUser> {
+    const row = await this.db.user.update({
+      where: { id: userId },
+      data: { avatarUrl },
     });
     return toAuthUser(row);
   }
@@ -1426,6 +1424,11 @@ export class PrismaStore implements Store {
     } catch {
       return false;
     }
+  }
+
+  async deleteSessionsByUser(userId: string): Promise<number> {
+    const res = await this.db.session.deleteMany({ where: { userId } });
+    return res.count;
   }
 
   /* ----- invites (plan §5.4) ----- */
@@ -1775,12 +1778,9 @@ export class PrismaStore implements Store {
         autoRenew: r.autoRenew,
         attachedProjectId: r.attachedProjectId,
         createdAt: new Date(r.createdAt),
-        account: {
-          connectOrCreate: {
-            where: { id: r.accountId },
-            create: { id: r.accountId, name: "Demo Account", handle: r.accountId },
-          },
-        },
+        // The account must already exist — connect, never auto-create a
+        // placeholder. A missing account surfaces as a real FK error.
+        account: { connect: { id: r.accountId } },
       },
     });
     return toRegistration(row);
@@ -2261,6 +2261,7 @@ function toAuthUser(r: DbUser): AuthUser {
     passwordHash: r.passwordHash ?? undefined,
     twoFactorEnabled: r.twoFactorEnabled,
     accountId: r.accountId ?? undefined,
+    avatarUrl: r.avatarUrl ?? undefined,
     emailVerifiedAt: r.emailVerifiedAt?.toISOString(),
     createdAt: r.createdAt.toISOString(),
   };

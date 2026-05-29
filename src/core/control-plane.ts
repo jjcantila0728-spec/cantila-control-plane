@@ -98,6 +98,7 @@ import {
   availableSsoProviders,
   type SsoProfile,
 } from "../auth/sso";
+import { generatePkceVerifier, derivePkceChallenge } from "../auth/pkce";
 import {
   mintOneShotToken,
   parsePresentedToken,
@@ -4871,6 +4872,7 @@ export class ControlPlane {
     name?: string;
     passwordHash?: string;
     accountId?: string;
+    avatarUrl?: string;
   }): Promise<AuthUser> {
     const email = input.email.trim().toLowerCase();
     const existing = await this.deps.store.findUserByEmail(email);
@@ -4892,6 +4894,11 @@ export class ControlPlane {
           });
         }
       }
+      // Refresh the avatar only when we have none on file — never clobber
+      // a value the user may later customise.
+      if (input.avatarUrl && !existing.avatarUrl) {
+        return this.deps.store.setUserAvatarUrl(existing.id, input.avatarUrl);
+      }
       return existing;
     }
     // Create the user with NO legacy account binding — Option B.
@@ -4900,6 +4907,7 @@ export class ControlPlane {
       email,
       name: input.name?.trim() || email.split("@")[0],
       passwordHash: input.passwordHash,
+      avatarUrl: input.avatarUrl,
       twoFactorEnabled: false,
       // accountId left undefined — memberships drive tenancy now.
       accountId: undefined,
@@ -5042,6 +5050,9 @@ export class ControlPlane {
       input.userId,
       hashPassword(input.newPassword),
     );
+    // Rotate: invalidate every existing session so a stolen cookie can't
+    // outlive a password change. The caller re-authenticates.
+    await this.deps.store.deleteSessionsByUser(input.userId);
     return { userId: input.userId };
   }
 
@@ -5385,11 +5396,18 @@ export class ControlPlane {
   beginSsoLogin(
     provider: string,
     redirectUri: string,
-  ): { authorizeUrl: string; provider: string; state: string } {
+  ): {
+    authorizeUrl: string;
+    provider: string;
+    state: string;
+    codeVerifier: string;
+  } {
     const p = getSsoProvider(provider);
     const state = randomBytes(12).toString("hex");
-    const { authorizeUrl } = p.startLogin({ redirectUri, state });
-    return { authorizeUrl, provider: p.label, state };
+    const codeVerifier = generatePkceVerifier();
+    const codeChallenge = derivePkceChallenge(codeVerifier);
+    const { authorizeUrl } = p.startLogin({ redirectUri, state, codeChallenge });
+    return { authorizeUrl, provider: p.label, state, codeVerifier };
   }
 
   /** Complete an SSO login from the IdP callback — resolves the verified
@@ -5399,6 +5417,7 @@ export class ControlPlane {
     provider: string;
     code?: string;
     email?: string;
+    codeVerifier?: string;
   }): Promise<
     | {
         token: string;
@@ -5418,6 +5437,7 @@ export class ControlPlane {
     const user = await this.findOrCreateUser({
       email: profile.email,
       name: profile.name,
+      avatarUrl: profile.avatarUrl,
     });
     const { token, expiresAt } = await this.mintSession(user.id);
     return {
@@ -5437,6 +5457,7 @@ export class ControlPlane {
           id: string;
           email: string;
           name: string;
+          avatarUrl?: string;
           accountId?: string;
         };
         expiresAt: string;
@@ -5465,6 +5486,7 @@ export class ControlPlane {
         id: user.id,
         email: user.email,
         name: user.name,
+        avatarUrl: user.avatarUrl,
         accountId: user.accountId,
       },
       expiresAt: session.expiresAt,
@@ -5927,7 +5949,7 @@ export class ControlPlane {
     const NODE_CAPACITY = 16;
     const projects = accountId
       ? await this.deps.store.listProjects(accountId)
-      : await this.deps.store.listProjects("acc_demo");
+      : [];
     const perNode = new Map<
       string,
       { nodeId: string; region: string; instances: number; capacity: number }

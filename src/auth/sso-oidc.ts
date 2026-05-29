@@ -27,6 +27,8 @@
    bundled `StubSsoProvider` runs instead.
    ============================================================ */
 
+import { createRemoteJWKSet, jwtVerify } from "jose";
+
 import type { SsoProfile, SsoProvider } from "./sso";
 
 export interface OidcSsoProviderOpts {
@@ -43,16 +45,29 @@ export interface OidcSsoProviderOpts {
   /** Redirect URI registered with the IdP — sent on both the authorize
    *  request and the token exchange, and they must match. */
   redirectUri: string;
+  /** JWKS endpoint for RS256 id_token signature verification. When set,
+   *  the id_token signature is verified (defence in depth beyond the TLS
+   *  back-channel). Omit for IdPs without a published JWKS. */
+  jwksUri?: string;
 }
 
 export class OidcSsoProvider implements SsoProvider {
   readonly live = true;
   readonly label: string;
   private opts: OidcSsoProviderOpts;
+  private jwks?: ReturnType<typeof createRemoteJWKSet>;
 
   constructor(opts: OidcSsoProviderOpts) {
-    for (const [k, v] of Object.entries(opts)) {
-      if (!v) {
+    const required: (keyof OidcSsoProviderOpts)[] = [
+      "issuer",
+      "authorizeUrl",
+      "tokenUrl",
+      "clientId",
+      "clientSecret",
+      "redirectUri",
+    ];
+    for (const k of required) {
+      if (!opts[k]) {
         throw new Error(`OidcSsoProvider: missing required option "${k}"`);
       }
     }
@@ -61,7 +76,11 @@ export class OidcSsoProvider implements SsoProvider {
   }
 
   /** Build the IdP authorize URL the browser should be sent to. */
-  startLogin(input: { redirectUri: string; state: string }): {
+  startLogin(input: {
+    redirectUri: string;
+    state: string;
+    codeChallenge?: string;
+  }): {
     authorizeUrl: string;
   } {
     const u = new URL(this.opts.authorizeUrl);
@@ -74,6 +93,10 @@ export class OidcSsoProvider implements SsoProvider {
     u.searchParams.set("redirect_uri", this.opts.redirectUri);
     u.searchParams.set("scope", "openid email profile");
     u.searchParams.set("state", input.state);
+    if (input.codeChallenge) {
+      u.searchParams.set("code_challenge", input.codeChallenge);
+      u.searchParams.set("code_challenge_method", "S256");
+    }
     return { authorizeUrl: u.toString() };
   }
 
@@ -82,6 +105,7 @@ export class OidcSsoProvider implements SsoProvider {
   async completeLogin(input: {
     code?: string;
     email?: string;
+    codeVerifier?: string;
   }): Promise<SsoProfile> {
     const code = input.code?.trim();
     if (!code) {
@@ -100,6 +124,7 @@ export class OidcSsoProvider implements SsoProvider {
           redirect_uri: this.opts.redirectUri,
           client_id: this.opts.clientId,
           client_secret: this.opts.clientSecret,
+          ...(input.codeVerifier ? { code_verifier: input.codeVerifier } : {}),
         }).toString(),
       });
     } catch (err) {
@@ -124,26 +149,50 @@ export class OidcSsoProvider implements SsoProvider {
 
     // Decode + validate the id_token claims (see the security note in
     // the file header on signature verification).
-    const claims = decodeJwtClaims(idToken);
-    if (claims.iss !== this.opts.issuer) {
-      throw new Error(
-        "OIDC id_token issuer does not match the configured issuer",
-      );
-    }
-    if (!audienceMatches(claims.aud, this.opts.clientId)) {
-      throw new Error(
-        "OIDC id_token audience does not include this client",
-      );
-    }
-    if (typeof claims.exp === "number" && claims.exp * 1000 < Date.now()) {
-      throw new Error("OIDC id_token has expired");
+    let claims: Record<string, unknown>;
+    if (this.opts.jwksUri) {
+      if (!this.jwks) {
+        this.jwks = createRemoteJWKSet(new URL(this.opts.jwksUri));
+      }
+      try {
+        const { payload } = await jwtVerify(idToken, this.jwks, {
+          issuer: this.opts.issuer,
+          audience: this.opts.clientId,
+        });
+        claims = payload as Record<string, unknown>;
+      } catch (err) {
+        throw new Error(
+          `OIDC id_token signature verification failed: ${
+            err instanceof Error ? err.message : "invalid token"
+          }`,
+        );
+      }
+    } else {
+      // No JWKS configured — fall back to TLS-back-channel trust (decode +
+      // claim checks). Retained for non-Google OIDC IdPs without a JWKS.
+      claims = decodeJwtClaims(idToken);
+      if (claims.iss !== this.opts.issuer) {
+        throw new Error(
+          "OIDC id_token issuer does not match the configured issuer",
+        );
+      }
+      if (!audienceMatches(claims.aud, this.opts.clientId)) {
+        throw new Error("OIDC id_token audience does not include this client");
+      }
+      if (typeof claims.exp === "number" && claims.exp * 1000 < Date.now()) {
+        throw new Error("OIDC id_token has expired");
+      }
     }
     const email = emailFromVerifiedClaims(claims);
     const name =
       typeof claims.name === "string" && claims.name
         ? claims.name
         : email.split("@")[0];
-    return { email, name, provider: this.label };
+    const avatarUrl =
+      typeof claims.picture === "string" && claims.picture
+        ? claims.picture
+        : undefined;
+    return { email, name, avatarUrl, provider: this.label };
   }
 }
 
@@ -206,6 +255,7 @@ export function googleProviderFromEnv(): OidcSsoProvider | null {
     clientId: e.CANTILA_GOOGLE_CLIENT_ID,
     clientSecret: e.CANTILA_GOOGLE_CLIENT_SECRET,
     redirectUri: e.CANTILA_GOOGLE_REDIRECT_URI,
+    jwksUri: "https://www.googleapis.com/oauth2/v3/certs",
   });
   (p as { label: string }).label = "Google";
   return p;

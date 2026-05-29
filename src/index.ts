@@ -34,12 +34,19 @@ import {
   startBillingEngineWorker as startCantilapayBillingEngineWorker,
 } from "./cantilapay";
 import { getPrisma } from "./lib/prisma";
+import { createRateLimiter } from "./auth/rate-limit";
+import {
+  NoAccountContextError,
+  getApiKey,
+  getActAs,
+  getSessionAuth,
+  resolveAccountId,
+  resolveActorAccountId,
+} from "./auth/account";
+import type { SessionAuth } from "./auth/account";
 
-/** The default account used when CANTILA_REQUIRE_AUTH is off — keeps the
- *  no-auth dev story identical to v1.3 (the Console / CLI both work without
- *  ever touching keys). With auth on, the caller's key is authoritative
- *  and this constant is never read. */
-const DEFAULT_ACCOUNT_ID = "acc_demo";
+// 10 auth attempts per IP per minute, shared across login/register/sso.
+const authRateLimit = createRateLimiter({ windowMs: 60_000, max: 10 });
 
 // Stripe adapter — auto-selects on `STRIPE_SECRET_KEY` presence (plan
 // §15.1). When set, the real Stripe-SDK-backed adapter is wired and
@@ -226,19 +233,6 @@ function scopeAllows(
   return scope === "deploy" || scope === "admin";
 }
 
-/** A resolved Console session attached to a request — the session-token
- *  equivalent of `req.apiKey` (plan §5.4). Makes a logged-in user's
- *  session a first-class, account-scoped API credential.
- *
- *  Plan §18 — Option B: `accountId` is sourced from `Session.currentAccountId`
- *  (the org the user is currently scoped to), with a legacy fallback to
- *  `AuthUser.accountId`. `sessionId` is exposed so the org-switcher route
- *  knows which session row to update. */
-interface SessionAuth {
-  userId: string;
-  accountId: string;
-  sessionId: string;
-}
 
 // Always-on hook: resolve whatever credential the caller supplied.
 //   - `Bearer ctk_…` — a scoped API key → attached as `req.apiKey`.
@@ -263,13 +257,11 @@ app.addHook("onRequest", async (req) => {
       (req as unknown as { session?: SessionAuth }).session = {
         userId: resolved.user.id,
         // Plan §18 — Option B: prefer the session's current active org;
-        // fall back to the legacy AuthUser.accountId for pre-§18 sessions,
-        // and to DEFAULT_ACCOUNT_ID only as a last resort (only reachable
-        // when CANTILA_REQUIRE_AUTH=off).
-        accountId:
-          resolved.currentAccountId ??
-          resolved.user.accountId ??
-          DEFAULT_ACCOUNT_ID,
+        // fall back to the legacy AuthUser.accountId for pre-§18 sessions.
+        // May be undefined when the user has no current/legacy account —
+        // routes that need a definite account go through `resolveAccountId`,
+        // which throws NoAccountContextError (→ 401) rather than inventing one.
+        accountId: resolved.currentAccountId ?? resolved.user.accountId,
         sessionId: resolved.sessionId,
       };
       return;
@@ -507,67 +499,21 @@ if (config.requireAuth) {
   app.log.info("auth enforcement is ON (CANTILA_REQUIRE_AUTH)");
 }
 
-/* ----- per-request account scoping ----- */
-
-function getApiKey(req: FastifyRequest): ApiKey | undefined {
-  return (req as unknown as { apiKey?: ApiKey }).apiKey;
-}
-
-/** The resolved Console session on this request, if a `cts_` token authed it. */
-function getSessionAuth(req: FastifyRequest): SessionAuth | undefined {
-  return (req as unknown as { session?: SessionAuth }).session;
-}
-
-/** The act-as target on this request, if `X-Cantila-Act-As` was supplied
- *  AND the auth-resolution hook accepted it via `canActOnAccount`. */
-function getActAs(req: FastifyRequest): string | undefined {
-  return (req as unknown as { actAs?: string }).actAs;
-}
-
-/** The authoritative account id for this request. The resolution order
- *  is:
- *   1. An accepted `X-Cantila-Act-As` target (plan §5.5 — white-label
- *      parent acting as a sub-account). The auth-resolution hook has
- *      already validated this via `canActOnAccount`.
- *   2. An authenticated API key.
- *   3. A Console session.
- *   4. `?accountId=` query param (only honoured when no credential is
- *      present, i.e. CANTILA_REQUIRE_AUTH=off and the demo flow).
- *   5. The demo account.
+/* ----- per-request account scoping -----
  *
- *  With CANTILA_REQUIRE_AUTH=on a key or session is always present past
- *  the enforcement hook, so the query param is effectively ignored —
- *  multi-tenant isolation is enforced by construction. */
-function resolveAccountId(req: FastifyRequest): string {
-  const actAs = getActAs(req);
-  if (actAs) return actAs;
-  const key = getApiKey(req);
-  if (key) return key.accountId;
-  const session = getSessionAuth(req);
-  if (session) return session.accountId;
-  const q = (req.query ?? {}) as { accountId?: string };
-  return q.accountId ?? DEFAULT_ACCOUNT_ID;
-}
-
-/** The original caller's account id, ignoring any `X-Cantila-Act-As`
- *  override. Used for audit fields ("done by acc_agency1 acting as
- *  acc_sub1") and for safety checks that must always speak in the
- *  caller's own name. */
-function resolveActorAccountId(req: FastifyRequest): string {
-  const key = getApiKey(req);
-  if (key) return key.accountId;
-  const session = getSessionAuth(req);
-  if (session) return session.accountId;
-  const q = (req.query ?? {}) as { accountId?: string };
-  return q.accountId ?? DEFAULT_ACCOUNT_ID;
-}
+ * `getApiKey`, `getSessionAuth`, `getActAs`, `resolveAccountId`,
+ * `resolveActorAccountId` and `NoAccountContextError` now live in
+ * `./auth/account` so they can be unit-tested without booting the server
+ * (this module calls `app.listen` at import time). They are imported at
+ * the top of this file. */
 
 /** Guard for billing mutations — checkout, billing-portal and plan-change.
  *  These must act on a real authenticated principal (a scoped API key or a
- *  Console session), never the anonymous `DEFAULT_ACCOUNT_ID` fallback that
- *  `resolveAccountId` allows when `CANTILA_REQUIRE_AUTH` is off — otherwise
- *  an unauthenticated visitor could open a checkout or portal session
- *  against the demo account. Returns the target account id (which may be
+ *  Console session). `resolveAccountId` already throws (→ 401) when there is
+ *  no principal and no explicit query account, but this guard additionally
+ *  rejects an anonymous `?accountId=` query so an unauthenticated visitor
+ *  cannot open a checkout or portal session against an account they do not
+ *  own. Returns the target account id (which may be
  *  the caller's own account, or a sub-account they're impersonating via
  *  `X-Cantila-Act-As` — plan §5.5), or sends a 401 and returns null.
  *  Independent of `CANTILA_REQUIRE_AUTH`. Plan §8.5.3.
@@ -656,7 +602,7 @@ async function assertProjectAccess(
 
 const createProjectSchema = z.object({
   name: z.string().min(1),
-  accountId: z.string().default("acc_demo"),
+  accountId: z.string().optional(),
   runtime: z
     .enum(["static", "node", "python", "php", "go", "ruby", "docker"])
     .default("node"),
@@ -710,7 +656,7 @@ const searchDomainsSchema = z.object({
 });
 
 const registerDomainSchema = z.object({
-  accountId: z.string().default("acc_demo"),
+  accountId: z.string().optional(),
   hostname: z.string().min(3),
   years: z.number().int().min(1).max(10).default(1),
   whoisPrivacy: z.boolean().default(true),
@@ -733,18 +679,18 @@ const addMemberSchema = z.object({
   email: z.string().email(),
   name: z.string().min(1),
   role: z.enum(["owner", "admin", "developer", "viewer"]).default("developer"),
-  accountId: z.string().default("acc_demo"),
+  accountId: z.string().optional(),
 });
 
 const updateMemberRoleSchema = z.object({
   role: z.enum(["owner", "admin", "developer", "viewer"]),
-  accountId: z.string().default("acc_demo"),
+  accountId: z.string().optional(),
 });
 
 const createApiKeySchema = z.object({
   name: z.string().min(1),
   scope: z.enum(["read", "deploy", "admin"]).default("deploy"),
-  accountId: z.string().default("acc_demo"),
+  accountId: z.string().optional(),
 });
 
 const createInviteSchema = z.object({
@@ -2247,6 +2193,7 @@ const ssoLoginSchema = z.object({
   provider: z.enum(["google", "github"]),
   code: z.string().optional(),
   email: z.string().optional(),
+  codeVerifier: z.string().optional(),
 });
 
 const sessionTokenSchema = z.object({
@@ -2257,6 +2204,9 @@ const sessionTokenSchema = z.object({
 // — new users sign up explicitly via /v1/auth/register. See
 // ControlPlane.loginWithPassword.
 app.post("/v1/auth/login", async (request, reply) => {
+  if (!authRateLimit(request.ip, Date.now())) {
+    return reply.code(429).send({ error: "too many attempts, slow down" });
+  }
   const parsed = loginSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
@@ -2268,6 +2218,9 @@ app.post("/v1/auth/login", async (request, reply) => {
 
 // Explicit registration — fails when the email is already taken.
 app.post("/v1/auth/register", async (request, reply) => {
+  if (!authRateLimit(request.ip, Date.now())) {
+    return reply.code(429).send({ error: "too many attempts, slow down" });
+  }
   const parsed = registerSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
@@ -2441,6 +2394,9 @@ app.post("/v1/auth/sso/start", async (request, reply) => {
 
 // Complete an SSO login from the IdP callback.
 app.post("/v1/auth/sso/login", async (request, reply) => {
+  if (!authRateLimit(request.ip, Date.now())) {
+    return reply.code(429).send({ error: "too many attempts, slow down" });
+  }
   const parsed = ssoLoginSchema.safeParse(request.body ?? {});
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
@@ -3185,8 +3141,11 @@ app.post("/v1/api-keys", async (request, reply) => {
   // Past the bootstrap window the authenticated caller's account wins;
   // the body's `accountId` is ignored. This prevents an admin on account
   // A from minting keys for account B — to onboard a new tenant, the
-  // operator must use `POST /v1/accounts` instead.
-  const accountId = callerKey?.accountId ?? parsed.data.accountId;
+  // operator must use `POST /v1/accounts` instead. When neither a caller
+  // key nor a body accountId is present we resolve from the request
+  // principal/session — `resolveAccountId` throws (→ 401) if there is none.
+  const accountId =
+    callerKey?.accountId ?? parsed.data.accountId ?? resolveAccountId(request);
   const result = await cp.createApiKey({ ...parsed.data, accountId });
   if ("error" in result) {
     return reply.code(400).send({ error: result.error });
@@ -3420,10 +3379,15 @@ app.get("/v1/me", async (request) => {
     const session = await getSessionAuth(request);
     if (session) {
       const user = await cp.getAuthUser(session.userId);
-      const account = await cp.getAccount(session.accountId);
+      // A session may carry no account (no current/legacy org). The /v1/me
+      // surface still answers — it just reports a null account so the
+      // Console can render the "no org yet" state instead of 401-ing here.
+      const account = session.accountId
+        ? await cp.getAccount(session.accountId)
+        : null;
       return {
         authenticated: true,
-        accountId: session.accountId,
+        accountId: session.accountId ?? null,
         keyName: "session",
         scope: "admin" as const,
         prefix: "cts_",
@@ -3434,6 +3398,7 @@ app.get("/v1/me", async (request) => {
               email: user.email,
               name: user.name,
               emailVerifiedAt: user.emailVerifiedAt ?? null,
+              avatarUrl: user.avatarUrl ?? null,
             }
           : null,
       };
@@ -3775,12 +3740,12 @@ registerCantilapayRoutes(app, {
   // Source of truth for "which Cantila tenant is on the request" for
   // Console-managed cantilapay routes. Returns null when no credentialed
   // principal — the Console-managed routes treat that as 401 (no
-  // fallback to DEFAULT_ACCOUNT_ID, by design).
+  // fallback to a demo account, by design).
   resolveConsoleAccountId: (req) => {
     const key = getApiKey(req);
     if (key) return key.accountId;
     const session = getSessionAuth(req);
-    if (session) return session.accountId;
+    if (session?.accountId) return session.accountId;
     return null;
   },
 });
@@ -3801,6 +3766,16 @@ process.on("SIGINT", () => {
 process.on("SIGTERM", () => {
   stopCantilapayWorker();
   stopCantilapayBillingWorker();
+});
+
+// Map the typed "no account context" error thrown by resolveAccountId /
+// resolveActorAccountId to a 401. Any other error falls through to
+// Fastify's default handling (which logs + sends a 500).
+app.setErrorHandler((err, _req, reply) => {
+  if (err instanceof NoAccountContextError) {
+    return reply.code(401).send({ error: err.message });
+  }
+  throw err; // fall through to Fastify's default handling
 });
 
 /* ----- boot ----- */

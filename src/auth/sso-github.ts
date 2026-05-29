@@ -48,9 +48,14 @@ export class GitHubOAuthProvider implements SsoProvider {
     this.opts = opts;
   }
 
-  startLogin(input: { redirectUri: string; state: string }): {
+  startLogin(input: {
+    redirectUri: string;
+    state: string;
+    codeChallenge?: string;
+  }): {
     authorizeUrl: string;
   } {
+    // GitHub OAuth Apps don't support PKCE; client secret + state cookie are the guard.
     const u = new URL(AUTHORIZE_URL);
     u.searchParams.set("client_id", this.opts.clientId);
     u.searchParams.set("redirect_uri", this.opts.redirectUri);
@@ -59,7 +64,10 @@ export class GitHubOAuthProvider implements SsoProvider {
     return { authorizeUrl: u.toString() };
   }
 
-  async completeLogin(input: { code?: string }): Promise<SsoProfile> {
+  async completeLogin(input: {
+    code?: string;
+    codeVerifier?: string;
+  }): Promise<SsoProfile> {
     const code = input.code?.trim();
     if (!code) throw new Error("GitHub callback is missing the code");
 
@@ -99,16 +107,27 @@ export class GitHubOAuthProvider implements SsoProvider {
     }
 
     let name: string | undefined;
+    let avatarUrl: string | undefined;
     const userRes = await fetch(USER_URL, { headers: authHeaders });
     if (userRes.ok) {
       const profile = (await userRes.json().catch(() => null)) as {
         name?: unknown;
         login?: unknown;
+        avatar_url?: unknown;
       } | null;
       name =
         (typeof profile?.name === "string" && profile.name) ||
         (typeof profile?.login === "string" ? profile.login : undefined);
+      avatarUrl =
+        typeof profile?.avatar_url === "string" && profile.avatar_url
+          ? profile.avatar_url
+          : undefined;
     }
-    return { email, name: name ?? email.split("@")[0], provider: this.label };
+    return {
+      email,
+      name: name ?? email.split("@")[0],
+      avatarUrl,
+      provider: this.label,
+    };
   }
 }

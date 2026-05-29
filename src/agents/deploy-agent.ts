@@ -9,8 +9,9 @@
 import type { ControlPlane } from "../core/control-plane";
 import { id as makeId, now } from "../lib/ids";
 import type { Agent, Observation, Proposal } from "./types";
+import { ownerAccountId } from "../lib/owner-account";
 
-const ACCOUNT = "acc_demo";
+const ACCOUNT = ownerAccountId();
 const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 export class DeployAgent implements Agent {

@@ -30,6 +30,9 @@ export interface SsoProfile {
   email: string;
   /** Display name, when the IdP supplies one. */
   name?: string;
+  /** Profile picture URL from the IdP (Google `picture`, GitHub
+   *  `avatar_url`), when supplied. */
+  avatarUrl?: string;
   /** Opaque provider label — recorded on the audit trail. */
   provider: string;
 }
@@ -43,14 +46,23 @@ export interface SsoProvider {
 
   /** Begin a login — returns the URL the browser should be sent to.
    *  `redirectUri` is where the IdP returns the user afterwards. */
-  startLogin(input: { redirectUri: string; state: string }): {
-    authorizeUrl: string;
-  };
+  startLogin(input: {
+    redirectUri: string;
+    state: string;
+    /** PKCE S256 challenge. Honoured by OIDC providers that support PKCE
+     *  (Google); ignored by GitHub OAuth Apps. */
+    codeChallenge?: string;
+  }): { authorizeUrl: string };
 
   /** Complete a login from the IdP callback. The stub accepts an
    *  `email` directly; a real provider ignores it and reads the
    *  verified identity out of `code`. Throws on an invalid login. */
-  completeLogin(input: { code?: string; email?: string }): Promise<SsoProfile>;
+  completeLogin(input: {
+    code?: string;
+    email?: string;
+    /** PKCE verifier echoed at the token exchange. */
+    codeVerifier?: string;
+  }): Promise<SsoProfile>;
 }
 
 /** Bundled, network-free SSO stub. */
@@ -58,7 +70,11 @@ export class StubSsoProvider implements SsoProvider {
   readonly label = "Stub SSO";
   readonly live = false;
 
-  startLogin(input: { redirectUri: string; state: string }): {
+  startLogin(input: {
+    redirectUri: string;
+    state: string;
+    codeChallenge?: string;
+  }): {
     authorizeUrl: string;
   } {
     // A real provider points at the IdP's /authorize endpoint. The stub
@@ -73,7 +89,13 @@ export class StubSsoProvider implements SsoProvider {
   async completeLogin(input: {
     code?: string;
     email?: string;
+    codeVerifier?: string;
   }): Promise<SsoProfile> {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error(
+        "SSO stub is disabled in production — configure a real provider",
+      );
+    }
     const email = (input.email ?? "").trim().toLowerCase();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       throw new Error("a valid email is required for stub SSO login");

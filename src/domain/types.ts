@@ -193,6 +193,8 @@ export interface TeamMember {
   name: string;
   role: MemberRole;
   joinedAt: string;
+  /** Optional — the user's avatar URL (from SSO profile or upload). */
+  avatarUrl?: string;
   /** Optional — most recent activity (touched by `recordEvent` later). */
   lastActiveAt?: string;
 }
@@ -220,6 +222,9 @@ export interface AuthUser {
    *  block — that decision lives at the route layer when Mail
    *  goes live and bounces become a real signal. */
   emailVerifiedAt?: string;
+  /** Profile picture URL from a social IdP (Google `picture`, GitHub
+   *  `avatar_url`). Undefined for password-only users. */
+  avatarUrl?: string;
   createdAt: string;
 }
 
