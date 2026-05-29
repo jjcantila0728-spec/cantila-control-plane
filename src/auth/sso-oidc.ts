@@ -138,13 +138,7 @@ export class OidcSsoProvider implements SsoProvider {
     if (typeof claims.exp === "number" && claims.exp * 1000 < Date.now()) {
       throw new Error("OIDC id_token has expired");
     }
-    const email =
-      typeof claims.email === "string"
-        ? claims.email.trim().toLowerCase()
-        : "";
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-      throw new Error("OIDC id_token did not carry a usable email claim");
-    }
+    const email = emailFromVerifiedClaims(claims);
     const name =
       typeof claims.name === "string" && claims.name
         ? claims.name
@@ -173,4 +167,46 @@ function audienceMatches(aud: unknown, clientId: string): boolean {
   if (typeof aud === "string") return aud === clientId;
   if (Array.isArray(aud)) return aud.includes(clientId);
   return false;
+}
+
+/** Extract the verified, normalized email from OIDC id_token claims.
+ *  Throws if the email is missing/malformed OR `email_verified` is not
+ *  strictly true — Google sets this; we refuse unverified emails so a
+ *  social login can't take over an existing account by email collision. */
+export function emailFromVerifiedClaims(
+  claims: Record<string, unknown>,
+): string {
+  if (claims.email_verified !== true) {
+    throw new Error("OIDC id_token email is not verified");
+  }
+  const email =
+    typeof claims.email === "string" ? claims.email.trim().toLowerCase() : "";
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    throw new Error("OIDC id_token did not carry a usable email claim");
+  }
+  return email;
+}
+
+/** Build an OidcSsoProvider pre-wired to Google's OIDC endpoints from
+ *  the CANTILA_GOOGLE_* env vars. Returns null when not configured so
+ *  the registry can fall back to the stub. */
+export function googleProviderFromEnv(): OidcSsoProvider | null {
+  const e = process.env;
+  if (
+    !e.CANTILA_GOOGLE_CLIENT_ID ||
+    !e.CANTILA_GOOGLE_CLIENT_SECRET ||
+    !e.CANTILA_GOOGLE_REDIRECT_URI
+  ) {
+    return null;
+  }
+  const p = new OidcSsoProvider({
+    issuer: "https://accounts.google.com",
+    authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+    tokenUrl: "https://oauth2.googleapis.com/token",
+    clientId: e.CANTILA_GOOGLE_CLIENT_ID,
+    clientSecret: e.CANTILA_GOOGLE_CLIENT_SECRET,
+    redirectUri: e.CANTILA_GOOGLE_REDIRECT_URI,
+  });
+  (p as { label: string }).label = "Google";
+  return p;
 }
