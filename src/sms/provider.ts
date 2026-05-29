@@ -483,10 +483,8 @@ export class StubTelephonyProvider implements TelephonyProvider {
   async updateVoiceAgent(
     input: { agentId: string } & Partial<VoiceAgentConfig>,
   ): Promise<ProvisionedVoiceAgent> {
-    const existing = this.agents.get(input.agentId) ?? {
-      agentId: input.agentId,
-      name: input.name ?? "agent",
-    };
+    const existing = this.agents.get(input.agentId);
+    if (!existing) throw new Error(`VoiceAgent not found: ${input.agentId}`);
     const updated: ProvisionedVoiceAgent = {
       agentId: input.agentId,
       name: input.name ?? existing.name,
@@ -519,7 +517,7 @@ export class StubTelephonyProvider implements TelephonyProvider {
       kind: k,
       toolName: typeof p.toolName === "string" ? p.toolName : undefined,
       payload:
-        p.payload && typeof p.payload === "object"
+        p.payload != null && typeof p.payload === "object" && !Array.isArray(p.payload)
           ? (p.payload as Record<string, unknown>)
           : undefined,
       at: String(p.at ?? new Date().toISOString()),
