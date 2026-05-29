@@ -374,6 +374,9 @@ export interface Project {
    *  restart. Unset until the live data plane is in play (stub never
    *  writes it; offline builds leave the column null). */
   coolifyAppUuid?: string;
+  /** True only for the seeded system "Platform" project that owns
+   *  cantila.app. Hidden from tenant project lists. */
+  platform?: boolean;
   createdAt: string;
 }
 
@@ -538,6 +541,13 @@ export interface HostedMailbox {
   status: ServiceStatus;
   createdAt: string;
 }
+
+/** `createHostedMailbox` success result. For platform (cantila.app)
+ *  mailboxes the generated mailbox password is returned exactly once
+ *  here and never persisted. Absent for non-platform mailboxes. */
+export type CreatedHostedMailbox = HostedMailbox & {
+  oneTimePassword?: string;
+};
 
 /** Kind of mail alias (plan §4.4 — Cantila Mail aliases). Mirrors the
  *  Console's existing alias vocabulary in `cantila-console/src/lib/types.ts`:
