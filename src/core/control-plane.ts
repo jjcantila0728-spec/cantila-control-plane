@@ -14,6 +14,7 @@ import type {
   ManagedDatabase,
   Mailbox,
   HostedMailbox,
+  CreatedHostedMailbox,
   MailAlias,
   MailAliasKind,
   MailboxKind,
@@ -104,6 +105,7 @@ import {
   type TokenVerifyOutcome,
 } from "../auth/tokens";
 import { mailProvider } from "../mail/provider";
+import { mailboxProvisioner } from "../mail/provisioner";
 import {
   DUNNING_POLICY,
   DUNNING_GRACE_DAYS,
@@ -6380,22 +6382,49 @@ export class ControlPlane {
     displayName?: string;
     kind?: MailboxKind;
     quotaMb?: number;
-  }): Promise<HostedMailbox | { error: string }> {
+  }): Promise<CreatedHostedMailbox | { error: string }> {
     const project = await this.deps.store.getProject(input.projectId);
     if (!project) return { error: "project not found" };
     const address = input.address.trim().toLowerCase();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(address)) {
       return { error: "a valid email address is required" };
     }
+    // Platform mailboxes must live on the platform domain.
+    if (project.platform && !address.endsWith("@cantila.app")) {
+      return { error: "platform mailboxes must be @cantila.app" };
+    }
     const taken = await this.deps.store.findHostedMailboxByAddress(address);
     if (taken) return { error: "mailbox address already taken" };
+
+    const quotaMb = input.quotaMb ?? 10240;
+    const displayName = input.displayName?.trim() || address.split("@")[0];
+
+    // Provision a real, login-capable mailbox in the MTA ONLY for
+    // platform-project (cantila.app) mailboxes. Tenant mailboxes stay
+    // record-only until multi-domain provisioning ships. Provision
+    // FIRST so a Mailcow failure leaves no ghost record. The generated
+    // password is returned once below and never persisted.
+    let oneTimePassword: string | undefined;
+    if (project.platform) {
+      oneTimePassword = randomBytes(18).toString("base64url");
+      const dom = await mailboxProvisioner.ensureDomain("cantila.app");
+      if ("error" in dom) return { error: dom.error };
+      const made = await mailboxProvisioner.createMailbox({
+        address,
+        password: oneTimePassword,
+        quotaMb,
+        displayName,
+      });
+      if ("error" in made) return { error: made.error };
+    }
+
     const mailbox = await this.deps.store.createHostedMailbox({
       id: id("mbx"),
       projectId: project.id,
       address,
-      displayName: input.displayName?.trim() || address.split("@")[0],
+      displayName,
       kind: input.kind ?? "personal",
-      quotaMb: input.quotaMb ?? 10240,
+      quotaMb,
       usedMb: 0,
       status: "active",
       createdAt: now(),
@@ -6407,7 +6436,7 @@ export class ControlPlane {
       `${mailbox.kind} · ${mailbox.quotaMb} MB quota`,
       project.id,
     );
-    return mailbox;
+    return { ...mailbox, oneTimePassword };
   }
 
   /** Hosted mailboxes on one project. */

@@ -8,6 +8,7 @@ import { z } from "zod";
 import { config } from "./config";
 import { createStore } from "./domain/create-store";
 import { seedOwnerAccount } from "./domain/seed-owner";
+import { seedPlatformProject } from "./domain/seed-platform";
 import { stubProvisioner } from "./dataplane/stub";
 import { selectDataPlane } from "./dataplane/factory";
 import { ControlPlane } from "./core/control-plane";
@@ -3721,6 +3722,13 @@ app
         `owner seed: account=${result.accountId} created=${JSON.stringify(result.created)}`,
       );
     }
+    // Hidden Platform project that owns cantila.app hosted mailboxes
+    // (info@, etc.). Idempotent; runs after the owner-account seed so
+    // the owning account exists. (plan §4.4)
+    const platformSeed = await seedPlatformProject(store);
+    app.log.info(
+      `platform seed: account=${platformSeed.accountId} created=${platformSeed.created}`,
+    );
     cp.startBackgroundJobs();
     app.log.info("background jobs started (uptime sweeps every 30s)");
   })
