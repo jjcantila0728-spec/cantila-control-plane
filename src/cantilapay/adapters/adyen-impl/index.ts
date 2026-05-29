@@ -11,3 +11,5 @@ export {};
 
 export { buildAdyenClients, _resetAdyenClientCacheForTest } from "./client";
 export type { AdyenClients, AdyenClientConfig } from "./client";
+
+export { mapAdyenRefusalReason, type MappedRefusal } from "./error-mapping";
