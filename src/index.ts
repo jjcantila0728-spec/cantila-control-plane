@@ -8,6 +8,7 @@ import { z } from "zod";
 import { config } from "./config";
 import { createStore } from "./domain/create-store";
 import { seedOwnerAccount } from "./domain/seed-owner";
+import { seedPlatformProject } from "./domain/seed-platform";
 import { stubProvisioner } from "./dataplane/stub";
 import { selectDataPlane } from "./dataplane/factory";
 import { ControlPlane } from "./core/control-plane";
@@ -426,7 +427,8 @@ if (config.requireAuth) {
       url.endsWith("/voice/inbound") ||
       url.endsWith("/sms/status") ||
       url.endsWith("/voice/status") ||
-      url.endsWith("/mail/inbound")
+      url.endsWith("/mail/inbound") ||
+      url.endsWith("/voice/webhook/telnyx/agent")
     ) {
       return;
     }
@@ -1355,6 +1357,73 @@ app.get("/v1/sms/inbox", async (request) => {
     limit: 100,
   });
   return { messages };
+});
+
+const voiceAgentSchema = z.object({
+  name: z.string().min(1),
+  instructions: z.string().min(1),
+  voice: z.string().optional(),
+  greeting: z.string().optional(),
+  tools: z
+    .array(z.object({ name: z.string(), description: z.string(), webhookUrl: z.string().url() }))
+    .optional(),
+});
+
+/** Create a voice agent for a project. */
+app.post("/v1/projects/:id/voice/agents", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const parsed = voiceAgentSchema.safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+  const result = await cp.createVoiceAgent(id, parsed.data);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(201).send(result);
+});
+
+/** Update a voice agent. */
+app.patch("/v1/projects/:id/voice/agents/:agentId", async (request, reply) => {
+  const { id, agentId } = request.params as { id: string; agentId: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const parsed = voiceAgentSchema.partial().safeParse(request.body ?? {});
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.message });
+  const result = await cp.updateVoiceAgent(id, agentId, parsed.data);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Delete a voice agent. */
+app.delete("/v1/projects/:id/voice/agents/:agentId", async (request, reply) => {
+  const { id, agentId } = request.params as { id: string; agentId: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const result = await cp.deleteVoiceAgent(id, agentId);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Bind a voice agent to the project's number. */
+app.post("/v1/projects/:id/voice/agents/:agentId/attach", async (request, reply) => {
+  const { id, agentId } = request.params as { id: string; agentId: string };
+  const project = await assertProjectAccess(request, reply, id);
+  if (!project) return;
+  const result = await cp.attachVoiceAgent(id, agentId);
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Agent/tool webhook — carrier-called, so auth-exempt; the signature is
+ *  verified inside the port when the payload is parsed. */
+app.post("/v1/projects/:id/voice/webhook/telnyx/agent", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const result = await cp.receiveAgentEvent(
+    id,
+    rawBodyOf(request),
+    request.headers as Record<string, string>,
+  );
+  if ("error" in result) return reply.code(400).send(result);
+  return reply.code(200).send(result);
 });
 
 /** Persisted inbound voice-call history for a project (plan §4.5 —
@@ -3721,6 +3790,13 @@ app
         `owner seed: account=${result.accountId} created=${JSON.stringify(result.created)}`,
       );
     }
+    // Hidden Platform project that owns cantila.app hosted mailboxes
+    // (info@, etc.). Idempotent; runs after the owner-account seed so
+    // the owning account exists. (plan §4.4)
+    const platformSeed = await seedPlatformProject(store);
+    app.log.info(
+      `platform seed: account=${platformSeed.accountId} created=${platformSeed.created}`,
+    );
     cp.startBackgroundJobs();
     app.log.info("background jobs started (uptime sweeps every 30s)");
   })
