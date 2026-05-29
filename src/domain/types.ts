@@ -377,6 +377,10 @@ export interface Project {
   /** True only for the seeded system "Platform" project that owns
    *  cantila.app. Hidden from tenant project lists. */
   platform?: boolean;
+  /** Webhook URL the Telnyx AI agent posts tool-call events to (plan §4.5 —
+   *  voice agents). When set, `receiveAgentEvent` forwards tool-call events
+   *  here. Absent until set via a management API (follow-up). */
+  voiceAgentToolUrl?: string;
   createdAt: string;
 }
 

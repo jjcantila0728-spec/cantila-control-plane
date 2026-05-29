@@ -1417,10 +1417,12 @@ app.post("/v1/projects/:id/voice/agents/:agentId/attach", async (request, reply)
  *  verified inside the port when the payload is parsed. */
 app.post("/v1/projects/:id/voice/webhook/telnyx/agent", async (request, reply) => {
   const { id } = request.params as { id: string };
+  const project = await cp.getProject(id);
   const result = await cp.receiveAgentEvent(
     id,
     rawBodyOf(request),
     request.headers as Record<string, string>,
+    { toolWebhookUrl: project?.voiceAgentToolUrl },
   );
   if ("error" in result) return reply.code(400).send(result);
   return reply.code(200).send(result);
