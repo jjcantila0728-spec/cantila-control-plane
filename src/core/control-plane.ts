@@ -98,6 +98,7 @@ import {
   availableSsoProviders,
   type SsoProfile,
 } from "../auth/sso";
+import { generatePkceVerifier, derivePkceChallenge } from "../auth/pkce";
 import {
   mintOneShotToken,
   parsePresentedToken,
@@ -5392,11 +5393,18 @@ export class ControlPlane {
   beginSsoLogin(
     provider: string,
     redirectUri: string,
-  ): { authorizeUrl: string; provider: string; state: string } {
+  ): {
+    authorizeUrl: string;
+    provider: string;
+    state: string;
+    codeVerifier: string;
+  } {
     const p = getSsoProvider(provider);
     const state = randomBytes(12).toString("hex");
-    const { authorizeUrl } = p.startLogin({ redirectUri, state });
-    return { authorizeUrl, provider: p.label, state };
+    const codeVerifier = generatePkceVerifier();
+    const codeChallenge = derivePkceChallenge(codeVerifier);
+    const { authorizeUrl } = p.startLogin({ redirectUri, state, codeChallenge });
+    return { authorizeUrl, provider: p.label, state, codeVerifier };
   }
 
   /** Complete an SSO login from the IdP callback — resolves the verified
@@ -5406,6 +5414,7 @@ export class ControlPlane {
     provider: string;
     code?: string;
     email?: string;
+    codeVerifier?: string;
   }): Promise<
     | {
         token: string;

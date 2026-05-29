@@ -2247,6 +2247,7 @@ const ssoLoginSchema = z.object({
   provider: z.enum(["google", "github"]),
   code: z.string().optional(),
   email: z.string().optional(),
+  codeVerifier: z.string().optional(),
 });
 
 const sessionTokenSchema = z.object({

@@ -61,7 +61,11 @@ export class OidcSsoProvider implements SsoProvider {
   }
 
   /** Build the IdP authorize URL the browser should be sent to. */
-  startLogin(input: { redirectUri: string; state: string }): {
+  startLogin(input: {
+    redirectUri: string;
+    state: string;
+    codeChallenge?: string;
+  }): {
     authorizeUrl: string;
   } {
     const u = new URL(this.opts.authorizeUrl);
@@ -74,6 +78,10 @@ export class OidcSsoProvider implements SsoProvider {
     u.searchParams.set("redirect_uri", this.opts.redirectUri);
     u.searchParams.set("scope", "openid email profile");
     u.searchParams.set("state", input.state);
+    if (input.codeChallenge) {
+      u.searchParams.set("code_challenge", input.codeChallenge);
+      u.searchParams.set("code_challenge_method", "S256");
+    }
     return { authorizeUrl: u.toString() };
   }
 
@@ -82,6 +90,7 @@ export class OidcSsoProvider implements SsoProvider {
   async completeLogin(input: {
     code?: string;
     email?: string;
+    codeVerifier?: string;
   }): Promise<SsoProfile> {
     const code = input.code?.trim();
     if (!code) {
@@ -100,6 +109,7 @@ export class OidcSsoProvider implements SsoProvider {
           redirect_uri: this.opts.redirectUri,
           client_id: this.opts.clientId,
           client_secret: this.opts.clientSecret,
+          ...(input.codeVerifier ? { code_verifier: input.codeVerifier } : {}),
         }).toString(),
       });
     } catch (err) {

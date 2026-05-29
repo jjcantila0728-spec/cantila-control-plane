@@ -46,14 +46,23 @@ export interface SsoProvider {
 
   /** Begin a login — returns the URL the browser should be sent to.
    *  `redirectUri` is where the IdP returns the user afterwards. */
-  startLogin(input: { redirectUri: string; state: string }): {
-    authorizeUrl: string;
-  };
+  startLogin(input: {
+    redirectUri: string;
+    state: string;
+    /** PKCE S256 challenge. Honoured by OIDC providers that support PKCE
+     *  (Google); ignored by GitHub OAuth Apps. */
+    codeChallenge?: string;
+  }): { authorizeUrl: string };
 
   /** Complete a login from the IdP callback. The stub accepts an
    *  `email` directly; a real provider ignores it and reads the
    *  verified identity out of `code`. Throws on an invalid login. */
-  completeLogin(input: { code?: string; email?: string }): Promise<SsoProfile>;
+  completeLogin(input: {
+    code?: string;
+    email?: string;
+    /** PKCE verifier echoed at the token exchange. */
+    codeVerifier?: string;
+  }): Promise<SsoProfile>;
 }
 
 /** Bundled, network-free SSO stub. */
@@ -61,7 +70,11 @@ export class StubSsoProvider implements SsoProvider {
   readonly label = "Stub SSO";
   readonly live = false;
 
-  startLogin(input: { redirectUri: string; state: string }): {
+  startLogin(input: {
+    redirectUri: string;
+    state: string;
+    codeChallenge?: string;
+  }): {
     authorizeUrl: string;
   } {
     // A real provider points at the IdP's /authorize endpoint. The stub
@@ -76,6 +89,7 @@ export class StubSsoProvider implements SsoProvider {
   async completeLogin(input: {
     code?: string;
     email?: string;
+    codeVerifier?: string;
   }): Promise<SsoProfile> {
     const email = (input.email ?? "").trim().toLowerCase();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
