@@ -5949,7 +5949,7 @@ export class ControlPlane {
     const NODE_CAPACITY = 16;
     const projects = accountId
       ? await this.deps.store.listProjects(accountId)
-      : await this.deps.store.listProjects("acc_demo");
+      : [];
     const perNode = new Map<
       string,
       { nodeId: string; region: string; instances: number; capacity: number }
