@@ -1372,6 +1372,7 @@ export class PrismaStore implements Store {
         passwordHash: u.passwordHash,
         twoFactorEnabled: u.twoFactorEnabled,
         accountId: u.accountId,
+        avatarUrl: u.avatarUrl,
         createdAt: new Date(u.createdAt),
       },
     });
@@ -1385,6 +1386,17 @@ export class PrismaStore implements Store {
     const row = await this.db.user.update({
       where: { id: userId },
       data: { passwordHash },
+    });
+    return toAuthUser(row);
+  }
+
+  async setUserAvatarUrl(
+    userId: string,
+    avatarUrl: string,
+  ): Promise<AuthUser> {
+    const row = await this.db.user.update({
+      where: { id: userId },
+      data: { avatarUrl },
     });
     return toAuthUser(row);
   }
@@ -2261,6 +2273,7 @@ function toAuthUser(r: DbUser): AuthUser {
     passwordHash: r.passwordHash ?? undefined,
     twoFactorEnabled: r.twoFactorEnabled,
     accountId: r.accountId ?? undefined,
+    avatarUrl: r.avatarUrl ?? undefined,
     emailVerifiedAt: r.emailVerifiedAt?.toISOString(),
     createdAt: r.createdAt.toISOString(),
   };

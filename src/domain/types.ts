@@ -220,6 +220,9 @@ export interface AuthUser {
    *  block — that decision lives at the route layer when Mail
    *  goes live and bounces become a real signal. */
   emailVerifiedAt?: string;
+  /** Profile picture URL from a social IdP (Google `picture`, GitHub
+   *  `avatar_url`). Undefined for password-only users. */
+  avatarUrl?: string;
   createdAt: string;
 }
 

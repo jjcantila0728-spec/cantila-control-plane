@@ -256,6 +256,9 @@ export interface Store {
     userId: string,
     verifiedAt: string,
   ): Promise<AuthUser>;
+  /** Set a user's avatar URL (captured from a social IdP at sign-in).
+   *  Idempotent. */
+  setUserAvatarUrl(userId: string, avatarUrl: string): Promise<AuthUser>;
   createSession(s: Session): Promise<Session>;
   findSessionByTokenHash(tokenHash: string): Promise<Session | null>;
   deleteSession(id: string): Promise<boolean>;
@@ -1305,6 +1308,17 @@ export class InMemoryStore implements Store {
     const existing = this.users.get(userId);
     if (!existing) throw new Error(`user ${userId} not found`);
     const updated: AuthUser = { ...existing, emailVerifiedAt: verifiedAt };
+    this.users.set(userId, updated);
+    return updated;
+  }
+
+  async setUserAvatarUrl(
+    userId: string,
+    avatarUrl: string,
+  ): Promise<AuthUser> {
+    const existing = this.users.get(userId);
+    if (!existing) throw new Error(`user ${userId} not found`);
+    const updated: AuthUser = { ...existing, avatarUrl };
     this.users.set(userId, updated);
     return updated;
   }
