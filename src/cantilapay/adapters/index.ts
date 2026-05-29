@@ -1,5 +1,5 @@
 /* ============================================================
-   Cantilapay — adapter selector (plan §25, Phase 0).
+   Cantilapay — adapter selector (plan §25, v1.1).
 
    Mirrors `selectDataPlane` / the StripeAdapter selection in
    `src/index.ts`. Returns the live Adyen-for-Platforms adapter
@@ -28,21 +28,22 @@ export interface PaymentProcessorSelection {
 export function selectPaymentProcessor(
   env: NodeJS.ProcessEnv = process.env,
 ): PaymentProcessorSelection {
-  const apiKey = env.ADYEN_API_KEY?.trim();
+  const checkoutApiKey = env.ADYEN_API_KEY?.trim();
+  const managementApiKey = env.ADYEN_MANAGEMENT_API_KEY?.trim() ?? checkoutApiKey;
+  const balancePlatformApiKey = env.ADYEN_BALANCE_PLATFORM_API_KEY?.trim() ?? checkoutApiKey;
+  const lemApiKey = env.ADYEN_LEM_API_KEY?.trim() ?? checkoutApiKey;
   const hmacKey = env.ADYEN_HMAC_KEY?.trim();
   const merchantAccount = env.ADYEN_MERCHANT_ACCOUNT?.trim();
-  const envFlag = (env.ADYEN_ENVIRONMENT?.trim().toLowerCase() ?? "test") as
-    | "test"
-    | "live";
+  const balancePlatformName = env.ADYEN_BALANCE_PLATFORM?.trim() ?? "";
+  const liableBalanceAccountId = env.ADYEN_LIABLE_BALANCE_ACCOUNT_ID?.trim() ?? "";
+  const onboardingThemeId = env.ADYEN_ONBOARDING_THEME_ID?.trim() ?? "";
+  const envFlag = (env.ADYEN_ENVIRONMENT?.trim().toLowerCase() ?? "test") as "test" | "live";
 
-  const hasLiveEnv = !!apiKey && !!hmacKey && !!merchantAccount;
+  const hasLiveEnv = !!checkoutApiKey && !!hmacKey && !!merchantAccount;
   if (!hasLiveEnv) {
     return { processor: new StubPaymentProcessor(), label: "stub", live: false };
   }
 
-  // Prod guard — refuse to attach the live processor in production
-  // unless the operator has explicitly acknowledged the live rail.
-  // Same posture as the v1.17 STORE prod guard.
   if (
     env.NODE_ENV === "production" &&
     envFlag === "live" &&
@@ -52,18 +53,19 @@ export function selectPaymentProcessor(
   }
 
   const adapter = new AdyenForPlatformsAdapter({
-    apiKey,
-    hmacKey,
-    merchantAccount,
-    managementBaseUrl: env.ADYEN_BASE_URL?.trim() || undefined,
-    legalEntityBaseUrl: env.ADYEN_LEM_BASE_URL?.trim() || undefined,
-    defaultEnvironment: envFlag,
+    checkoutApiKey: checkoutApiKey!,
+    managementApiKey: managementApiKey!,
+    balancePlatformApiKey: balancePlatformApiKey!,
+    lemApiKey: lemApiKey!,
+    hmacKey: hmacKey!,
+    merchantAccount: merchantAccount!,
+    balancePlatformName,
+    liableBalanceAccountId,
+    onboardingThemeId,
+    environment: envFlag === "live" ? "LIVE" : "TEST",
+    liveEndpointUrlPrefix: env.ADYEN_LIVE_ENDPOINT_URL_PREFIX?.trim(),
   });
-  return {
-    processor: adapter,
-    label: adapter.label,
-    live: true,
-  };
+  return { processor: adapter, label: adapter.label, live: true };
 }
 
 export { StubPaymentProcessor } from "./stub";

@@ -1,32 +1,18 @@
 /* ============================================================
-   Cantilapay — `AdyenForPlatformsAdapter` (plan §25, Phase 0).
+   Cantilapay — AdyenForPlatformsAdapter (plan §25, v1.1).
 
-   Skeleton for the live Adyen-for-Platforms-backed implementation
-   of `PaymentProcessor`. Phase 0 lays out the env shape and the
-   call surface; Phase 1+ fills in the actual HTTP calls (or
-   switches to `@adyen/api-library` once that dependency lands).
+   The live PaymentProcessor implementation. Delegates each
+   method to a focused module under ./adyen-impl/. The cache for
+   per-mode Adyen SDK clients lives in adyen-impl/client.ts.
 
-   Why a skeleton now: the selector (`selectPaymentProcessor`)
-   needs SOMETHING to construct when the live env is present, and
-   keeping the live and stub paths in lockstep prevents drift.
-
-   Env (only used when the operator opts into live mode):
-     ADYEN_API_KEY               — Management + Checkout API key.
-     ADYEN_HMAC_KEY              — Webhook HMAC verification key.
-     ADYEN_MERCHANT_ACCOUNT      — Cantila's platform-level merchant id.
-     ADYEN_BASE_URL              — Defaults to https://management-test.adyen.com
-                                   (test) or https://management-live.adyen.com.
-     ADYEN_LEM_BASE_URL          — Defaults to https://kyc-test.adyen.com
-                                   (Legal Entity Management).
-     CANTILAPAY_LIVE_ACK         — Required in NODE_ENV=production to
-                                   actually mount the live adapter.
-
-   Phase 0 contract for unimplemented calls: throw a clear error
-   pointing at the phase that will implement it. Better to fail
-   loud than to silently degrade.
+   Env vars consumed (passed through from selectPaymentProcessor):
+     ADYEN_ENVIRONMENT, ADYEN_API_KEY, ADYEN_MANAGEMENT_API_KEY,
+     ADYEN_BALANCE_PLATFORM_API_KEY, ADYEN_LEM_API_KEY,
+     ADYEN_HMAC_KEY, ADYEN_MERCHANT_ACCOUNT, ADYEN_BALANCE_PLATFORM,
+     ADYEN_LIABLE_BALANCE_ACCOUNT_ID, ADYEN_ONBOARDING_THEME_ID,
+     ADYEN_LIVE_ENDPOINT_URL_PREFIX (live only).
    ============================================================ */
 
-import { createHmac, timingSafeEqual } from "node:crypto";
 import type {
   PaymentProcessor,
   PspCancelResult,
@@ -37,124 +23,59 @@ import type {
   PspSubMerchant,
 } from "./port";
 import type { CantilapayMode } from "../types";
+import { buildAdyenClients, type AdyenClientConfig } from "./adyen-impl/client";
+import {
+  confirmPayment as confirmImpl,
+  capturePayment as captureImpl,
+  refundPayment as refundImpl,
+  cancelPayment as cancelImpl,
+} from "./adyen-impl/payments";
+import { parseAdyenNotification } from "./adyen-impl/webhooks";
 
 export interface AdyenForPlatformsConfig {
-  apiKey: string;
+  checkoutApiKey: string;
+  managementApiKey: string;
+  balancePlatformApiKey: string;
+  lemApiKey: string;
   hmacKey: string;
   merchantAccount: string;
-  /** When the API base URL is unset, defaults are chosen per mode. */
-  managementBaseUrl?: string;
-  legalEntityBaseUrl?: string;
-  /** Which Adyen environment the API key is for. The Cantilapay mode
-   *  (test/live) flows through the adapter call signature; this is the
-   *  default the adapter falls back to when the call doesn't specify. */
-  defaultEnvironment: "test" | "live";
+  balancePlatformName: string;
+  liableBalanceAccountId: string;
+  onboardingThemeId: string;
+  environment: "TEST" | "LIVE";
+  liveEndpointUrlPrefix?: string;
 }
 
 export class AdyenForPlatformsAdapter implements PaymentProcessor {
   readonly live = true;
   readonly label: string;
-
   private readonly cfg: AdyenForPlatformsConfig;
+  private readonly clientCfg: AdyenClientConfig;
 
   constructor(cfg: AdyenForPlatformsConfig) {
     this.cfg = cfg;
-    this.label = `Adyen for Platforms (${cfg.defaultEnvironment})`;
+    this.label = `Adyen for Platforms (${cfg.environment.toLowerCase()})`;
+    this.clientCfg = {
+      checkoutApiKey: cfg.checkoutApiKey,
+      managementApiKey: cfg.managementApiKey,
+      balancePlatformApiKey: cfg.balancePlatformApiKey,
+      lemApiKey: cfg.lemApiKey,
+      merchantAccount: cfg.merchantAccount,
+      balancePlatformName: cfg.balancePlatformName,
+      liableBalanceAccountId: cfg.liableBalanceAccountId,
+      onboardingThemeId: cfg.onboardingThemeId,
+      environment: cfg.environment,
+      liveEndpointUrlPrefix: cfg.liveEndpointUrlPrefix,
+    };
   }
 
-  // ----- sub-merchant lifecycle -----
-
-  async createSubMerchant(_input: {
-    country: string;
-    externalRef: string;
-    mode: CantilapayMode;
-  }): Promise<PspSubMerchant> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.createSubMerchant — Phase 3 (Connect-equivalent) wires this against Adyen Legal Entity Management.",
-    );
+  private clients(mode: CantilapayMode) {
+    return buildAdyenClients(mode, this.clientCfg);
   }
 
-  async getSubMerchant(_input: {
-    id: string;
-    mode: CantilapayMode;
-  }): Promise<PspSubMerchant> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.getSubMerchant — Phase 3 wires this against Adyen Legal Entity Management.",
-    );
-  }
+  // ----- payments (v1.1.0) -----
 
-  async createOnboardingLink(_input: {
-    subMerchantId: string;
-    mode: CantilapayMode;
-    returnUrl: string;
-  }): Promise<{ url: string; expiresAt: string }> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.createOnboardingLink — Phase 3 wires this against Adyen Hosted Onboarding.",
-    );
-  }
-
-  // ----- inbound webhook verification (Phase 0 wires this; Phase 1
-  //       starts dispatching real PAYMENT events to cantilapay state). -----
-
-  /** Adyen sends webhook payloads with an `additionalData.hmacSignature`
-   *  field — HMAC-SHA256 over a concatenation of selected fields. For
-   *  Phase 0 we accept the *envelope* signature only (an `hmac-signature`
-   *  header). The full per-notification HMAC matrix lands in Phase 1
-   *  alongside the AUTHORISATION event handler that needs it.
-   *
-   *  This Phase 0 implementation rejects every inbound notification it
-   *  receives unless `ADYEN_HMAC_KEY` is configured AND the envelope
-   *  signature matches — which is the right default for a skeleton that
-   *  shouldn't accept real money events yet. The dispatcher routes these
-   *  to a no-op handler in Phase 0.
-   *
-   *  We accept the `ping` event type for connectivity tests Adyen
-   *  fires during Test Notification → Send Test setup. */
-  parseInboundWebhook(input: {
-    rawBody: string;
-    headers: Record<string, string | string[] | undefined>;
-  }): PspInboundEvent {
-    const sigRaw = pickHeader(input.headers, "hmac-signature");
-    if (!sigRaw) throw new Error("missing hmac-signature header");
-    if (!this.cfg.hmacKey) {
-      throw new Error("ADYEN_HMAC_KEY not configured");
-    }
-    const expected = createHmac("sha256", Buffer.from(this.cfg.hmacKey, "hex"))
-      .update(input.rawBody)
-      .digest("hex");
-    const a = Buffer.from(sigRaw, "hex");
-    const b = Buffer.from(expected, "hex");
-    if (a.length !== b.length || !timingSafeEqual(a, b)) {
-      throw new Error("invalid hmac-signature");
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(input.rawBody);
-    } catch {
-      throw new Error("inbound webhook body is not valid JSON");
-    }
-    // Phase 0 only recognises the `ping` / connectivity test from
-    // Adyen's Test Notification panel. Everything else is rejected
-    // until Phase 1 wires the AUTHORISATION / CAPTURE / REFUND
-    // dispatch.
-    const obj = parsed as { eventCode?: string; pspReference?: string };
-    if (obj.eventCode === "PING" || obj.eventCode === "TEST") {
-      return {
-        id: obj.pspReference ?? `evt_test_${Date.now()}`,
-        type: "ping",
-        subMerchantId: null,
-        raw: parsed,
-      };
-    }
-    throw new Error(
-      `Adyen event '${obj.eventCode}' is not handled in Phase 0 — Phases 1-3 wire payment / sub-merchant events.`,
-    );
-  }
-
-  // ----- Phase 1: charges (skeleton — real Adyen wiring lands when
-  //       @adyen/api-library + a sandbox account are configured). -----
-
-  async confirmPayment(_input: {
+  confirmPayment(input: {
     subMerchantId: string;
     paymentIntentId: string;
     amount: number;
@@ -165,54 +86,84 @@ export class AdyenForPlatformsAdapter implements PaymentProcessor {
     platformFeeAmount: number;
     metadata?: Record<string, string>;
   }): Promise<PspConfirmResult> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.confirmPayment — Phase 1 wires this against Adyen Checkout API /payments.",
-    );
+    return confirmImpl(this.clients(input.mode), input);
   }
 
-  async capturePayment(_input: {
+  capturePayment(input: {
     pspPaymentRef: string;
     amount: number;
     currency: string;
     mode: CantilapayMode;
   }): Promise<PspCaptureResult> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.capturePayment — Phase 1 wires this against Adyen Checkout API /payments/{psp}/captures.",
-    );
+    return captureImpl(this.clients(input.mode), input);
   }
 
-  async refundPayment(_input: {
+  refundPayment(input: {
     pspPaymentRef: string;
     amount: number;
     currency: string;
     mode: CantilapayMode;
     reason?: string;
   }): Promise<PspRefundResult> {
-    throw new Error(
-      "AdyenForPlatformsAdapter.refundPayment — Phase 1 wires this against Adyen Checkout API /payments/{psp}/refunds.",
-    );
+    return refundImpl(this.clients(input.mode), input);
   }
 
-  async cancelPayment(_input: {
+  cancelPayment(input: {
     pspPaymentRef: string;
     mode: CantilapayMode;
   }): Promise<PspCancelResult> {
+    return cancelImpl(this.clients(input.mode), input);
+  }
+
+  // ----- inbound webhook -----
+
+  parseInboundWebhook(input: {
+    rawBody: string;
+    headers: Record<string, string | string[] | undefined>;
+  }): PspInboundEvent {
+    // The Phase 0 contract returns a single event; Adyen envelopes
+    // can contain many. For v1.1.0 we surface the FIRST valid event
+    // and the cantilapay route handler dispatches it. A future drop
+    // extends `PaymentProcessor.parseInboundWebhook` to return an
+    // array — the route already loops one-at-a-time via the dispatcher.
+    const events = parseAdyenNotification({
+      rawBody: input.rawBody,
+      hmacKeyHex: this.cfg.hmacKey,
+    });
+    if (events.length === 0) {
+      throw new Error("Adyen notification yielded no valid items");
+    }
+    return events[0];
+  }
+
+  // ----- sub-merchants (v1.1.1 — Tasks 9-10 wire these) -----
+
+  async createSubMerchant(_input: {
+    country: string;
+    externalRef: string;
+    mode: CantilapayMode;
+  }): Promise<PspSubMerchant> {
     throw new Error(
-      "AdyenForPlatformsAdapter.cancelPayment — Phase 1 wires this against Adyen Checkout API /payments/{psp}/cancels.",
+      "AdyenForPlatformsAdapter.createSubMerchant — implemented in v1.1.1 (Task 9-10).",
     );
   }
-}
 
-function pickHeader(
-  headers: Record<string, string | string[] | undefined>,
-  name: string,
-): string | undefined {
-  const lc = name.toLowerCase();
-  for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === lc) {
-      if (Array.isArray(v)) return v[0];
-      return v;
-    }
+  async getSubMerchant(_input: {
+    id: string;
+    mode: CantilapayMode;
+  }): Promise<PspSubMerchant> {
+    throw new Error(
+      "AdyenForPlatformsAdapter.getSubMerchant — implemented in v1.1.1 (Task 9-10).",
+    );
   }
-  return undefined;
+
+  async createOnboardingLink(_input: {
+    subMerchantId: string;
+    mode: CantilapayMode;
+    returnUrl: string;
+  }): Promise<{ url: string; expiresAt: string }> {
+    throw new Error(
+      "AdyenForPlatformsAdapter.createOnboardingLink — implemented in v1.1.1 (Task 9-10).",
+    );
+  }
 }
