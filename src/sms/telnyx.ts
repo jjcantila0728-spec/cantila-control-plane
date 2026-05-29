@@ -94,3 +94,30 @@ export class TelnyxError extends Error {
     this.name = "TelnyxError";
   }
 }
+
+/** DER SPKI prefix for a raw 32-byte Ed25519 public key. */
+const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
+
+/** Verify a Telnyx Ed25519 webhook signature. Telnyx signs
+ *  `${timestamp}|${rawBody}` with its messaging-profile key; the public
+ *  key (env `TELNYX_PUBLIC_KEY`) is the base64 of the raw 32-byte key. */
+export function verifyTelnyxSignature(
+  publicKeyB64: string,
+  signatureB64: string,
+  timestamp: string,
+  rawBody: string,
+): boolean {
+  try {
+    const rawKey = Buffer.from(publicKeyB64, "base64");
+    const der = Buffer.concat([ED25519_SPKI_PREFIX, rawKey]);
+    const keyObj = createPublicKey({ key: der, format: "der", type: "spki" });
+    return edVerify(
+      null,
+      Buffer.from(`${timestamp}|${rawBody}`),
+      keyObj,
+      Buffer.from(signatureB64, "base64"),
+    );
+  } catch {
+    return false;
+  }
+}

@@ -1,6 +1,8 @@
 /* Telnyx telephony — Phase A smoke test (stub + adapter request-building). */
 import { StubTelephonyProvider } from "../src/sms/provider";
 import { TelnyxClient } from "../src/sms/telnyx";
+import { generateKeyPairSync, sign as edSign } from "node:crypto";
+import { verifyTelnyxSignature } from "../src/sms/telnyx";
 
 let failed = 0;
 function check(condition: unknown, label: string, detail?: unknown): void {
@@ -57,9 +59,30 @@ async function telnyxClientRequest(): Promise<void> {
   check((body as { data: { id: string } }).data.id === "msg_1", "client returns parsed JSON body");
 }
 
+async function signatureVerification(): Promise<void> {
+  console.log("--- Phase A — Ed25519 signature verification ---");
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const rawPub = publicKey.export({ format: "der", type: "spki" }).subarray(-32); // last 32 bytes = raw key
+  const publicKeyB64 = rawPub.toString("base64");
+
+  const timestamp = "1700000000";
+  const rawBody = JSON.stringify({ data: { event_type: "message.received" } });
+  const sig = edSign(null, Buffer.from(`${timestamp}|${rawBody}`), privateKey).toString("base64");
+
+  check(
+    verifyTelnyxSignature(publicKeyB64, sig, timestamp, rawBody) === true,
+    "valid signature verifies",
+  );
+  check(
+    verifyTelnyxSignature(publicKeyB64, sig, timestamp, rawBody + "X") === false,
+    "tampered body fails verification",
+  );
+}
+
 async function main(): Promise<void> {
   await stubVoiceAgent();
   await telnyxClientRequest();
+  await signatureVerification();
   if (failed > 0) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
 }
