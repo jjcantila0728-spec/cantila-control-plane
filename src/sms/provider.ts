@@ -146,6 +146,45 @@ export interface A2pRegistration {
   status: "pending" | "approved" | "rejected";
 }
 
+/* ---------- AI voice agents ---------- */
+
+/** A webhook tool the voice agent may invoke during a call. The agent
+ *  calls out to the tenant app; the control plane signs the request with
+ *  the project's HMAC secret. */
+export interface VoiceAgentTool {
+  name: string;
+  description: string;
+  webhookUrl: string;
+}
+
+/** Config for a deployable AI voice agent. */
+export interface VoiceAgentConfig {
+  name: string;
+  /** System prompt that steers the agent. */
+  instructions: string;
+  /** TTS voice id; the provider default is used when unset. */
+  voice?: string;
+  /** Spoken when the agent answers. */
+  greeting?: string;
+  tools?: VoiceAgentTool[];
+}
+
+/** A provisioned voice agent the carrier now hosts. */
+export interface ProvisionedVoiceAgent {
+  agentId: string;
+  name: string;
+}
+
+/** A normalized agent/tool webhook event. */
+export interface VoiceAgentEvent {
+  agentId: string;
+  callId: string;
+  kind: "tool_call" | "transcript" | "ended";
+  toolName?: string;
+  payload?: Record<string, unknown>;
+  at: string;
+}
+
 /* ---------- the port ---------- */
 
 export interface TelephonyProvider {
@@ -241,6 +280,29 @@ export interface TelephonyProvider {
     useCase: string;
     sampleMessages: string[];
   }): Promise<A2pRegistration>;
+
+  /* --- AI voice agents --- */
+
+  /** Create a hosted AI voice agent. */
+  createVoiceAgent(input: VoiceAgentConfig): Promise<ProvisionedVoiceAgent>;
+
+  /** Update an existing agent's config. */
+  updateVoiceAgent(
+    input: { agentId: string } & Partial<VoiceAgentConfig>,
+  ): Promise<ProvisionedVoiceAgent>;
+
+  /** Delete an agent. */
+  deleteVoiceAgent(input: { agentId: string }): Promise<void>;
+
+  /** Bind an agent to a provisioned number so inbound calls reach it. */
+  attachAgentToNumber(input: { agentId: string; e164: string }): Promise<void>;
+
+  /** Verify + normalize an agent/tool webhook into `VoiceAgentEvent`;
+   *  throws on an invalid signature or unparseable body. */
+  parseAgentEvent(
+    rawBody: string,
+    headers: Record<string, string>,
+  ): VoiceAgentEvent;
 }
 
 /* ---------- the stub ---------- */
@@ -405,6 +467,63 @@ export class StubTelephonyProvider implements TelephonyProvider {
     // The stub auto-approves; a real carrier returns `pending` and the
     // outcome arrives later out-of-band.
     return { campaignId: this.nextId("a2p"), status: "approved" };
+  }
+
+  private agents = new Map<string, ProvisionedVoiceAgent>();
+
+  async createVoiceAgent(input: VoiceAgentConfig): Promise<ProvisionedVoiceAgent> {
+    const agent: ProvisionedVoiceAgent = {
+      agentId: this.nextId("agent"),
+      name: input.name,
+    };
+    this.agents.set(agent.agentId, agent);
+    return agent;
+  }
+
+  async updateVoiceAgent(
+    input: { agentId: string } & Partial<VoiceAgentConfig>,
+  ): Promise<ProvisionedVoiceAgent> {
+    const existing = this.agents.get(input.agentId) ?? {
+      agentId: input.agentId,
+      name: input.name ?? "agent",
+    };
+    const updated: ProvisionedVoiceAgent = {
+      agentId: input.agentId,
+      name: input.name ?? existing.name,
+    };
+    this.agents.set(input.agentId, updated);
+    return updated;
+  }
+
+  async deleteVoiceAgent(input: { agentId: string }): Promise<void> {
+    this.agents.delete(input.agentId);
+  }
+
+  async attachAgentToNumber(_input: { agentId: string; e164: string }): Promise<void> {
+    // No-op — the stub binds nothing real.
+  }
+
+  parseAgentEvent(
+    rawBody: string,
+    _headers: Record<string, string>,
+  ): VoiceAgentEvent {
+    const p = parseJson(rawBody);
+    const kind = p.kind;
+    const k: VoiceAgentEvent["kind"] =
+      kind === "tool_call" || kind === "transcript" || kind === "ended"
+        ? kind
+        : "transcript";
+    return {
+      agentId: String(p.agentId ?? ""),
+      callId: String(p.callId ?? ""),
+      kind: k,
+      toolName: typeof p.toolName === "string" ? p.toolName : undefined,
+      payload:
+        p.payload && typeof p.payload === "object"
+          ? (p.payload as Record<string, unknown>)
+          : undefined,
+      at: String(p.at ?? new Date().toISOString()),
+    };
   }
 }
 
