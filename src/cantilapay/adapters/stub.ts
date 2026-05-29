@@ -91,7 +91,7 @@ export class StubPaymentProcessor implements PaymentProcessor {
   parseInboundWebhook(input: {
     rawBody: string;
     headers: Record<string, string | string[] | undefined>;
-  }): PspInboundEvent {
+  }): PspInboundEvent[] {
     const sigRaw = pickHeader(input.headers, STUB_HEADER);
     if (!sigRaw) throw new Error("missing Cantilapay-Stub-Signature header");
     const expected = createHmac("sha256", STUB_INBOUND_SECRET)
@@ -108,7 +108,9 @@ export class StubPaymentProcessor implements PaymentProcessor {
     } catch {
       throw new Error("inbound webhook body is not valid JSON");
     }
-    return payload;
+    // The stub signs one event per call; return it as a one-element
+    // batch to match the array contract the real Adyen adapter needs.
+    return [payload];
   }
 
   /** Test-only helper: produce a properly-signed inbound payload +

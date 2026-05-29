@@ -174,13 +174,18 @@ export interface PaymentProcessor {
     returnUrl: string;
   }): Promise<{ url: string; expiresAt: string }>;
 
-  /** Verify the PSP webhook signature and return the parsed event.
+  /** Verify the PSP webhook signature and return the parsed events.
    *  The real Adyen adapter uses Basic Auth + HMAC; the stub uses
-   *  HMAC-SHA256 with a fixed secret. Throws on invalid signature. */
+   *  HMAC-SHA256 with a fixed secret. Throws on invalid signature.
+   *
+   *  Returns an ARRAY because a single Adyen webhook envelope can batch
+   *  many notification items (`notificationItems[]`). The dispatcher in
+   *  `services/webhooks-in.ts` projects each one independently so no
+   *  item is silently dropped. The stub returns a one-element array. */
   parseInboundWebhook(input: {
     rawBody: string;
     headers: Record<string, string | string[] | undefined>;
-  }): PspInboundEvent;
+  }): PspInboundEvent[];
 
   // ----- Phase 1: charges -----
 

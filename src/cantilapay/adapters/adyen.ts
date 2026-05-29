@@ -125,12 +125,11 @@ export class AdyenForPlatformsAdapter implements PaymentProcessor {
   parseInboundWebhook(input: {
     rawBody: string;
     headers: Record<string, string | string[] | undefined>;
-  }): PspInboundEvent {
-    // The Phase 0 contract returns a single event; Adyen envelopes
-    // can contain many. For v1.1.0 we surface the FIRST valid event
-    // and the cantilapay route handler dispatches it. A future drop
-    // extends `PaymentProcessor.parseInboundWebhook` to return an
-    // array — the route already loops one-at-a-time via the dispatcher.
+  }): PspInboundEvent[] {
+    // An Adyen webhook envelope batches `notificationItems[]`; each item
+    // carries its own HMAC and is verified independently inside
+    // parseAdyenNotification. We return ALL valid items so the dispatcher
+    // projects every one — nothing is dropped.
     const events = parseAdyenNotification({
       rawBody: input.rawBody,
       hmacKeyHex: this.cfg.hmacKey,
@@ -138,7 +137,7 @@ export class AdyenForPlatformsAdapter implements PaymentProcessor {
     if (events.length === 0) {
       throw new Error("Adyen notification yielded no valid items");
     }
-    return events[0];
+    return events;
   }
 
   // ----- sub-merchants (v1.1.1 — LEM + Balance Platform + Hosted Onboarding) -----

@@ -51,9 +51,9 @@ function partA(): void {
     rawBody: signed.rawBody,
     headers: { [signed.header.name]: signed.header.value },
   });
-  check(parsed.type === "account.updated", "stub passes through account.updated type");
+  check(parsed[0].type === "account.updated", "stub passes through account.updated type");
   check(
-    (parsed.raw as { status?: string })?.status === "active",
+    (parsed[0].raw as { status?: string })?.status === "active",
     "stub preserves status in payload",
   );
 }

@@ -1409,6 +1409,7 @@ export function registerCantilapayRoutes(
         accepted: outcome.accepted,
         eventId: outcome.eventId,
         type: outcome.type,
+        processed: outcome.processed,
       });
     } catch (err) {
       if (err instanceof InboundSignatureError) {

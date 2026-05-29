@@ -24,6 +24,7 @@
    ============================================================ */
 
 import { StubPaymentProcessor } from "../src/cantilapay/adapters/stub";
+import type { PaymentProcessor } from "../src/cantilapay/adapters/port";
 import { selectPaymentProcessor } from "../src/cantilapay/adapters";
 import { inferKeyShape } from "../src/cantilapay/types";
 import {
@@ -89,8 +90,9 @@ async function main(): Promise<void> {
     rawBody: signed.rawBody,
     headers: { [signed.header.name]: signed.header.value },
   });
-  check(parsed.id === event.id, "stub inbound roundtrip preserves event id");
-  check(parsed.type === "ping", "stub inbound roundtrip preserves event type");
+  check(parsed.length === 1, "stub inbound returns a one-element batch");
+  check(parsed[0].id === event.id, "stub inbound roundtrip preserves event id");
+  check(parsed[0].type === "ping", "stub inbound roundtrip preserves event type");
 
   // Tampered body → throws.
   let tamperedThrew = false;
@@ -103,6 +105,34 @@ async function main(): Promise<void> {
     tamperedThrew = true;
   }
   check(tamperedThrew, "stub inbound rejects a tampered body");
+
+  // 2b. Multi-item batch — an Adyen envelope can carry many
+  // notificationItems. handleInboundWebhook must project EVERY one,
+  // not just the first. Account-less (subMerchantId: null) events take
+  // the no-DB path, so we can prove the loop without Postgres.
+  const { handleInboundWebhook } = await import(
+    "../src/cantilapay/services/webhooks-in"
+  );
+  const batchProcessor: PaymentProcessor = {
+    ...stub,
+    parseInboundWebhook: () => [
+      { id: "evt_batch_a", type: "ping", subMerchantId: null, raw: {} },
+      { id: "evt_batch_b", type: "ping", subMerchantId: null, raw: {} },
+    ],
+  };
+  const batchOutcome = await handleInboundWebhook({
+    prisma: {} as never,
+    processor: batchProcessor,
+    rawBody: "{}",
+    headers: {},
+    mode: "test",
+  });
+  check(batchOutcome.processed === 2, "batch envelope projects both items");
+  check(batchOutcome.results.length === 2, "batch outcome carries per-item results");
+  check(
+    batchOutcome.results.every((r) => r.accepted),
+    "every batched item is accepted",
+  );
 
   // 3. selectPaymentProcessor — defaults to stub, picks Adyen when env present.
   const def = selectPaymentProcessor({});

@@ -28,7 +28,7 @@ import type { PaymentProcessor, PspInboundEvent } from "../adapters/port";
 import type { CantilapayMode } from "../types";
 import { recordCantilapayAudit } from "./audit";
 
-export interface InboundOutcome {
+export interface InboundEventResult {
   /** True if the event was new; false if the dedupe table caught a retry. */
   accepted: boolean;
   /** The cantilapay-shaped event type after mapping. */
@@ -37,7 +37,17 @@ export interface InboundOutcome {
   eventId: string;
 }
 
-/** Verify, dedupe, and project an inbound PSP webhook. */
+export interface InboundOutcome extends InboundEventResult {
+  /** How many notification items the envelope carried (Adyen batches). */
+  processed: number;
+  /** Per-item projection result, in envelope order. */
+  results: InboundEventResult[];
+}
+
+/** Verify, dedupe, and project an inbound PSP webhook. A single Adyen
+ *  envelope can batch many notification items, so we project EACH one
+ *  and aggregate. The top-level `accepted`/`type`/`eventId` mirror the
+ *  first item for back-compat; `results` carries every item. */
 export async function handleInboundWebhook(args: {
   prisma: PrismaClient;
   processor: PaymentProcessor;
@@ -45,9 +55,9 @@ export async function handleInboundWebhook(args: {
   headers: Record<string, string | string[] | undefined>;
   mode: CantilapayMode;
 }): Promise<InboundOutcome> {
-  let parsed: PspInboundEvent;
+  let parsedEvents: PspInboundEvent[];
   try {
-    parsed = args.processor.parseInboundWebhook({
+    parsedEvents = args.processor.parseInboundWebhook({
       rawBody: args.rawBody,
       headers: args.headers,
     });
@@ -57,6 +67,30 @@ export async function handleInboundWebhook(args: {
     );
   }
 
+  const results: InboundEventResult[] = [];
+  for (const parsed of parsedEvents) {
+    results.push(await projectInboundEvent(args, parsed));
+  }
+
+  const first = results[0] ?? { accepted: false, type: "none", eventId: "" };
+  return {
+    accepted: results.some((r) => r.accepted),
+    type: first.type,
+    eventId: first.eventId,
+    processed: results.length,
+    results,
+  };
+}
+
+/** Dedupe + project a single notification item. Extracted so the batch
+ *  loop in handleInboundWebhook stays flat. */
+async function projectInboundEvent(
+  args: {
+    prisma: PrismaClient;
+    mode: CantilapayMode;
+  },
+  parsed: PspInboundEvent,
+): Promise<InboundEventResult> {
   const cantilapayAccountId = parsed.subMerchantId
     ? await resolveAccountForSubMerchant(args.prisma, parsed.subMerchantId, args.mode)
     : null;
