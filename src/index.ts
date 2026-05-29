@@ -29,6 +29,7 @@ import {
   registerCantilapayRoutes,
   selectPaymentProcessor,
   startDeliveryWorker as startCantilapayDeliveryWorker,
+  startBillingEngineWorker as startCantilapayBillingEngineWorker,
 } from "./cantilapay";
 import { getPrisma } from "./lib/prisma";
 
@@ -3606,8 +3607,22 @@ registerCantilapayRoutes(app, {
 });
 
 const stopCantilapayWorker = startCantilapayDeliveryWorker(getPrisma());
-process.on("SIGINT", () => stopCantilapayWorker());
-process.on("SIGTERM", () => stopCantilapayWorker());
+// Phase 2 — recurring billing tick. Same in-process posture as the
+// delivery worker: setInterval + unref, single-process, no external
+// scheduler. Cadence is 60s; the smoke test invokes the engine's `tick`
+// directly with an injected `now` to fast-forward across periods.
+const stopCantilapayBillingWorker = startCantilapayBillingEngineWorker(
+  getPrisma(),
+  cantilapaySelection.processor,
+);
+process.on("SIGINT", () => {
+  stopCantilapayWorker();
+  stopCantilapayBillingWorker();
+});
+process.on("SIGTERM", () => {
+  stopCantilapayWorker();
+  stopCantilapayBillingWorker();
+});
 
 /* ----- boot ----- */
 

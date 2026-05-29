@@ -1062,3 +1062,835 @@ model ProjectAsset {
   @@index([projectId, createdAt])
   @@index([projectId, kind])
 }
+
+// ============================================================
+// Cantilapay — Phase 0 foundation (plan §25)
+//
+// The 12th Cantila product surface. A Cantila-owned tenant-facing
+// payments platform with a Stripe-shaped API and Adyen for
+// Platforms as the underlying rail. Tenant is Merchant of Record
+// (Stripe Connect Express/Custom model).
+//
+// All models are namespaced `Cantilapay*` so they cannot collide
+// with Cantila's own billing (which stays on Stripe — see Account
+// .stripeCustomerId + src/billing/*). The two products are fully
+// separate at the data layer.
+//
+// Test/live mode is enforced at the API-key layer (the same key
+// cannot read both modes). For storage the `mode` column on each
+// row records which side it belongs to; queries always include it.
+// ============================================================
+
+enum CantilapayAccountStatus {
+  // Tenant enabled cantilapay but has not begun KYC.
+  created
+  // Adyen sub-merchant created; KYC link generated; awaiting tenant.
+  onboarding
+  // Adyen approved the sub-merchant; can accept live payments.
+  active
+  // KYC failed or Adyen rejected — tenant cannot accept payments.
+  rejected
+  // Tenant or admin disabled the sub-merchant.
+  disabled
+}
+
+enum CantilapayApiKeyKind {
+  publishable
+  secret
+}
+
+enum CantilapayMode {
+  test
+  live
+}
+
+model CantilapayAccount {
+  id String @id @default(cuid())
+  /// The owning Cantila tenant Account (loose-typed string FK matching
+  /// the rest of the schema's accountId columns; cross-account asserts
+  /// live in the ControlPlane layer).
+  accountId String @unique
+  /// Adyen Account Holder id for the test-mode sub-merchant. Null
+  /// until onboarding begins. Adyen treats test/live as fully
+  /// separate sub-merchants, so two columns rather than a JSON map.
+  adyenAccountHolderIdTest String?
+  /// Adyen Account Holder id for the live-mode sub-merchant.
+  adyenAccountHolderIdLive String?
+  status CantilapayAccountStatus @default(created)
+  /// Per-transaction platform fee Cantila collects, in basis points
+  /// (10000 bps = 100%). Default 50 bps = 0.5%. The fee is split off
+  /// at the Adyen Balance Platform layer when each charge clears.
+  platformFeeBps Int @default(50)
+  /// ISO-3 country code of the sub-merchant (drives Adyen Legal
+  /// Entity shape). Null until onboarding begins.
+  country String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  apiKeys           CantilapayApiKey[]
+  webhookEndpoints  CantilapayWebhookEndpoint[]
+  events            CantilapayEvent[]
+  webhookDeliveries CantilapayWebhookDelivery[]
+  idempotencyKeys   CantilapayIdempotencyKey[]
+  auditLog          CantilapayAuditLog[]
+  // Phase 1 — charges.
+  customers      CantilapayCustomer[]
+  paymentMethods CantilapayPaymentMethod[]
+  paymentIntents CantilapayPaymentIntent[]
+  refunds        CantilapayRefund[]
+  // Phase 2 — subscriptions.
+  products      CantilapayProduct[]
+  prices        CantilapayPrice[]
+  subscriptions CantilapaySubscription[]
+  invoices      CantilapayInvoice[]
+  // Phase 3 — Connect-equivalent + payouts.
+  payouts             CantilapayPayout[]
+  balanceTransactions CantilapayBalanceTransaction[]
+  // Phase 4 — hosted sessions.
+  checkoutSessions      CantilapayCheckoutSession[]
+  billingPortalSessions CantilapayBillingPortalSession[]
+  // Phase 5 — tax calculations.
+  taxCalculations CantilapayTaxCalculation[]
+
+  @@index([accountId])
+}
+
+model CantilapayApiKey {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  name String
+  kind CantilapayApiKeyKind
+  mode CantilapayMode
+  /// First chars of the raw key (e.g. "cpk_test_AbCdEf12"). Shown in
+  /// lists so the tenant can identify a key without seeing the secret.
+  prefix String
+  /// SHA-256 hex of the raw key — same one-time-reveal posture as
+  /// `ApiKey.hashedKey`. The raw key is returned exactly once on
+  /// creation and never persisted.
+  hashedKey String @unique
+  lastUsedAt DateTime?
+  /// When set, the key is revoked and authentication rejects.
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([cantilapayAccountId, mode])
+}
+
+model CantilapayWebhookEndpoint {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  url String
+  mode CantilapayMode
+  /// Comma-separated event types this endpoint subscribes to. "*" = all.
+  enabledEvents String @default("*")
+  /// HMAC signing secret used to compute the `Cantilapay-Signature`
+  /// header on outbound deliveries. Plaintext today; production
+  /// should encrypt-at-rest with a KMS-backed envelope before
+  /// writing. Returned exactly once at creation.
+  signingSecret String
+  signingSecretPrefix String
+  /// active | disabled — loose-typed to keep the migration additive.
+  status String @default("active")
+  createdAt DateTime @default(now())
+  lastDeliveryAt DateTime?
+
+  deliveries CantilapayWebhookDelivery[]
+
+  @@index([cantilapayAccountId, mode])
+}
+
+model CantilapayEvent {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  /// Stripe-shaped event type, e.g. "payment_intent.succeeded",
+  /// "account.updated".
+  type String
+  /// JSON-encoded event payload. Storing as text keeps the schema
+  /// simple at the cost of in-DB queries against it; the outbound
+  /// deliverer serialises this directly to the wire.
+  data String
+  createdAt DateTime @default(now())
+
+  deliveries CantilapayWebhookDelivery[]
+
+  @@index([cantilapayAccountId, mode, createdAt])
+  @@index([type])
+}
+
+model CantilapayWebhookDelivery {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  endpoint   CantilapayWebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  endpointId String
+  event   CantilapayEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  eventId String
+  /// pending | succeeded | failed_temporary | failed_permanent
+  status String @default("pending")
+  attempts Int @default(0)
+  lastAttemptAt DateTime?
+  /// When the retry worker should next pick this delivery up. Null
+  /// for terminal states (succeeded / failed_permanent).
+  nextAttemptAt DateTime?
+  /// HTTP response code from the last attempt; 0 = network error.
+  lastResponseCode Int?
+  /// First ~512 chars of the response body, for debugging in the
+  /// Console webhook log.
+  lastResponseBody String?
+  createdAt DateTime @default(now())
+
+  @@index([cantilapayAccountId, status])
+  @@index([nextAttemptAt])
+}
+
+model CantilapayIdempotencyKey {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  /// The `Cantilapay-Idempotency-Key` value the caller presented.
+  key String
+  mode CantilapayMode
+  /// SHA-256 of the request body. A retry that presents the same
+  /// idempotency key with a different body is a 400 (same as Stripe).
+  requestHash String
+  /// Cached response so a retry returns the original response
+  /// byte-for-byte rather than re-running the operation.
+  responseStatus Int
+  responseBody String
+  createdAt DateTime @default(now())
+  /// TTL — Stripe keeps idempotency results for 24h. A nightly sweep
+  /// deletes anything past this.
+  expiresAt DateTime
+
+  @@unique([cantilapayAccountId, mode, key])
+  @@index([expiresAt])
+}
+
+model CantilapayAuditLog {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  /// Dot-namespaced event type, e.g. "cantilapay.account.created",
+  /// "cantilapay.api_key.issued", "cantilapay.webhook.delivered".
+  type String
+  /// Free-form human-readable message for the Console audit list.
+  message String
+  /// JSON-encoded structured details. Null when nothing structured
+  /// to add beyond the message.
+  data String?
+  /// The cantilapay api key id used (when the action was via API),
+  /// null if via Console session or inbound webhook.
+  apiKeyId String?
+  createdAt DateTime @default(now())
+
+  @@index([cantilapayAccountId, createdAt])
+}
+
+// ============================================================
+// Cantilapay — Phase 1 (Charges) (plan §25)
+//
+// One-time payments: Customer, PaymentMethod (PSP-tokenised —
+// Cantila never sees PAN), PaymentIntent (Stripe-shape state
+// machine), Refund. Mode-partitioned (test/live) at the row
+// level via the same `mode` column the Phase 0 tables use.
+//
+// All amounts are integers in MINOR currency units (cents,
+// ören, pence) — matches Stripe + Adyen conventions and rules
+// out floating-point rounding bugs.
+// ============================================================
+
+enum CantilapayPaymentIntentStatus {
+  /// Created but no payment method attached yet — tenant must
+  /// either confirm with a method or call /attach.
+  requires_payment_method
+  /// Has method; waiting for explicit confirm.
+  requires_confirmation
+  /// Confirmed; Adyen / PSP issued a 3DS challenge or similar.
+  /// The tenant-side SDK handles the redirect / completion.
+  requires_action
+  /// Submitted to PSP; awaiting AUTHORISATION result.
+  processing
+  /// Authorised but capture is manual; waiting for /capture.
+  requires_capture
+  /// Captured + cleared.
+  succeeded
+  /// Cancelled by tenant or PSP before capture.
+  canceled
+  /// PSP declined or terminal error.
+  failed
+}
+
+enum CantilapayCaptureMode {
+  automatic
+  manual
+}
+
+enum CantilapayPaymentMethodStatus {
+  chargeable
+  detached
+}
+
+enum CantilapayRefundStatus {
+  pending
+  succeeded
+  failed
+}
+
+model CantilapayCustomer {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  /// Optional tenant-side reference (e.g. their own customer id). Unique
+  /// per (account, mode) when set so the tenant can hit upsert-by-ref.
+  externalRef String?
+  email String?
+  name String?
+  description String?
+  /// Free-form bag of tenant metadata. JSON-encoded text; the route layer
+  /// limits each value to 500 chars (Stripe's convention).
+  metadata String @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  paymentMethods CantilapayPaymentMethod[]
+  paymentIntents CantilapayPaymentIntent[]
+
+  @@unique([cantilapayAccountId, mode, externalRef])
+  @@index([cantilapayAccountId, mode, createdAt])
+}
+
+model CantilapayPaymentMethod {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  customer   CantilapayCustomer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerId String?
+  /// Always "card" in Phase 1. Future kinds (ideal, sepa_debit, …) land
+  /// in Phase 4. Loose-typed for forward-compat without a schema change.
+  type String @default("card")
+  /// PSP-side token — Adyen `storedPaymentMethodId` or stub equivalent.
+  /// This is what the PSP charges; Cantila never sees PAN. Required even
+  /// for the stub so the wire shape matches what tenants integrate against.
+  pspToken String
+  /// Display-only — for the tenant Console "Saved methods" list.
+  cardBrand String?
+  cardLast4 String?
+  cardExpMonth Int?
+  cardExpYear Int?
+  status CantilapayPaymentMethodStatus @default(chargeable)
+  /// Tenant metadata bag.
+  metadata String @default("{}")
+  createdAt DateTime @default(now())
+  detachedAt DateTime?
+
+  paymentIntents CantilapayPaymentIntent[]
+
+  @@index([cantilapayAccountId, mode])
+  @@index([customerId])
+}
+
+model CantilapayPaymentIntent {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  customer   CantilapayCustomer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerId String?
+  paymentMethod   CantilapayPaymentMethod? @relation(fields: [paymentMethodId], references: [id], onDelete: SetNull)
+  paymentMethodId String?
+  /// Amount in MINOR currency units (cents). Always positive.
+  amount Int
+  /// Amount that has actually been captured. Equals `amount` once
+  /// `succeeded`; 0 before capture; partial captures are not Phase 1.
+  amountCaptured Int @default(0)
+  /// Sum of all refunds against this intent in minor units.
+  amountRefunded Int @default(0)
+  /// ISO-4217 lowercase, e.g. "usd", "eur".
+  currency String
+  captureMode CantilapayCaptureMode @default(automatic)
+  status CantilapayPaymentIntentStatus @default(requires_payment_method)
+  /// Cantila platform fee, in minor units, derived from
+  /// CantilapayAccount.platformFeeBps at create time. Stored so a
+  /// later fee config change doesn't retroactively reshape past
+  /// intents.
+  platformFeeAmount Int @default(0)
+  description String?
+  /// Tenant metadata bag.
+  metadata String @default("{}")
+  /// PSP-side reference (Adyen `pspReference`) once submitted.
+  /// Indexed so inbound webhooks can find the owning intent.
+  pspPaymentRef String?
+  /// JSON blob the tenant's frontend SDK uses to mount the payment UI
+  /// (Adyen Drop-in `sessionData`, or stub equivalent). Null after
+  /// terminal state.
+  pspSessionData String?
+  /// JSON-encoded last-error info (code, declineCode, message). Set
+  /// when status flips to `failed`; preserved for tenant debugging.
+  lastError String?
+  /// Idempotency key the original create-request carried, when present.
+  /// Phase 1+ payment-intent retries can dedupe on this in addition to
+  /// the generic CantilapayIdempotencyKey table.
+  clientIdempotencyKey String?
+  confirmedAt DateTime?
+  capturedAt DateTime?
+  canceledAt DateTime?
+  succeededAt DateTime?
+  failedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  refunds CantilapayRefund[]
+
+  @@index([cantilapayAccountId, mode, status])
+  @@index([cantilapayAccountId, mode, createdAt])
+  @@index([pspPaymentRef])
+  @@index([customerId])
+}
+
+model CantilapayRefund {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  paymentIntent   CantilapayPaymentIntent @relation(fields: [paymentIntentId], references: [id], onDelete: Cascade)
+  paymentIntentId String
+  amount Int
+  currency String
+  status CantilapayRefundStatus @default(pending)
+  /// Free-form: "duplicate" / "fraudulent" / "requested_by_customer" /
+  /// "other". Loose-typed so a tenant can pass anything Stripe-like.
+  reason String?
+  /// PSP-side refund id (Adyen `pspReference` for the refund event).
+  pspRefundRef String?
+  lastError String?
+  createdAt DateTime @default(now())
+  succeededAt DateTime?
+  failedAt DateTime?
+
+  @@index([cantilapayAccountId, mode, status])
+  @@index([paymentIntentId])
+  @@index([pspRefundRef])
+}
+
+// ============================================================
+// Cantilapay — Phase 2 (Subscriptions) (plan §25)
+//
+// Stripe-shaped recurring billing: Product, Price, Subscription,
+// Invoice, InvoiceItem. The in-process `billing-engine.ts`
+// drives the lifecycle (period advance, dunning) without an
+// external scheduler — same posture as the delivery worker
+// shipped in Phase 0.
+//
+// All amounts are integers in MINOR currency units (cents).
+// ============================================================
+
+enum CantilapayPriceInterval {
+  day
+  week
+  month
+  year
+}
+
+enum CantilapaySubscriptionStatus {
+  /// Created but the first invoice has not been charged successfully yet.
+  incomplete
+  /// In a trial period — not yet charging.
+  trialing
+  /// Charging successfully.
+  active
+  /// Last charge failed; retrying within the dunning schedule.
+  past_due
+  /// Cancelled by tenant or by dunning terminal.
+  canceled
+  /// Stripe-shape "left in dunning, not deactivated" — rarely used,
+  /// reserved for tenant policy (we default canceled).
+  unpaid
+}
+
+enum CantilapayInvoiceStatus {
+  draft
+  open
+  paid
+  uncollectible
+  void
+}
+
+model CantilapayProduct {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  name String
+  description String?
+  active Boolean @default(true)
+  /// Tenant metadata.
+  metadata String @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  prices CantilapayPrice[]
+
+  @@index([cantilapayAccountId, mode])
+}
+
+model CantilapayPrice {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  product   CantilapayProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId String
+  /// Unit amount in MINOR currency units (cents).
+  unitAmount Int
+  /// ISO-4217 lowercase, e.g. "usd", "eur".
+  currency String
+  /// Recurring interval. Phase 2 always sets this; one-time prices
+  /// land in a future drop and are gated behind a separate enum value.
+  recurringInterval CantilapayPriceInterval
+  recurringIntervalCount Int @default(1)
+  /// Days of trial when a subscription on this price is created without
+  /// an explicit override. 0 = no trial by default.
+  trialPeriodDays Int @default(0)
+  active Boolean @default(true)
+  metadata String @default("{}")
+  createdAt DateTime @default(now())
+
+  subscriptions CantilapaySubscription[]
+
+  @@index([cantilapayAccountId, mode])
+  @@index([productId])
+}
+
+model CantilapaySubscription {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  /// The subscriber. Loose FK because cantilapay customers can be
+  /// deleted (intentionally not cascaded — Stripe behaviour).
+  customerId String
+  /// The current Price the subscription is billed on. A plan-change
+  /// rewrites this column (with proration in a future phase).
+  price   CantilapayPrice @relation(fields: [priceId], references: [id], onDelete: Restrict)
+  priceId String
+  /// The default payment method for this subscription. The billing
+  /// engine charges THIS method when each renewal invoice opens.
+  defaultPaymentMethodId String?
+  status CantilapaySubscriptionStatus @default(incomplete)
+  /// Start of the currently-billed period (inclusive).
+  currentPeriodStart DateTime
+  /// End of the currently-billed period (exclusive). When `<= now()`,
+  /// the engine tick advances the period and bills the next one.
+  currentPeriodEnd DateTime
+  /// When trial began (null if no trial).
+  trialStart DateTime?
+  /// When trial ends (null if no trial). On the engine tick, when
+  /// `now >= trialEnd`, the subscription transitions trialing → active
+  /// and the engine generates an invoice for the next period.
+  trialEnd DateTime?
+  /// When true, the subscription cancels at `currentPeriodEnd` instead
+  /// of immediately. Default false (Stripe-shape `cancel_at_period_end`).
+  cancelAtPeriodEnd Boolean @default(false)
+  canceledAt DateTime?
+  endedAt DateTime?
+  /// Counter of failed renewal-charge attempts in the current dunning
+  /// cycle. Reset to 0 when a charge succeeds.
+  dunningAttempts Int @default(0)
+  /// Set when the engine plans the next dunning retry; consulted by
+  /// the tick to decide whether to retry now.
+  nextDunningAt DateTime?
+  metadata String @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoices CantilapayInvoice[]
+
+  @@index([cantilapayAccountId, mode, status])
+  @@index([currentPeriodEnd])
+  @@index([nextDunningAt])
+  @@index([customerId])
+}
+
+model CantilapayInvoice {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  /// The owning subscription. Null for one-off invoices (Phase 2 only
+  /// produces subscription invoices; the column is forward-compat).
+  subscription   CantilapaySubscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  subscriptionId String?
+  customerId String
+  /// Period this invoice covers (inclusive start, exclusive end).
+  periodStart DateTime
+  periodEnd DateTime
+  /// Total in MINOR currency units.
+  amountDue Int
+  amountPaid Int @default(0)
+  currency String
+  status CantilapayInvoiceStatus @default(draft)
+  /// When the engine finalised the draft and tried the first charge.
+  finalizedAt DateTime?
+  /// When the invoice was paid.
+  paidAt DateTime?
+  /// The PaymentIntent created by the engine when charging this invoice.
+  paymentIntentId String?
+  /// Counter of failed charge attempts.
+  attempts Int @default(0)
+  /// JSON-encoded last-error info, set when status moves to open with
+  /// attempts > 0.
+  lastError String?
+  metadata String @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items CantilapayInvoiceItem[]
+
+  @@index([cantilapayAccountId, mode, status])
+  @@index([subscriptionId])
+  @@index([customerId])
+}
+
+model CantilapayInvoiceItem {
+  id String @id @default(cuid())
+  invoice   CantilapayInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  invoiceId String
+  /// Amount in MINOR currency units.
+  amount Int
+  currency String
+  description String
+  /// Source price (when this item came from a subscription).
+  priceId String?
+  periodStart DateTime?
+  periodEnd DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([invoiceId])
+}
+
+// ============================================================
+// Cantilapay — Phase 3 (Connect-equivalent: payouts + balance) (plan §25)
+//
+// Payouts settle accumulated balance to the tenant's bank
+// account at the PSP. Cantila is the platform; Adyen for
+// Platforms (or stub) is the payout rail.
+//
+// Every money movement that touches the tenant's available
+// balance gets a BalanceTransaction row — Stripe's ledger
+// shape. Cantila platform fees show up as negative amounts on
+// the tenant ledger.
+// ============================================================
+
+enum CantilapayPayoutStatus {
+  pending
+  in_transit
+  paid
+  failed
+  canceled
+}
+
+enum CantilapayBalanceTransactionType {
+  charge
+  refund
+  payout
+  /// Cantila's per-transaction platform fee, debited from the
+  /// tenant's available balance when a charge clears.
+  platform_fee
+  /// Adjustment — generic catch-all for manual corrections.
+  adjustment
+}
+
+model CantilapayBalanceTransaction {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  /// Signed amount in MINOR currency units. Positive = credit to
+  /// tenant available balance; negative = debit.
+  amount Int
+  currency String
+  type CantilapayBalanceTransactionType
+  description String?
+  /// Loose-typed source pointers — exactly one set per row.
+  sourcePaymentIntentId String?
+  sourceRefundId String?
+  sourcePayoutId String?
+  createdAt DateTime @default(now())
+
+  @@index([cantilapayAccountId, mode, createdAt])
+  @@index([sourcePaymentIntentId])
+  @@index([sourceRefundId])
+  @@index([sourcePayoutId])
+}
+
+model CantilapayPayout {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  /// Amount paid out in MINOR currency units. Always positive.
+  amount Int
+  currency String
+  status CantilapayPayoutStatus @default(pending)
+  /// When the funds are expected to land in the tenant's bank.
+  /// Phase 3 stub schedules T+1 business day (24h ahead).
+  arrivalDate DateTime
+  /// The window of balance this payout sweeps. Used by the auditor
+  /// to reconcile balance transactions against payouts.
+  periodStart DateTime
+  periodEnd DateTime
+  /// PSP-side reference (Adyen Transfer id) once submitted.
+  pspPayoutRef String?
+  lastError String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  paidAt DateTime?
+  failedAt DateTime?
+
+  @@index([cantilapayAccountId, mode, status])
+  @@index([arrivalDate])
+}
+
+// ============================================================
+// Cantilapay — Phase 4 (Hosted Checkout + Billing Portal) (plan §25)
+//
+// A CheckoutSession is the tenant's entry point for one-off
+// checkout flows: tenant calls POST /checkout/sessions, gets back
+// a URL or clientSecret, redirects (or embeds) the end-customer
+// to the Cantila-branded payment page. On completion the
+// session's `complete` action creates the underlying
+// PaymentIntent or Subscription.
+//
+// BillingPortalSession is the equivalent for the end-customer
+// self-service flow (manage payment methods, see invoices,
+// cancel subscription).
+// ============================================================
+
+enum CantilapayCheckoutSessionMode {
+  payment
+  subscription
+  setup
+}
+
+enum CantilapayCheckoutSessionStatus {
+  open
+  complete
+  expired
+}
+
+enum CantilapayCheckoutUiMode {
+  hosted
+  embedded
+}
+
+enum CantilapayBillingPortalSessionStatus {
+  open
+  used
+  expired
+}
+
+model CantilapayCheckoutSession {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  sessionMode CantilapayCheckoutSessionMode
+  status CantilapayCheckoutSessionStatus @default(open)
+  uiMode CantilapayCheckoutUiMode @default(hosted)
+  customerId String?
+  /// JSON-encoded array of line items. For payment-mode sessions:
+  ///   [{ amount, currency, name, quantity? }, ...]
+  /// For subscription-mode:
+  ///   [{ priceId, quantity? }, ...]
+  lineItems String
+  /// Currency on the session (Phase 4 enforces all line items match).
+  currency String
+  /// Total amount in minor units — sum of items × quantity. Persisted
+  /// so the session view can show it without re-parsing items.
+  amountTotal Int @default(0)
+  successUrl String
+  cancelUrl String?
+  /// Embedded-mode return URL (the tenant's frontend page that
+  /// finalises after the inline Drop-in completes).
+  returnUrl String?
+  /// Set on complete. Either a payment intent (sessionMode=payment)
+  /// or a subscription (sessionMode=subscription).
+  paymentIntentId String?
+  subscriptionId String?
+  /// Cantila-side URL the tenant redirects to (hosted mode). Phase 4
+  /// stub gives a placeholder; cantila-console Phase 6 will serve it.
+  url String?
+  /// Embedded-mode client secret minted server-side; tenant front
+  /// uses it to mount Drop-in in their own page.
+  clientSecret String?
+  expiresAt DateTime
+  completedAt DateTime?
+  metadata String @default("{}")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([cantilapayAccountId, mode, status])
+  @@index([expiresAt])
+}
+
+model CantilapayBillingPortalSession {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  customerId String
+  returnUrl String?
+  status CantilapayBillingPortalSessionStatus @default(open)
+  /// Cantila-side URL the tenant redirects to. Phase 4 stub placeholder.
+  url String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  usedAt DateTime?
+
+  @@index([cantilapayAccountId, mode, status])
+  @@index([expiresAt])
+}
+
+// ============================================================
+// Cantilapay — Phase 5 (Tax calculation) (plan §25)
+//
+// Stripe-Tax-shape calculation, calc-only. Cantila does NOT
+// file — tenant is Merchant of Record and remains responsible
+// for filing in their jurisdictions. The live adapter integrates
+// Anrok (non-Stripe, SaaS-friendly); the stub returns 0% so
+// non-US dev/test paths work without an Anrok account.
+// ============================================================
+
+model CantilapayTaxCalculation {
+  id String @id @default(cuid())
+  cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
+  cantilapayAccountId String
+  mode CantilapayMode
+  /// Pre-tax subtotal in MINOR currency units.
+  amount Int
+  currency String
+  /// ISO-3 country code, e.g. "USA", "DEU".
+  customerCountry String
+  customerState String?
+  customerPostalCode String?
+  /// Total tax computed for this calc, in minor units.
+  taxAmount Int
+  /// Effective rate in basis points (10000 = 100%).
+  taxRateBps Int
+  /// JSON-encoded array of breakdown lines, per jurisdiction.
+  breakdown String
+  /// Which provider produced this calc: "stub", "anrok", "taxjar".
+  provider String @default("stub")
+  /// Optional category hint (e.g. "saas", "physical_goods") the
+  /// tenant passes through to influence tax rules.
+  productCategory String?
+  createdAt DateTime @default(now())
+
+  @@index([cantilapayAccountId, mode, createdAt])
+}
