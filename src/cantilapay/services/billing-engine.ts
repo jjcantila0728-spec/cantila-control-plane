@@ -12,7 +12,7 @@
      4. Retry past_due subscriptions at `nextDunningAt`.
      5. After `MAX_DUNNING_ATTEMPTS` consecutive failures, cancel.
 
-   Each transition emits the Stripe-shaped events:
+   Each transition emits the Cantilapay-shaped events:
      - invoice.created
      - invoice.payment_succeeded / invoice.payment_failed
      - invoice.paid

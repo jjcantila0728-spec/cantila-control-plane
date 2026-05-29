@@ -1,7 +1,7 @@
 /* ============================================================
    Cantilapay — Customer service (plan §25, Phase 1).
 
-   Stripe-shaped Customer CRUD, scoped to (cantilapayAccount, mode).
+   Cantilapay-shaped Customer CRUD, scoped to (cantilapayAccount, mode).
    `externalRef` lets a tenant upsert-by-their-own-id (Stripe calls
    this `idempotency_key`-by-side-effect; here we make it explicit).
    ============================================================ */

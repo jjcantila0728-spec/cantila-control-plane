@@ -6,7 +6,7 @@
    and download. `voidInvoice` and `markUncollectible` give the
    tenant manual control over what to do with stuck invoices.
 
-   The Stripe-shape `payInvoice` (retry-now) lives here too —
+   The Cantilapay-shaped `payInvoice` (retry-now) lives here too —
    the tenant calls it from the Console "Try again" button on a
    past-due banner.
    ============================================================ */

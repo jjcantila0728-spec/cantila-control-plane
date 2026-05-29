@@ -1067,7 +1067,7 @@ model ProjectAsset {
 // Cantilapay — Phase 0 foundation (plan §25)
 //
 // The 12th Cantila product surface. A Cantila-owned tenant-facing
-// payments platform with a Stripe-shaped API and Adyen for
+// payments platform with a Cantilapay-shaped API and Adyen for
 // Platforms as the underlying rail. Tenant is Merchant of Record
 // (Stripe Connect Express/Custom model).
 //
@@ -1206,7 +1206,7 @@ model CantilapayEvent {
   cantilapayAccount   CantilapayAccount @relation(fields: [cantilapayAccountId], references: [id], onDelete: Cascade)
   cantilapayAccountId String
   mode CantilapayMode
-  /// Stripe-shaped event type, e.g. "payment_intent.succeeded",
+  /// Cantilapay-shaped event type, e.g. "payment_intent.succeeded",
   /// "account.updated".
   type String
   /// JSON-encoded event payload. Storing as text keeps the schema
@@ -1294,7 +1294,7 @@ model CantilapayAuditLog {
 // Cantilapay — Phase 1 (Charges) (plan §25)
 //
 // One-time payments: Customer, PaymentMethod (PSP-tokenised —
-// Cantila never sees PAN), PaymentIntent (Stripe-shape state
+// Cantila never sees PAN), PaymentIntent (Cantilapay-shaped state
 // machine), Refund. Mode-partitioned (test/live) at the row
 // level via the same `mode` column the Phase 0 tables use.
 //
@@ -1464,7 +1464,7 @@ model CantilapayRefund {
   currency String
   status CantilapayRefundStatus @default(pending)
   /// Free-form: "duplicate" / "fraudulent" / "requested_by_customer" /
-  /// "other". Loose-typed so a tenant can pass anything Stripe-like.
+  /// "other". Loose-typed so a tenant can pass anything Cantilapay.
   reason String?
   /// PSP-side refund id (Adyen `pspReference` for the refund event).
   pspRefundRef String?
@@ -1481,7 +1481,7 @@ model CantilapayRefund {
 // ============================================================
 // Cantilapay — Phase 2 (Subscriptions) (plan §25)
 //
-// Stripe-shaped recurring billing: Product, Price, Subscription,
+// Cantilapay-shaped recurring billing: Product, Price, Subscription,
 // Invoice, InvoiceItem. The in-process `billing-engine.ts`
 // drives the lifecycle (period advance, dunning) without an
 // external scheduler — same posture as the delivery worker
@@ -1508,7 +1508,7 @@ enum CantilapaySubscriptionStatus {
   past_due
   /// Cancelled by tenant or by dunning terminal.
   canceled
-  /// Stripe-shape "left in dunning, not deactivated" — rarely used,
+  /// Cantilapay-shaped "left in dunning, not deactivated" — rarely used,
   /// reserved for tenant policy (we default canceled).
   unpaid
 }
@@ -1595,7 +1595,7 @@ model CantilapaySubscription {
   /// and the engine generates an invoice for the next period.
   trialEnd DateTime?
   /// When true, the subscription cancels at `currentPeriodEnd` instead
-  /// of immediately. Default false (Stripe-shape `cancel_at_period_end`).
+  /// of immediately. Default false (Cantilapay-shaped `cancel_at_period_end`).
   cancelAtPeriodEnd Boolean @default(false)
   canceledAt DateTime?
   endedAt DateTime?

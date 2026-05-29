@@ -3,7 +3,7 @@
 
    Every money movement that touches the tenant's available
    balance leaves a `CantilapayBalanceTransaction` row — the
-   Stripe-shape ledger. `recordBalanceTransaction` is the single
+   Cantilapay-shaped ledger. `recordBalanceTransaction` is the single
    write surface used by payment-intents, refunds, and the
    payout engine. `getBalance` aggregates the ledger to compute
    `available` (settled, can be paid out) and `pending`

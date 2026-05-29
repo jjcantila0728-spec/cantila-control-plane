@@ -8,7 +8,7 @@
 
    Keeping the wire types decoupled from Prisma rows lets the
    adapter port (`PaymentProcessor`) speak in PSP-agnostic terms
-   that match the Stripe-shaped API tenants integrate against.
+   that match the Cantilapay-shaped API tenants integrate against.
    ============================================================ */
 
 /** Cantilapay test vs live mode. Same key cannot read both. */
@@ -90,7 +90,7 @@ export interface CantilapayWebhookEndpointIssued
   signingSecret: string;
 }
 
-/** A cantilapay event the platform emits. Mirrors Stripe's Event shape.
+/** A cantilapay event the platform emits. Mirrors the cantilapay's Event shape.
  *  Event types in Phase 0 are limited to lifecycle events; Phases 1-3
  *  add `payment_intent.*`, `invoice.*`, `subscription.*`, `payout.*`. */
 export interface CantilapayEventView {

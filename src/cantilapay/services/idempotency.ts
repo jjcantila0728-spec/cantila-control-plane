@@ -1,7 +1,7 @@
 /* ============================================================
    Cantilapay — idempotency-key service (plan §25, Phase 0).
 
-   Stripe-shaped idempotency: a caller passes a
+   Cantilapay-shaped idempotency: a caller passes a
    `Cantilapay-Idempotency-Key` header on any mutating request;
    the platform persists `(account, mode, key) -> (requestHash,
    responseStatus, responseBody)` so a retry within the TTL

@@ -21,7 +21,7 @@ export interface EmitEventOptions {
   prisma: PrismaClient;
   cantilapayAccountId: string;
   mode: CantilapayMode;
-  /** Stripe-shape dotted event type, e.g. "payment_intent.succeeded". */
+  /** Cantilapay-shaped dotted event type, e.g. "payment_intent.succeeded". */
   type: string;
   /** Free-form payload. Serialised + persisted as the event body and
    *  delivered to subscribed tenant webhooks. */

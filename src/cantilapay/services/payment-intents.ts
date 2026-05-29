@@ -1,7 +1,7 @@
 /* ============================================================
    Cantilapay — PaymentIntent service (plan §25, Phase 1).
 
-   The heart of Phase 1. Stripe-shaped state machine:
+   The heart of Phase 1. Cantilapay-shaped state machine:
 
      create  → requires_payment_method  (no method)
              → requires_confirmation    (method attached)
@@ -12,7 +12,7 @@
      capture → succeeded                (only from requires_capture)
      cancel  → canceled                 (any pre-terminal)
 
-   Every transition emits a Stripe-shaped event
+   Every transition emits a Cantilapay-shaped event
    (`payment_intent.created`, `…succeeded`, `…payment_failed`, …) via
    `emitCantilapayEvent`, which both writes the canonical Event row
    and enqueues outbound deliveries to subscribed tenant webhooks.
@@ -399,7 +399,7 @@ export async function confirmPaymentIntent(
     }
   }
 
-  // Emit Stripe-shaped events for each outcome.
+  // Emit Cantilapay-shaped events for each outcome.
   const eventBase = {
     id: updated.id,
     amount: updated.amount,

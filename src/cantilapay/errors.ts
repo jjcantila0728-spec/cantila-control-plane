@@ -1,7 +1,7 @@
 /* ============================================================
    Cantilapay — error model (plan §25, Phase 0).
 
-   Mirrors Stripe's error shape so SDKs feel familiar to a
+   Mirrors the cantilapay's error shape so SDKs feel familiar to a
    developer migrating from Stripe:
 
      {
@@ -20,7 +20,7 @@
    what the tenant reads in their logs.
    ============================================================ */
 
-/** Stripe-shaped error category. */
+/** Cantilapay-shaped error category. */
 export type CantilapayErrorType =
   | "api_error" // platform bug; would be a Cantila incident
   | "invalid_request_error" // bad input from the tenant
