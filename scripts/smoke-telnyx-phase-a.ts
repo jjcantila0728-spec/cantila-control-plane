@@ -1,5 +1,6 @@
 /* Telnyx telephony — Phase A smoke test (stub + adapter request-building). */
 import { StubTelephonyProvider } from "../src/sms/provider";
+import { TelnyxClient } from "../src/sms/telnyx";
 
 let failed = 0;
 function check(condition: unknown, label: string, detail?: unknown): void {
@@ -34,8 +35,31 @@ async function stubVoiceAgent(): Promise<void> {
   check(true, "stub deleteVoiceAgent resolves");
 }
 
+async function telnyxClientRequest(): Promise<void> {
+  console.log("--- Phase A — TelnyxClient request building ---");
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const fakeFetch: typeof fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url: String(url), init });
+    return new Response(JSON.stringify({ data: { id: "msg_1" } }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+
+  const client = new TelnyxClient({ apiKey: "KEY123", fetchImpl: fakeFetch });
+  const body = await client.post("/messages", { from: "+1", to: "+2", text: "hi" });
+  check(calls.length === 1, "client issued one request");
+  check(calls[0].url === "https://api.telnyx.com/v2/messages", "client hits v2 base + path", calls[0].url);
+  check(
+    (calls[0].init.headers as Record<string, string>)["Authorization"] === "Bearer KEY123",
+    "client sends Bearer auth",
+  );
+  check((body as { data: { id: string } }).data.id === "msg_1", "client returns parsed JSON body");
+}
+
 async function main(): Promise<void> {
   await stubVoiceAgent();
+  await telnyxClientRequest();
   if (failed > 0) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
 }
