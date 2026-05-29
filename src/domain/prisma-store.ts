@@ -117,6 +117,7 @@ function toProject(r: DbProject): Project {
         ? undefined
         : (r.automationConfig as Record<string, unknown>),
     coolifyAppUuid: r.coolifyAppUuid ?? undefined,
+    platform: r.platform ?? false,
     createdAt: r.createdAt.toISOString(),
   };
 }
@@ -449,6 +450,7 @@ export class PrismaStore implements Store {
         repoUrl: p.repoUrl,
         branch: p.branch,
         autoDeploy: p.autoDeploy,
+        platform: p.platform ?? false,
         createdAt: new Date(p.createdAt),
         // The ControlPlane only carries an accountId. Connect to the owning
         // account, creating a placeholder if it does not exist yet, so the
@@ -506,7 +508,7 @@ export class PrismaStore implements Store {
 
   async listProjects(accountId: string): Promise<Project[]> {
     const rows = await this.db.project.findMany({
-      where: { accountId },
+      where: { accountId, platform: false },
       orderBy: { createdAt: "desc" },
     });
     return rows.map(toProject);

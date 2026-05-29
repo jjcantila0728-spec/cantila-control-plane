@@ -399,6 +399,9 @@ model Project {
   /// plane look the project back up across restarts without scanning
   /// the full /applications list. Null on stub-only environments.
   coolifyAppUuid   String?
+  /// True only for the seeded system "Platform" project that owns
+  /// cantila.app. Hidden from tenant project lists (plan §4.4).
+  platform  Boolean       @default(false)
   createdAt DateTime      @default(now())
 
   deployments     Deployment[]

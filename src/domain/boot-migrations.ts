@@ -63,6 +63,12 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "User.emailVerifiedAt — ISO timestamp the user completed email_verify (v1.18 / §5.4). Nullable; absent on legacy rows reads as unverified.",
     sql: 'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "emailVerifiedAt" TIMESTAMP(3);',
   },
+  {
+    id: "20260529010000_add_project_platform",
+    description:
+      "Project.platform — marks the seeded hidden Platform project that owns cantila.app (plan §4.4). New column WITH a default, so existing rows get false; not a NOT-NULL backfill of an existing column.",
+    sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "platform" BOOLEAN NOT NULL DEFAULT false;',
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.

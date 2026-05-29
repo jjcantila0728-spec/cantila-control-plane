@@ -504,7 +504,9 @@ export class InMemoryStore implements Store {
   }
 
   async listProjects(accountId: string): Promise<Project[]> {
-    return [...this.projects.values()].filter((p) => p.accountId === accountId);
+    return [...this.projects.values()].filter(
+      (p) => p.accountId === accountId && !p.platform,
+    );
   }
 
   async getProject(id: string): Promise<Project | null> {
