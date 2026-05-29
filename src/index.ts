@@ -34,12 +34,16 @@ import {
   startBillingEngineWorker as startCantilapayBillingEngineWorker,
 } from "./cantilapay";
 import { getPrisma } from "./lib/prisma";
+import { createRateLimiter } from "./auth/rate-limit";
 
 /** The default account used when CANTILA_REQUIRE_AUTH is off — keeps the
  *  no-auth dev story identical to v1.3 (the Console / CLI both work without
  *  ever touching keys). With auth on, the caller's key is authoritative
  *  and this constant is never read. */
 const DEFAULT_ACCOUNT_ID = "acc_demo";
+
+// 10 auth attempts per IP per minute, shared across login/register/sso.
+const authRateLimit = createRateLimiter({ windowMs: 60_000, max: 10 });
 
 // Stripe adapter — auto-selects on `STRIPE_SECRET_KEY` presence (plan
 // §15.1). When set, the real Stripe-SDK-backed adapter is wired and
@@ -2258,6 +2262,9 @@ const sessionTokenSchema = z.object({
 // — new users sign up explicitly via /v1/auth/register. See
 // ControlPlane.loginWithPassword.
 app.post("/v1/auth/login", async (request, reply) => {
+  if (!authRateLimit(request.ip, Date.now())) {
+    return reply.code(429).send({ error: "too many attempts, slow down" });
+  }
   const parsed = loginSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
@@ -2269,6 +2276,9 @@ app.post("/v1/auth/login", async (request, reply) => {
 
 // Explicit registration — fails when the email is already taken.
 app.post("/v1/auth/register", async (request, reply) => {
+  if (!authRateLimit(request.ip, Date.now())) {
+    return reply.code(429).send({ error: "too many attempts, slow down" });
+  }
   const parsed = registerSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
@@ -2442,6 +2452,9 @@ app.post("/v1/auth/sso/start", async (request, reply) => {
 
 // Complete an SSO login from the IdP callback.
 app.post("/v1/auth/sso/login", async (request, reply) => {
+  if (!authRateLimit(request.ip, Date.now())) {
+    return reply.code(429).send({ error: "too many attempts, slow down" });
+  }
   const parsed = ssoLoginSchema.safeParse(request.body ?? {});
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
