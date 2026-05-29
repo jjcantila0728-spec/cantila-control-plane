@@ -69,6 +69,18 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "Project.platform — marks the seeded hidden Platform project that owns cantila.app (plan §4.4). New column WITH a default, so existing rows get false; not a NOT-NULL backfill of an existing column.",
     sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "platform" BOOLEAN NOT NULL DEFAULT false;',
   },
+  {
+    id: "20260529020000_add_phone_number_marketplace_link",
+    description:
+      "PhoneNumber.marketplaceNumberId — links a project's SMS number to the account-owned MarketplaceNumber it was provisioned from (opt-in SMS, plan §4.5). Nullable; legacy rows stay null.",
+    sql: 'ALTER TABLE "PhoneNumber" ADD COLUMN IF NOT EXISTS "marketplaceNumberId" TEXT;',
+  },
+  {
+    id: "20260529030000_add_user_avatar_url",
+    description:
+      "User.avatarUrl — profile picture URL captured from social sign-in (Google picture / GitHub avatar_url, plan §5.4). Nullable; legacy rows stay null.",
+    sql: 'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "avatarUrl" TEXT;',
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.
