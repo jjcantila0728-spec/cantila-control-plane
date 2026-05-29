@@ -101,6 +101,16 @@ export class TelnyxError extends Error {
   }
 }
 
+/** True when a Telnyx error is a registration/compliance rejection
+ *  (A2P/10DLC, brand/campaign, unregistered sender) rather than a
+ *  transient failure — the control plane maps these to
+ *  `sms_compliance_required`. */
+export function isComplianceRejection(err: unknown): boolean {
+  if (!(err instanceof TelnyxError)) return false;
+  if (err.status < 400 || err.status >= 500) return false;
+  return /10dlc|campaign|brand|registr|unregistered|not\s+registered/i.test(err.bodyText);
+}
+
 export interface TelnyxProviderConfig {
   apiKey: string;
   publicKey?: string;

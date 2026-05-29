@@ -1,6 +1,6 @@
 /* Telnyx telephony — Phase A smoke test (stub + adapter request-building). */
 import { StubTelephonyProvider, createTelephonyProvider } from "../src/sms/provider";
-import { TelnyxClient, TelnyxTelephonyProvider } from "../src/sms/telnyx";
+import { TelnyxClient, TelnyxTelephonyProvider, TelnyxError, isComplianceRejection } from "../src/sms/telnyx";
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import { verifyTelnyxSignature } from "../src/sms/telnyx";
 
@@ -146,12 +146,22 @@ async function telnyxVoiceAgentAndFactory(): Promise<void> {
   delete process.env.TELNYX_API_KEY;
 }
 
+function complianceClassifier(): void {
+  console.log("--- Phase A — compliance rejection classifier ---");
+  const reg = new TelnyxError(422, "/messages", JSON.stringify({ errors: [{ detail: "number is not registered for 10DLC campaign" }] }));
+  check(isComplianceRejection(reg) === true, "10DLC rejection classified as compliance");
+  const other = new TelnyxError(500, "/messages", "internal error");
+  check(isComplianceRejection(other) === false, "500 is not a compliance rejection");
+  check(isComplianceRejection(new Error("boom")) === false, "non-Telnyx error is not compliance");
+}
+
 async function main(): Promise<void> {
   await stubVoiceAgent();
   await telnyxClientRequest();
   await signatureVerification();
   await telnyxAdapter();
   await telnyxVoiceAgentAndFactory();
+  complianceClassifier();
   if (failed > 0) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
 }
