@@ -101,6 +101,216 @@ export class TelnyxError extends Error {
   }
 }
 
+export interface TelnyxProviderConfig {
+  apiKey: string;
+  publicKey?: string;
+  messagingProfileId?: string;
+  voiceConnectionId?: string;
+  fetchImpl?: typeof fetch;
+}
+
+export class TelnyxTelephonyProvider implements TelephonyProvider {
+  readonly label = "Telnyx";
+  readonly live = true;
+
+  private readonly client: TelnyxClient;
+  private readonly publicKey: string;
+  private readonly messagingProfileId?: string;
+  private readonly voiceConnectionId?: string;
+
+  constructor(cfg: TelnyxProviderConfig) {
+    this.client = new TelnyxClient({ apiKey: cfg.apiKey, fetchImpl: cfg.fetchImpl });
+    this.publicKey = cfg.publicKey ?? "";
+    this.messagingProfileId = cfg.messagingProfileId;
+    this.voiceConnectionId = cfg.voiceConnectionId;
+  }
+
+  /* --- numbers --- */
+
+  async searchAvailableNumbers(input: {
+    country: string;
+    type?: NumberType;
+    capability?: NumberCapability;
+    areaCode?: string;
+  }): Promise<AvailableNumber[]> {
+    const params = new URLSearchParams();
+    params.set("filter[country_code]", input.country);
+    if (input.capability) params.append("filter[features][]", input.capability);
+    if (input.areaCode) params.set("filter[national_destination_code]", input.areaCode);
+    const res = (await this.client.get(`/available_phone_numbers?${params.toString()}`)) as {
+      data?: Array<{
+        phone_number: string;
+        cost_information?: { monthly_cost?: string; upfront_cost?: string };
+        features?: Array<{ name: string }>;
+      }>;
+    };
+    const type: NumberType = input.type ?? "local";
+    return (res.data ?? []).map((n) => ({
+      e164: n.phone_number,
+      country: input.country,
+      type,
+      capabilities: (n.features ?? [])
+        .map((f) => f.name)
+        .filter((x): x is NumberCapability => x === "sms" || x === "mms" || x === "voice"),
+      setupPriceCents: Math.round(Number(n.cost_information?.upfront_cost ?? "0") * 100),
+      monthlyPriceCents: Math.round(Number(n.cost_information?.monthly_cost ?? "0") * 100),
+    }));
+  }
+
+  async provisionNumber(input: {
+    e164: string;
+    country: string;
+    type: NumberType;
+    capabilities: NumberCapability[];
+  }): Promise<ProvisionedNumber> {
+    const res = (await this.client.post("/number_orders", {
+      phone_numbers: [{ phone_number: input.e164 }],
+      ...(this.messagingProfileId ? { messaging_profile_id: this.messagingProfileId } : {}),
+    })) as { data?: { phone_numbers?: Array<{ id: string; phone_number: string }> } };
+    const pn = res.data?.phone_numbers?.[0];
+    return {
+      e164: input.e164,
+      country: input.country,
+      type: input.type,
+      capabilities: input.capabilities,
+      providerId: pn?.id ?? "",
+    };
+  }
+
+  async releaseNumber(input: { providerId: string }): Promise<void> {
+    await this.client.del(`/phone_numbers/${input.providerId}`);
+  }
+
+  async portInNumber(input: {
+    e164: string;
+    country: string;
+    type: NumberType;
+    capabilities: NumberCapability[];
+  }): Promise<{ providerId: string }> {
+    const res = (await this.client.post("/porting_orders", {
+      phone_numbers: [{ phone_number: input.e164 }],
+    })) as { data?: { id?: string } };
+    return { providerId: res.data?.id ?? "" };
+  }
+
+  /* --- outbound SMS --- */
+
+  async sendSms(input: { from: string; to: string; body: string }): Promise<OutboundSmsResult> {
+    const res = (await this.client.post("/messages", {
+      from: input.from,
+      to: input.to,
+      text: input.body,
+      ...(this.messagingProfileId ? { messaging_profile_id: this.messagingProfileId } : {}),
+    })) as { data?: { id?: string } };
+    return { providerMessageId: res.data?.id ?? "", accepted: Boolean(res.data?.id) };
+  }
+
+  /* --- outbound voice --- */
+
+  async placeCall(input: { from: string; to: string; routing: CallRouting }): Promise<OutboundCallResult> {
+    void input.routing;
+    const res = (await this.client.post("/calls", {
+      to: input.to,
+      from: input.from,
+      ...(this.voiceConnectionId ? { connection_id: this.voiceConnectionId } : {}),
+    })) as { data?: { call_control_id?: string } };
+    return { providerCallId: res.data?.call_control_id ?? "", accepted: Boolean(res.data?.call_control_id) };
+  }
+
+  /* --- inbound webhook parsing --- */
+
+  private requireVerified(rawBody: string, headers: Record<string, string>): Record<string, unknown> {
+    const sig = headers["telnyx-signature-ed25519"] ?? headers["Telnyx-Signature-Ed25519"] ?? "";
+    const ts = headers["telnyx-timestamp"] ?? headers["Telnyx-Timestamp"] ?? "";
+    if (!verifyTelnyxSignature(this.publicKey, sig, ts, rawBody)) {
+      throw new Error("invalid Telnyx webhook signature");
+    }
+    const parsed = JSON.parse(rawBody) as { data?: { payload?: Record<string, unknown> } };
+    return parsed.data?.payload ?? {};
+  }
+
+  parseInboundSms(rawBody: string, headers: Record<string, string>): InboundSmsMessage {
+    const p = this.requireVerified(rawBody, headers);
+    const from = String((p.from as { phone_number?: string })?.phone_number ?? p.from ?? "");
+    const toArr = p.to as Array<{ phone_number?: string }> | undefined;
+    const to = String(toArr?.[0]?.phone_number ?? p.to ?? "");
+    const body = String(p.text ?? "");
+    const upper = body.trim().toUpperCase();
+    const keyword =
+      upper === "STOP" ? "stop" : upper === "START" ? "start" : upper === "HELP" ? "help" : undefined;
+    return {
+      providerMessageId: String(p.id ?? ""),
+      from,
+      to,
+      body,
+      receivedAt: String(p.received_at ?? new Date().toISOString()),
+      keyword,
+    };
+  }
+
+  parseInboundCall(rawBody: string, headers: Record<string, string>): InboundCall {
+    const p = this.requireVerified(rawBody, headers);
+    return {
+      providerCallId: String(p.call_control_id ?? ""),
+      from: String(p.from ?? ""),
+      to: String(p.to ?? ""),
+      receivedAt: String(p.start_time ?? new Date().toISOString()),
+    };
+  }
+
+  parseSmsStatus(rawBody: string, headers: Record<string, string>): SmsStatusUpdate {
+    const p = this.requireVerified(rawBody, headers);
+    const toArr = p.to as Array<{ status?: string }> | undefined;
+    const raw = String(toArr?.[0]?.status ?? "sent");
+    const status: SmsStatusUpdate["status"] =
+      raw === "delivered" ? "delivered"
+      : raw === "sending_failed" || raw === "delivery_failed" ? "failed"
+      : raw === "queued" ? "queued"
+      : raw === "sent" ? "sent"
+      : "undelivered";
+    return { providerMessageId: String(p.id ?? ""), status, at: String(p.completed_at ?? new Date().toISOString()) };
+  }
+
+  parseCallStatus(rawBody: string, headers: Record<string, string>): CallStatusUpdate {
+    const p = this.requireVerified(rawBody, headers);
+    const raw = String(p.state ?? "completed");
+    const status: CallStatusUpdate["status"] =
+      raw === "ringing" ? "ringing"
+      : raw === "answered" || raw === "bridged" ? "in_progress"
+      : raw === "hangup" || raw === "completed" ? "completed"
+      : raw === "busy" ? "busy"
+      : raw === "no-answer" ? "no_answer"
+      : "failed";
+    return {
+      providerCallId: String(p.call_control_id ?? ""),
+      status,
+      durationSec: typeof p.duration_secs === "number" ? p.duration_secs : undefined,
+      at: String(p.occurred_at ?? new Date().toISOString()),
+    };
+  }
+
+  /* --- A2P / 10DLC --- */
+
+  async registerA2pCampaign(input: {
+    brandName: string;
+    useCase: string;
+    sampleMessages: string[];
+  }): Promise<A2pRegistration> {
+    const res = (await this.client.post("/10dlc/campaigns", {
+      brand_name: input.brandName,
+      use_case: input.useCase,
+      sample_messages: input.sampleMessages,
+    })) as { data?: { campaignId?: string; id?: string; status?: string } };
+    const status = res.data?.status;
+    return {
+      campaignId: String(res.data?.campaignId ?? res.data?.id ?? ""),
+      status: status === "approved" ? "approved" : status === "rejected" ? "rejected" : "pending",
+    };
+  }
+
+  /* VoiceAgent methods added in Task A5 */
+}
+
 /** DER SPKI prefix for a raw 32-byte Ed25519 public key. */
 const ED25519_SPKI_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 

@@ -1,6 +1,6 @@
 /* Telnyx telephony — Phase A smoke test (stub + adapter request-building). */
 import { StubTelephonyProvider } from "../src/sms/provider";
-import { TelnyxClient } from "../src/sms/telnyx";
+import { TelnyxClient, TelnyxTelephonyProvider } from "../src/sms/telnyx";
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import { verifyTelnyxSignature } from "../src/sms/telnyx";
 
@@ -79,10 +79,56 @@ async function signatureVerification(): Promise<void> {
   );
 }
 
+function recordingFetch(responses: Record<string, unknown>) {
+  const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+  const f: typeof fetch = (async (url: string, init: RequestInit) => {
+    const method = init?.method ?? "GET";
+    calls.push({ method, url: String(url), body: init?.body ? JSON.parse(String(init.body)) : undefined });
+    const key = `${method} ${new URL(String(url)).pathname.replace("/v2", "")}`;
+    const payload = responses[key] ?? responses[method] ?? {};
+    return new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+  }) as unknown as typeof fetch;
+  return { calls, f };
+}
+
+async function telnyxAdapter(): Promise<void> {
+  console.log("--- Phase A — TelnyxTelephonyProvider ---");
+  const { calls, f } = recordingFetch({
+    "POST /messages": { data: { id: "msg_telnyx_1", to: [{ status: "queued" }] } },
+    "GET /available_phone_numbers": { data: [{ phone_number: "+639170000010", cost_information: { monthly_cost: "1.00", upfront_cost: "0.50" }, features: [{ name: "sms" }, { name: "voice" }] }] },
+    "POST /number_orders": { data: { id: "order_1", phone_numbers: [{ id: "num_telnyx_1", phone_number: "+639170000010" }] } },
+    "POST /calls": { data: { call_control_id: "cc_1" } },
+  });
+  const tp = new TelnyxTelephonyProvider({ apiKey: "KEY", publicKey: "", fetchImpl: f });
+
+  check(tp.live === true, "Telnyx adapter is live");
+  check(tp.label === "Telnyx", "Telnyx adapter label");
+
+  const avail = await tp.searchAvailableNumbers({ country: "PH", capability: "sms" });
+  check(avail.length === 1 && avail[0].e164 === "+639170000010", "searchAvailableNumbers normalizes", avail);
+  check(calls.some((c) => c.url.includes("/available_phone_numbers")), "search hit /available_phone_numbers");
+
+  const sms = await tp.sendSms({ from: "+639170000010", to: "+639998887777", body: "hello" });
+  check(sms.accepted === true && sms.providerMessageId === "msg_telnyx_1", "sendSms normalizes", sms);
+  const sendCall = calls.find((c) => c.url.includes("/messages"));
+  check(
+    (sendCall?.body as { text: string }).text === "hello" && (sendCall?.body as { to: string }).to === "+639998887777",
+    "sendSms posts {to,text}",
+    sendCall?.body,
+  );
+
+  const prov = await tp.provisionNumber({ e164: "+639170000010", country: "PH", type: "local", capabilities: ["sms", "voice"] });
+  check(prov.providerId === "num_telnyx_1", "provisionNumber returns the Telnyx phone-number id", prov);
+
+  const placed = await tp.placeCall({ from: "+639170000010", to: "+639998887777", routing: { action: "forward", destination: "+639111111111" } });
+  check(placed.accepted === true && placed.providerCallId === "cc_1", "placeCall normalizes", placed);
+}
+
 async function main(): Promise<void> {
   await stubVoiceAgent();
   await telnyxClientRequest();
   await signatureVerification();
+  await telnyxAdapter();
   if (failed > 0) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
 }
