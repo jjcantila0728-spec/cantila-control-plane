@@ -16,6 +16,7 @@
     "prisma:deploy": "prisma migrate deploy"
   },
   "dependencies": {
+    "@adyen/api-library": "^17.3.0",
     "@anthropic-ai/sdk": "^0.98.0",
     "@prisma/client": "5.22.0",
     "fastify": "4.28.1",
