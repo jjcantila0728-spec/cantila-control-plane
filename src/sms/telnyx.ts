@@ -308,7 +308,58 @@ export class TelnyxTelephonyProvider implements TelephonyProvider {
     };
   }
 
-  /* VoiceAgent methods added in Task A5 */
+  /* --- AI voice agents --- */
+
+  async createVoiceAgent(input: VoiceAgentConfig): Promise<ProvisionedVoiceAgent> {
+    const res = (await this.client.post("/ai/assistants", {
+      name: input.name,
+      instructions: input.instructions,
+      ...(input.voice ? { voice: input.voice } : {}),
+      ...(input.greeting ? { greeting: input.greeting } : {}),
+      ...(input.tools ? { tools: input.tools.map((t) => ({ type: "webhook", name: t.name, description: t.description, url: t.webhookUrl })) } : {}),
+    })) as { data?: { id?: string; name?: string } };
+    return { agentId: String(res.data?.id ?? ""), name: String(res.data?.name ?? input.name) };
+  }
+
+  async updateVoiceAgent(
+    input: { agentId: string } & Partial<VoiceAgentConfig>,
+  ): Promise<ProvisionedVoiceAgent> {
+    const res = (await this.client.post(`/ai/assistants/${input.agentId}`, {
+      ...(input.name ? { name: input.name } : {}),
+      ...(input.instructions ? { instructions: input.instructions } : {}),
+      ...(input.voice ? { voice: input.voice } : {}),
+      ...(input.greeting ? { greeting: input.greeting } : {}),
+    })) as { data?: { id?: string; name?: string } };
+    return { agentId: input.agentId, name: String(res.data?.name ?? input.name ?? "") };
+  }
+
+  async deleteVoiceAgent(input: { agentId: string }): Promise<void> {
+    await this.client.del(`/ai/assistants/${input.agentId}`);
+  }
+
+  async attachAgentToNumber(input: { agentId: string; e164: string }): Promise<void> {
+    // Bind the assistant as the inbound handler for the number's voice settings.
+    await this.client.post(`/ai/assistants/${input.agentId}/phone_numbers`, {
+      phone_number: input.e164,
+    });
+  }
+
+  parseAgentEvent(rawBody: string, headers: Record<string, string>): VoiceAgentEvent {
+    const p = this.requireVerified(rawBody, headers);
+    const rawKind = String(p.event_type ?? p.kind ?? "");
+    const kind: VoiceAgentEvent["kind"] =
+      rawKind.includes("tool") ? "tool_call"
+      : rawKind.includes("end") || rawKind.includes("hangup") ? "ended"
+      : "transcript";
+    return {
+      agentId: String(p.assistant_id ?? p.agentId ?? ""),
+      callId: String(p.call_control_id ?? p.callId ?? ""),
+      kind,
+      toolName: typeof p.tool_name === "string" ? p.tool_name : undefined,
+      payload: p.payload && typeof p.payload === "object" ? (p.payload as Record<string, unknown>) : undefined,
+      at: String(p.occurred_at ?? new Date().toISOString()),
+    };
+  }
 }
 
 /** DER SPKI prefix for a raw 32-byte Ed25519 public key. */

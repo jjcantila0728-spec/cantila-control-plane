@@ -1,5 +1,5 @@
 /* Telnyx telephony — Phase A smoke test (stub + adapter request-building). */
-import { StubTelephonyProvider } from "../src/sms/provider";
+import { StubTelephonyProvider, createTelephonyProvider } from "../src/sms/provider";
 import { TelnyxClient, TelnyxTelephonyProvider } from "../src/sms/telnyx";
 import { generateKeyPairSync, sign as edSign } from "node:crypto";
 import { verifyTelnyxSignature } from "../src/sms/telnyx";
@@ -124,11 +124,34 @@ async function telnyxAdapter(): Promise<void> {
   check(placed.accepted === true && placed.providerCallId === "cc_1", "placeCall normalizes", placed);
 }
 
+async function telnyxVoiceAgentAndFactory(): Promise<void> {
+  console.log("--- Phase A — Telnyx VoiceAgent + factory ---");
+  const { calls, f } = recordingFetch({
+    "POST /ai/assistants": { data: { id: "assist_1", name: "Bot" } },
+  });
+  const tp = new TelnyxTelephonyProvider({ apiKey: "KEY", publicKey: "", fetchImpl: f });
+  const agent = await tp.createVoiceAgent({ name: "Bot", instructions: "Help." });
+  check(agent.agentId === "assist_1", "Telnyx createVoiceAgent returns assistant id", agent);
+  check(calls.some((c) => c.url.includes("/ai/assistants")), "createVoiceAgent hit /ai/assistants");
+
+  // Factory: no TELNYX_API_KEY → stub
+  delete process.env.TELNYX_API_KEY;
+  const stub = createTelephonyProvider();
+  check(stub.live === false && stub.label === "Stub telephony", "factory returns stub without key", stub.label);
+
+  // Factory: with key → Telnyx
+  process.env.TELNYX_API_KEY = "KEY";
+  const live = createTelephonyProvider();
+  check(live.live === true && live.label === "Telnyx", "factory returns Telnyx with key", live.label);
+  delete process.env.TELNYX_API_KEY;
+}
+
 async function main(): Promise<void> {
   await stubVoiceAgent();
   await telnyxClientRequest();
   await signatureVerification();
   await telnyxAdapter();
+  await telnyxVoiceAgentAndFactory();
   if (failed > 0) { console.error(`\n${failed} check(s) failed`); process.exit(1); }
   console.log("\nall checks passed");
 }

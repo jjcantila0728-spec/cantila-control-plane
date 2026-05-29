@@ -27,6 +27,8 @@
    carrier account exists.
    ============================================================ */
 
+import { TelnyxTelephonyProvider } from "./telnyx";
+
 /* ---------- numbers ---------- */
 
 // The number-type / capability vocabulary is shared with the number
@@ -536,9 +538,19 @@ function parseJson(rawBody: string): Record<string, unknown> {
   }
 }
 
-/** The telephony provider the control plane uses. A production build
- *  selects a carrier-backed adapter here when the carrier/aggregator env
- *  vars are present — exactly the way the Stripe and AI adapters
- *  auto-select on env. */
-export const telephonyProvider: TelephonyProvider =
-  new StubTelephonyProvider();
+/** The telephony provider the control plane uses. Auto-selects on env:
+ *  `TELNYX_API_KEY` present → `TelnyxTelephonyProvider`; absent → the
+ *  stub. Same one-file-swap pattern as `createMailProvider`. */
+export function createTelephonyProvider(): TelephonyProvider {
+  if (process.env.TELNYX_API_KEY) {
+    return new TelnyxTelephonyProvider({
+      apiKey: process.env.TELNYX_API_KEY,
+      publicKey: process.env.TELNYX_PUBLIC_KEY,
+      messagingProfileId: process.env.TELNYX_MESSAGING_PROFILE_ID,
+      voiceConnectionId: process.env.TELNYX_VOICE_CONNECTION_ID,
+    });
+  }
+  return new StubTelephonyProvider();
+}
+
+export const telephonyProvider: TelephonyProvider = createTelephonyProvider();
