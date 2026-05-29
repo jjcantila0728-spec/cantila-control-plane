@@ -13,15 +13,17 @@
    prototype's "any credentials open the Console" behaviour while the
    real IdP wiring is deferred to a production hardening pass.
 
-   The real provider — `OidcSsoProvider` in `./sso-oidc.ts` — implements
-   the same two methods against an IdP: `startLogin` builds the OIDC
-   authorize URL; `completeLogin` exchanges the `code` for tokens at the
-   IdP token endpoint and returns the verified profile. `ssoProvider`
-   below auto-selects it when the `CANTILA_OIDC_*` env vars are present —
-   no call site changes.
+   The real providers — `OidcSsoProvider` (Google, via `./sso-oidc.ts`)
+   and `GitHubOAuthProvider` (`./sso-github.ts`) — implement the same two
+   methods against an IdP: `startLogin` builds the authorize URL;
+   `completeLogin` exchanges the `code` and returns the verified profile.
+   A small **registry** keyed by id (`"google"`, `"github"`) wires each
+   from its `CANTILA_*` env vars at boot, falling back to a labelled
+   `StubSsoProvider` when not configured — no call site changes.
    ============================================================ */
 
-import { OidcSsoProvider } from "./sso-oidc";
+import { googleProviderFromEnv } from "./sso-oidc";
+import { GitHubOAuthProvider } from "./sso-github";
 
 export interface SsoProfile {
   /** Verified email from the identity provider. */
@@ -80,32 +82,58 @@ export class StubSsoProvider implements SsoProvider {
   }
 }
 
-/** Select the SSO provider from the environment. When the full set of
- *  `CANTILA_OIDC_*` vars is present a real `OidcSsoProvider` is wired;
- *  otherwise the network-free `StubSsoProvider` — exactly the way the
- *  Stripe and AI adapters auto-select on env. */
-function selectSsoProvider(): SsoProvider {
+/** Provider ids the Console can request. */
+export type SsoProviderId = "google" | "github";
+
+function githubProviderFromEnv(): GitHubOAuthProvider | null {
   const e = process.env;
   if (
-    e.CANTILA_OIDC_ISSUER &&
-    e.CANTILA_OIDC_AUTHORIZE_URL &&
-    e.CANTILA_OIDC_TOKEN_URL &&
-    e.CANTILA_OIDC_CLIENT_ID &&
-    e.CANTILA_OIDC_CLIENT_SECRET &&
-    e.CANTILA_OIDC_REDIRECT_URI
+    !e.CANTILA_GITHUB_CLIENT_ID ||
+    !e.CANTILA_GITHUB_CLIENT_SECRET ||
+    !e.CANTILA_GITHUB_REDIRECT_URI
   ) {
-    return new OidcSsoProvider({
-      issuer: e.CANTILA_OIDC_ISSUER,
-      authorizeUrl: e.CANTILA_OIDC_AUTHORIZE_URL,
-      tokenUrl: e.CANTILA_OIDC_TOKEN_URL,
-      clientId: e.CANTILA_OIDC_CLIENT_ID,
-      clientSecret: e.CANTILA_OIDC_CLIENT_SECRET,
-      redirectUri: e.CANTILA_OIDC_REDIRECT_URI,
-    });
+    return null;
   }
-  return new StubSsoProvider();
+  return new GitHubOAuthProvider({
+    clientId: e.CANTILA_GITHUB_CLIENT_ID,
+    clientSecret: e.CANTILA_GITHUB_CLIENT_SECRET,
+    redirectUri: e.CANTILA_GITHUB_REDIRECT_URI,
+  });
 }
 
-/** The SSO provider the control plane uses — a real `OidcSsoProvider`
- *  when the OIDC env vars are set, the bundled stub otherwise. */
-export const ssoProvider: SsoProvider = selectSsoProvider();
+/** Build the registry once at boot. A provider with no env config falls
+ *  back to a labelled StubSsoProvider so the dev flow still round-trips
+ *  and the Console can render the button with a "(stub)" badge. */
+function buildRegistry(): Record<SsoProviderId, SsoProvider> {
+  const stub = (label: string): SsoProvider => {
+    const s = new StubSsoProvider();
+    (s as { label: string }).label = label;
+    return s;
+  };
+  return {
+    google: googleProviderFromEnv() ?? stub("Google (stub)"),
+    github: githubProviderFromEnv() ?? stub("GitHub (stub)"),
+  };
+}
+
+const registry = buildRegistry();
+
+/** Look up a provider by id; throws on an unknown id. */
+export function getSsoProvider(id: string): SsoProvider {
+  const p = (registry as Record<string, SsoProvider | undefined>)[id];
+  if (!p) throw new Error(`unknown SSO provider "${id}"`);
+  return p;
+}
+
+/** List the configured providers for the Console login page. */
+export function availableSsoProviders(): Array<{
+  id: SsoProviderId;
+  label: string;
+  live: boolean;
+}> {
+  return (Object.keys(registry) as SsoProviderId[]).map((id) => ({
+    id,
+    label: registry[id].label,
+    live: registry[id].live,
+  }));
+}

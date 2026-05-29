@@ -93,7 +93,11 @@ import { id, now, secret } from "../lib/ids";
 import { getRequestContext } from "../lib/request-context";
 import { decryptSecret, encryptSecret, isEncryptedSecret } from "../lib/secrets";
 import { hashPassword, verifyPassword } from "../auth/passwords";
-import { ssoProvider, type SsoProfile } from "../auth/sso";
+import {
+  getSsoProvider,
+  availableSsoProviders,
+  type SsoProfile,
+} from "../auth/sso";
 import {
   mintOneShotToken,
   parsePresentedToken,
@@ -5208,27 +5212,34 @@ export class ControlPlane {
     };
   }
 
-  /** Which SSO provider is wired — `{label, live}`. The Console login
-   *  page renders this so the "Continue with SSO" button reflects the
-   *  real IdP (or shows the stub). Mirrors `aiInfo` / billing info. */
-  ssoInfo(): { label: string; live: boolean } {
-    return { label: ssoProvider.label, live: ssoProvider.live };
+  /** The configured SSO providers, for the Console login/signup pages.
+   *  Each entry's `live` flag lets the Console badge the bundled stub.
+   *  Mirrors `aiInfo` / billing info. */
+  ssoInfo(): {
+    providers: Array<{ id: string; label: string; live: boolean }>;
+  } {
+    return { providers: availableSsoProviders() };
   }
 
-  /** Begin an SSO login — returns the IdP authorize URL the browser
-   *  should follow. The bundled stub provider round-trips locally. */
-  beginSsoLogin(redirectUri: string): {
-    authorizeUrl: string;
-    provider: string;
-  } {
+  /** Begin an SSO login for a specific provider — returns the IdP
+   *  authorize URL the browser should follow plus the `state` the
+   *  Console persists for the callback CSRF check. The bundled stub
+   *  provider round-trips locally. */
+  beginSsoLogin(
+    provider: string,
+    redirectUri: string,
+  ): { authorizeUrl: string; provider: string; state: string } {
+    const p = getSsoProvider(provider);
     const state = randomBytes(12).toString("hex");
-    const { authorizeUrl } = ssoProvider.startLogin({ redirectUri, state });
-    return { authorizeUrl, provider: ssoProvider.label };
+    const { authorizeUrl } = p.startLogin({ redirectUri, state });
+    return { authorizeUrl, provider: p.label, state };
   }
 
   /** Complete an SSO login from the IdP callback — resolves the verified
-   *  profile, find-or-creates the user, and mints a session. */
+   *  profile for the named provider, find-or-creates the user, and mints
+   *  a session. */
   async loginWithSso(input: {
+    provider: string;
     code?: string;
     email?: string;
   }): Promise<
@@ -5241,7 +5252,7 @@ export class ControlPlane {
   > {
     let profile: SsoProfile;
     try {
-      profile = await ssoProvider.completeLogin(input);
+      profile = await getSsoProvider(input.provider).completeLogin(input);
     } catch (err) {
       return {
         error: err instanceof Error ? err.message : "SSO login failed",

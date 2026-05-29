@@ -2205,10 +2205,12 @@ const registerSchema = z.object({
 });
 
 const ssoStartSchema = z.object({
+  provider: z.enum(["google", "github"]),
   redirectUri: z.string().url(),
 });
 
 const ssoLoginSchema = z.object({
+  provider: z.enum(["google", "github"]),
   code: z.string().optional(),
   email: z.string().optional(),
 });
@@ -2385,8 +2387,8 @@ app.post("/v1/auth/verify-email/confirm", async (request, reply) => {
   return reply.code(200).send(result);
 });
 
-// Which SSO provider is wired (real OIDC vs the bundled stub) — the
-// Console login page renders this on the "Continue with SSO" button.
+// Which SSO providers are wired (real Google/GitHub vs the bundled stub)
+// — the Console login/signup pages render a button per provider.
 app.get("/v1/auth/sso/info", async () => {
   return cp.ssoInfo();
 });
@@ -2397,7 +2399,9 @@ app.post("/v1/auth/sso/start", async (request, reply) => {
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
   }
-  return reply.code(200).send(cp.beginSsoLogin(parsed.data.redirectUri));
+  return reply
+    .code(200)
+    .send(cp.beginSsoLogin(parsed.data.provider, parsed.data.redirectUri));
 });
 
 // Complete an SSO login from the IdP callback.
