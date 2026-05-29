@@ -4871,6 +4871,7 @@ export class ControlPlane {
     name?: string;
     passwordHash?: string;
     accountId?: string;
+    avatarUrl?: string;
   }): Promise<AuthUser> {
     const email = input.email.trim().toLowerCase();
     const existing = await this.deps.store.findUserByEmail(email);
@@ -4892,6 +4893,11 @@ export class ControlPlane {
           });
         }
       }
+      // Refresh the avatar only when we have none on file — never clobber
+      // a value the user may later customise.
+      if (input.avatarUrl && !existing.avatarUrl) {
+        return this.deps.store.setUserAvatarUrl(existing.id, input.avatarUrl);
+      }
       return existing;
     }
     // Create the user with NO legacy account binding — Option B.
@@ -4900,6 +4906,7 @@ export class ControlPlane {
       email,
       name: input.name?.trim() || email.split("@")[0],
       passwordHash: input.passwordHash,
+      avatarUrl: input.avatarUrl,
       twoFactorEnabled: false,
       // accountId left undefined — memberships drive tenancy now.
       accountId: undefined,
@@ -5418,6 +5425,7 @@ export class ControlPlane {
     const user = await this.findOrCreateUser({
       email: profile.email,
       name: profile.name,
+      avatarUrl: profile.avatarUrl,
     });
     const { token, expiresAt } = await this.mintSession(user.id);
     return {
