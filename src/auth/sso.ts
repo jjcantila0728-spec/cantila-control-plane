@@ -91,6 +91,11 @@ export class StubSsoProvider implements SsoProvider {
     email?: string;
     codeVerifier?: string;
   }): Promise<SsoProfile> {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error(
+        "SSO stub is disabled in production — configure a real provider",
+      );
+    }
     const email = (input.email ?? "").trim().toLowerCase();
     if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       throw new Error("a valid email is required for stub SSO login");
