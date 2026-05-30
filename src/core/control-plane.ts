@@ -148,7 +148,8 @@ import {
 } from "../sms/provider";
 import { isComplianceRejection } from "../sms/telnyx";
 import { config } from "../config";
-import * as ghFiles from "../github/github-files";
+import { cantilaOrStubProvider, orgNameForAccount, gitProviderFor, repoRefFor } from "../git/resolve";
+import type { FileNode, FileContent } from "../git/types";
 
 export interface ControlPlaneDeps {
   store: Store;
@@ -6099,13 +6100,24 @@ export class ControlPlane {
   async listProjectFiles(
     projectId: string,
     ref?: string,
-  ): Promise<{ files: ghFiles.FileNode[] } | { error: "no-repo" } | null> {
-    const project = await this.deps.store.getProject(projectId);
+  ): Promise<{ files: FileNode[] } | { error: "no-repo" } | null> {
+    let project = await this.deps.store.getProject(projectId);
     if (!project) return null;
-    const repo = ghFiles.parseRepo(project.repoUrl ?? "");
-    if (!repo) return { error: "no-repo" };
-    const branch = ref || (await ghFiles.getDefaultBranch(repo, config.githubToken));
-    return { files: await ghFiles.listTree(repo, branch, config.githubToken) };
+    if (!project.repoUrl) {
+      const ensured = await this.ensureProjectRepo(projectId);
+      if (!ensured) return null;
+      project = ensured;
+    }
+    const account = await this.deps.store.getAccount(project.accountId);
+    if (!account) return null;
+    let repo;
+    try {
+      repo = repoRefFor(project, account);
+    } catch {
+      return { error: "no-repo" };
+    }
+    const provider = gitProviderFor(project);
+    return { files: await provider.listTree(repo, ref) };
   }
 
   /** Read a single file from the connected repo. */
@@ -6113,13 +6125,24 @@ export class ControlPlane {
     projectId: string,
     path: string,
     ref?: string,
-  ): Promise<ghFiles.FileContent | { error: "no-repo" } | null> {
-    const project = await this.deps.store.getProject(projectId);
+  ): Promise<FileContent | { error: "no-repo" } | null> {
+    let project = await this.deps.store.getProject(projectId);
     if (!project) return null;
-    const repo = ghFiles.parseRepo(project.repoUrl ?? "");
-    if (!repo) return { error: "no-repo" };
-    const branch = ref || (await ghFiles.getDefaultBranch(repo, config.githubToken));
-    return ghFiles.readFile(repo, path, branch, config.githubToken);
+    if (!project.repoUrl) {
+      const ensured = await this.ensureProjectRepo(projectId);
+      if (!ensured) return null;
+      project = ensured;
+    }
+    const account = await this.deps.store.getAccount(project.accountId);
+    if (!account) return null;
+    let repo;
+    try {
+      repo = repoRefFor(project, account);
+    } catch {
+      return { error: "no-repo" };
+    }
+    const provider = gitProviderFor(project);
+    return provider.readFile(repo, path, ref);
   }
 
   /** Create or update a file in the connected repo's default branch. */
@@ -6127,13 +6150,25 @@ export class ControlPlane {
     projectId: string,
     input: { path: string; content: string; sha?: string; message?: string },
   ): Promise<{ commitSha: string; sha: string } | { error: "no-repo" | "no-token" } | null> {
-    const project = await this.deps.store.getProject(projectId);
+    let project = await this.deps.store.getProject(projectId);
     if (!project) return null;
-    const repo = ghFiles.parseRepo(project.repoUrl ?? "");
-    if (!repo) return { error: "no-repo" };
-    if (!config.githubToken) return { error: "no-token" };
-    const branch = await ghFiles.getDefaultBranch(repo, config.githubToken);
-    return ghFiles.writeFile(repo, { ...input, branch }, config.githubToken);
+    if (!project.repoUrl) {
+      const ensured = await this.ensureProjectRepo(projectId);
+      if (!ensured) return null;
+      project = ensured;
+    }
+    const account = await this.deps.store.getAccount(project.accountId);
+    if (!account) return null;
+    let repo;
+    try {
+      repo = repoRefFor(project, account);
+    } catch {
+      return { error: "no-repo" };
+    }
+    if (project.repoHost !== "cantila" && !config.githubToken) return { error: "no-token" };
+    const provider = gitProviderFor(project);
+    const branch = project.branch || (await provider.getDefaultBranch(repo));
+    return provider.writeFile(repo, { ...input, branch });
   }
 
   /** Delete a file in the connected repo's default branch. */
@@ -6141,13 +6176,25 @@ export class ControlPlane {
     projectId: string,
     input: { path: string; sha: string; message?: string },
   ): Promise<{ commitSha: string } | { error: "no-repo" | "no-token" } | null> {
-    const project = await this.deps.store.getProject(projectId);
+    let project = await this.deps.store.getProject(projectId);
     if (!project) return null;
-    const repo = ghFiles.parseRepo(project.repoUrl ?? "");
-    if (!repo) return { error: "no-repo" };
-    if (!config.githubToken) return { error: "no-token" };
-    const branch = await ghFiles.getDefaultBranch(repo, config.githubToken);
-    return ghFiles.deleteFile(repo, { ...input, branch }, config.githubToken);
+    if (!project.repoUrl) {
+      const ensured = await this.ensureProjectRepo(projectId);
+      if (!ensured) return null;
+      project = ensured;
+    }
+    const account = await this.deps.store.getAccount(project.accountId);
+    if (!account) return null;
+    let repo;
+    try {
+      repo = repoRefFor(project, account);
+    } catch {
+      return { error: "no-repo" };
+    }
+    if (project.repoHost !== "cantila" && !config.githubToken) return { error: "no-token" };
+    const provider = gitProviderFor(project);
+    const branch = project.branch || (await provider.getDefaultBranch(repo));
+    return provider.deleteFile(repo, { ...input, branch });
   }
 
   /** Connect a git repository to a project. After this, pushing to the
@@ -6160,6 +6207,36 @@ export class ControlPlane {
    *  it into GitHub/GitLab's webhook config and Cantila uses it to verify
    *  every subsequent payload. Without this gate, anyone who knew a
    *  project id could fire deploys for it. */
+  /** Ensure a project has a usable git repo. GitHub-connected or
+   *  already-provisioned projects are returned as-is; repo-less projects get a
+   *  Cantila (Gitea/stub) repo provisioned + persisted. Idempotent. */
+  async ensureProjectRepo(projectId: string): Promise<Project | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    if (project.repoUrl) return project; // already has a repo
+    // Production safety: never provision via the in-memory StubGitProvider for
+    // real traffic. When GITEA_URL is unset in production there is no durable
+    // Cantila git backend, so leave the project repo-less — the file methods
+    // then surface the existing "no repo connected" state rather than letting
+    // edits vanish into an ephemeral per-process store. (Dev/test still
+    // provision against the stub so native editing is exercisable offline.)
+    if (config.nodeEnv === "production" && !config.giteaUrl) return project;
+    const account = await this.deps.store.getAccount(project.accountId);
+    if (!account) return null;
+    const owner = orgNameForAccount(account);
+    const provider = cantilaOrStubProvider();
+    const { cloneUrl, defaultBranch } = await provider.createRepo({
+      owner,
+      name: project.slug,
+      private: true,
+    });
+    return this.deps.store.updateProject(projectId, {
+      repoUrl: cloneUrl,
+      repoHost: "cantila",
+      branch: defaultBranch,
+    });
+  }
+
   async connectGit(
     projectId: string,
     opts: { repoUrl: string; branch?: string; autoDeploy?: boolean },

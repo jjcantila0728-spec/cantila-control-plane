@@ -379,6 +379,10 @@ model Project {
   minInstances     Int           @default(1)
   maxInstances     Int           @default(1)
   repoUrl       String?
+  /// Which git host backs this project's source: "github" (user-connected
+  /// external repo) or "cantila" (auto-provisioned Gitea repo). Nullable +
+  /// default for rows created before this column.
+  repoHost      String?       @default("github")
   branch        String?
   autoDeploy    Boolean       @default(false)
   /// Per-project HMAC secret for verifying incoming git webhook payloads.

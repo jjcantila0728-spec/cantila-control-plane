@@ -5,10 +5,8 @@
    console workspace file-tree (read-only fallback when no token).
    ============================================================ */
 
-export interface RepoRef {
-  owner: string;
-  repo: string;
-}
+export type { RepoRef, FileNode, FileContent, WriteInput, DeleteInput } from "../git/types";
+import type { RepoRef, FileNode, FileContent, WriteInput, DeleteInput } from "../git/types";
 
 /** Parse an https GitHub repo URL into {owner, repo}, or null. */
 export function parseRepo(repoUrl: string): RepoRef | null {
@@ -27,16 +25,6 @@ export function parseRepo(repoUrl: string): RepoRef | null {
 
 const API = "https://api.github.com";
 
-export interface FileNode {
-  path: string;
-  type: "blob" | "tree";
-  sha: string;
-}
-export interface FileContent {
-  content: string; // decoded UTF-8
-  sha: string;
-  encoding: "utf-8";
-}
 export class GithubError extends Error {
   constructor(
     public status: number,
@@ -118,20 +106,6 @@ export async function readFile(
       ? Buffer.from(data.content, "base64").toString("utf-8")
       : data.content;
   return { content, sha: data.sha, encoding: "utf-8" };
-}
-
-export interface WriteInput {
-  path: string;
-  content: string; // UTF-8 (will be base64-encoded)
-  sha?: string; // required for update; omit for create
-  message?: string;
-  branch: string;
-}
-export interface DeleteInput {
-  path: string;
-  sha: string;
-  message?: string;
-  branch: string;
 }
 
 function encPath(path: string): string {

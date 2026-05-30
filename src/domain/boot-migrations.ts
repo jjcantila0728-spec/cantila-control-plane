@@ -81,6 +81,12 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "User.avatarUrl — profile picture URL captured from social sign-in (Google picture / GitHub avatar_url, plan §5.4). Nullable; legacy rows stay null.",
     sql: 'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "avatarUrl" TEXT;',
   },
+  {
+    id: "20260530010000_add_project_repo_host",
+    description:
+      "Project.repoHost — which git host backs the project's source: \"github\" (user-connected external repo) or \"cantila\" (auto-provisioned Gitea repo). New column WITH a default, so existing rows backfill to 'github'.",
+    sql: `ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "repoHost" TEXT DEFAULT 'github';`,
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.

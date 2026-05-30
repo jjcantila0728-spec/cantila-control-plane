@@ -108,6 +108,7 @@ function toProject(r: DbProject): Project {
     minInstances: r.minInstances,
     maxInstances: r.maxInstances,
     repoUrl: r.repoUrl ?? undefined,
+    repoHost: r.repoHost ?? undefined,
     branch: r.branch ?? undefined,
     autoDeploy: r.autoDeploy,
     webhookSecret: r.webhookSecret ?? undefined,
@@ -449,6 +450,7 @@ export class PrismaStore implements Store {
         minInstances: p.minInstances,
         maxInstances: p.maxInstances,
         repoUrl: p.repoUrl,
+        repoHost: p.repoHost ?? "github",
         branch: p.branch,
         autoDeploy: p.autoDeploy,
         platform: p.platform ?? false,
@@ -483,6 +485,7 @@ export class PrismaStore implements Store {
     if (patch.minInstances !== undefined) data.minInstances = patch.minInstances;
     if (patch.maxInstances !== undefined) data.maxInstances = patch.maxInstances;
     if (patch.repoUrl !== undefined) data.repoUrl = patch.repoUrl;
+    if (patch.repoHost !== undefined) data.repoHost = patch.repoHost;
     if (patch.branch !== undefined) data.branch = patch.branch;
     if (patch.autoDeploy !== undefined) data.autoDeploy = patch.autoDeploy;
     if (patch.webhookSecret !== undefined) data.webhookSecret = patch.webhookSecret;
