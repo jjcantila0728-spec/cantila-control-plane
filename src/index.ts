@@ -641,6 +641,13 @@ const setEnvSchema = z.object({
   scope: z.enum(["production", "preview", "all"]).default("all"),
 });
 
+const writeFileSchema = z.object({
+  path: z.string().min(1),
+  content: z.string(),
+  sha: z.string().optional(),
+  message: z.string().optional(),
+});
+
 const addDomainSchema = z.object({
   hostname: z.string().min(1),
 });
@@ -919,6 +926,60 @@ app.post("/v1/projects/:id/env", async (request, reply) => {
   });
   if (!result) return reply.code(404).send({ error: "project not found" });
   return result;
+});
+
+// ---- Project files (GitHub-backed) ----
+app.get("/v1/projects/:id/files", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { ref } = request.query as { ref?: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.listProjectFiles(id, ref);
+  if (result === null) return reply.code(404).send({ error: "project not found" });
+  if ("error" in result) return reply.code(409).send({ error: result.error });
+  return result;
+});
+
+app.get("/v1/projects/:id/files/content", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { path, ref } = request.query as { path?: string; ref?: string };
+  if (!path) return reply.code(400).send({ error: "path required" });
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.readProjectFile(id, path, ref);
+  if (result === null) return reply.code(404).send({ error: "project not found" });
+  if ("error" in result) return reply.code(409).send({ error: result.error });
+  return result;
+});
+
+app.put("/v1/projects/:id/files/content", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = writeFileSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.flatten() });
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  try {
+    const result = await cp.writeProjectFile(id, parsed.data);
+    if (result === null) return reply.code(404).send({ error: "project not found" });
+    if ("error" in result) return reply.code(409).send({ error: result.error });
+    return result;
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 502;
+    return reply.code(status).send({ error: (err as Error).message });
+  }
+});
+
+app.delete("/v1/projects/:id/files/content", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { path, sha } = request.query as { path?: string; sha?: string };
+  if (!path || !sha) return reply.code(400).send({ error: "path and sha required" });
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  try {
+    const result = await cp.deleteProjectFile(id, { path, sha });
+    if (result === null) return reply.code(404).send({ error: "project not found" });
+    if ("error" in result) return reply.code(409).send({ error: result.error });
+    return result;
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 502;
+    return reply.code(status).send({ error: (err as Error).message });
+  }
 });
 
 // Attach a custom domain (the free *.cantila.app subdomain is added with the project).
