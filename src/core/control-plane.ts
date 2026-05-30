@@ -148,6 +148,7 @@ import {
 } from "../sms/provider";
 import { isComplianceRejection } from "../sms/telnyx";
 import { config } from "../config";
+import { cantilaOrStubProvider, orgNameForAccount } from "../git/resolve";
 import * as ghFiles from "../github/github-files";
 
 export interface ControlPlaneDeps {
@@ -6160,6 +6161,29 @@ export class ControlPlane {
    *  it into GitHub/GitLab's webhook config and Cantila uses it to verify
    *  every subsequent payload. Without this gate, anyone who knew a
    *  project id could fire deploys for it. */
+  /** Ensure a project has a usable git repo. GitHub-connected or
+   *  already-provisioned projects are returned as-is; repo-less projects get a
+   *  Cantila (Gitea/stub) repo provisioned + persisted. Idempotent. */
+  async ensureProjectRepo(projectId: string): Promise<Project | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    if (project.repoUrl) return project; // already has a repo
+    const account = await this.deps.store.getAccount(project.accountId);
+    if (!account) return null;
+    const owner = orgNameForAccount(account);
+    const provider = cantilaOrStubProvider();
+    const { cloneUrl, defaultBranch } = await provider.createRepo({
+      owner,
+      name: project.slug,
+      private: true,
+    });
+    return this.deps.store.updateProject(projectId, {
+      repoUrl: cloneUrl,
+      repoHost: "cantila",
+      branch: defaultBranch,
+    });
+  }
+
   async connectGit(
     projectId: string,
     opts: { repoUrl: string; branch?: string; autoDeploy?: boolean },
