@@ -348,6 +348,9 @@ export interface Project {
   maxInstances: number;
   /** Connected git repo, e.g. https://github.com/owner/name */
   repoUrl?: string;
+  /** Which git host backs this project's source: "github" (user-connected
+   *  external repo) or "cantila" (auto-provisioned Gitea repo). */
+  repoHost?: string | null;
   /** Branch that auto-deploys when a push arrives — default "main". */
   branch?: string;
   /** When true, an incoming push webhook triggers a deploy. */

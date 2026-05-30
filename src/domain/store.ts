@@ -515,8 +515,12 @@ export class InMemoryStore implements Store {
   private domains = new Map<string, Domain>(); //              keyed by id
 
   async createProject(p: Project): Promise<Project> {
-    this.projects.set(p.id, p);
-    return p;
+    // Default the git host to "github" for projects created without one
+    // (mirrors the Prisma column default). A later flow can flip this to
+    // "cantila" via updateProject when a Gitea repo is auto-provisioned.
+    const project: Project = { ...p, repoHost: p.repoHost ?? "github" };
+    this.projects.set(project.id, project);
+    return project;
   }
 
   async listProjects(accountId: string): Promise<Project[]> {
