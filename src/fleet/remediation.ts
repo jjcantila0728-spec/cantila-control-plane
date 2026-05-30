@@ -4,13 +4,7 @@ import { workspaceDir } from "./workspace";
 import { agentDefinitions } from "./roster/agent-defs";
 import { fleetConfig } from "./config";
 import type { OrchestratorEvent } from "../agents/project-orchestrator";
-
-const DISALLOWED = [
-  "Bash(rm:*)", "Bash(sudo:*)", "Bash(mv:*)", "Bash(chmod:*)",
-  "Bash(git push:*)", "Bash(git clone:*)", "Bash(git reset:*)",
-  "Bash(curl:*)", "Bash(wget:*)",
-];
-const ALLOWED = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent"];
+import { ALLOWED_TOOLS, DISALLOWED_BASH } from "./tool-policy";
 
 export interface DeploymentLike {
   id: string;
@@ -63,8 +57,8 @@ export class ClaudeRemediator {
         options: {
           cwd,
           agents: agentDefinitions(),
-          allowedTools: ALLOWED,
-          disallowedTools: DISALLOWED,
+          allowedTools: ALLOWED_TOOLS,
+          disallowedTools: DISALLOWED_BASH,
           permissionMode: "dontAsk",
           maxTurns: cfg.maxAgentSteps * cfg.maxRounds,
           maxBudgetUsd: cfg.maxBudgetUsd,
