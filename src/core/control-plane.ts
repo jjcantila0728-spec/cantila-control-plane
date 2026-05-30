@@ -147,6 +147,8 @@ import {
   type VoiceAgentEvent,
 } from "../sms/provider";
 import { isComplianceRejection } from "../sms/telnyx";
+import { config } from "../config";
+import * as ghFiles from "../github/github-files";
 
 export interface ControlPlaneDeps {
   store: Store;
@@ -6090,6 +6092,62 @@ export class ControlPlane {
     const project = await this.deps.store.getProject(projectId);
     if (!project) return [];
     return this.deps.dataPlane.sampleMetrics(project);
+  }
+
+  /** List the connected repo's file tree for a project.
+   *  null = project not found; {error} = caller-fixable; else data. */
+  async listProjectFiles(
+    projectId: string,
+    ref?: string,
+  ): Promise<{ files: ghFiles.FileNode[] } | { error: "no-repo" } | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    const repo = ghFiles.parseRepo(project.repoUrl ?? "");
+    if (!repo) return { error: "no-repo" };
+    const branch = ref || (await ghFiles.getDefaultBranch(repo, config.githubToken));
+    return { files: await ghFiles.listTree(repo, branch, config.githubToken) };
+  }
+
+  /** Read a single file from the connected repo. */
+  async readProjectFile(
+    projectId: string,
+    path: string,
+    ref?: string,
+  ): Promise<ghFiles.FileContent | { error: "no-repo" } | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    const repo = ghFiles.parseRepo(project.repoUrl ?? "");
+    if (!repo) return { error: "no-repo" };
+    const branch = ref || (await ghFiles.getDefaultBranch(repo, config.githubToken));
+    return ghFiles.readFile(repo, path, branch, config.githubToken);
+  }
+
+  /** Create or update a file in the connected repo's default branch. */
+  async writeProjectFile(
+    projectId: string,
+    input: { path: string; content: string; sha?: string; message?: string },
+  ): Promise<{ commitSha: string; sha: string } | { error: "no-repo" | "no-token" } | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    const repo = ghFiles.parseRepo(project.repoUrl ?? "");
+    if (!repo) return { error: "no-repo" };
+    if (!config.githubToken) return { error: "no-token" };
+    const branch = await ghFiles.getDefaultBranch(repo, config.githubToken);
+    return ghFiles.writeFile(repo, { ...input, branch }, config.githubToken);
+  }
+
+  /** Delete a file in the connected repo's default branch. */
+  async deleteProjectFile(
+    projectId: string,
+    input: { path: string; sha: string; message?: string },
+  ): Promise<{ commitSha: string } | { error: "no-repo" | "no-token" } | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    const repo = ghFiles.parseRepo(project.repoUrl ?? "");
+    if (!repo) return { error: "no-repo" };
+    if (!config.githubToken) return { error: "no-token" };
+    const branch = await ghFiles.getDefaultBranch(repo, config.githubToken);
+    return ghFiles.deleteFile(repo, { ...input, branch }, config.githubToken);
   }
 
   /** Connect a git repository to a project. After this, pushing to the
