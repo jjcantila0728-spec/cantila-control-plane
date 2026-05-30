@@ -1,10 +1,11 @@
 import { rolesByDivision } from "./roster/index";
 import type { FleetSessionRegistry } from "./session-registry";
 import type { AgentSessionStatus } from "./types";
+import { getBudgetGovernor, type BudgetSnapshot } from "./budget";
 
 export interface OrgAgent { id: string; name: string; model: string; description: string; status: AgentSessionStatus; lastAt?: string; }
 export interface OrgDivision { key: string; label: string; agents: OrgAgent[]; }
-export interface AgentOrg { divisions: OrgDivision[]; activeBuilds: number; }
+export interface AgentOrg { divisions: OrgDivision[]; activeBuilds: number; budget: BudgetSnapshot; }
 
 function label(key: string): string { return key.charAt(0).toUpperCase() + key.slice(1).replace(/-/g, " "); }
 
@@ -18,5 +19,5 @@ export function buildAgentOrg(registry: FleetSessionRegistry): AgentOrg {
       status: registry.statusOf(r.id), lastAt: registry.lastAtOf(r.id),
     })),
   }));
-  return { divisions, activeBuilds: registry.activeBuilds() };
+  return { divisions, activeBuilds: registry.activeBuilds(), budget: getBudgetGovernor().snapshot() };
 }

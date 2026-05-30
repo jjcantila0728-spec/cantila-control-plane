@@ -5,6 +5,7 @@ import { agentDefinitions } from "./roster/agent-defs";
 import { fleetConfig } from "./config";
 import type { OrchestratorEvent } from "../agents/project-orchestrator";
 import { ALLOWED_TOOLS, DISALLOWED_BASH } from "./tool-policy";
+import { getBudgetGovernor, type BudgetGovernor } from "./budget";
 
 export interface DeploymentLike {
   id: string;
@@ -24,6 +25,7 @@ export interface ClaudeRemediatorDeps {
   query: QueryFn | null;
   workspaceRoot: string;
   onEvent?: (e: OrchestratorEvent) => void;
+  governor?: BudgetGovernor;
 }
 
 export class ClaudeRemediator {
@@ -32,6 +34,11 @@ export class ClaudeRemediator {
   async remediate(input: { projectId: string; deployment: DeploymentLike }): Promise<RemediationResult> {
     if (!this.deps.query) {
       return { ok: false, detail: "remediation offline — ANTHROPIC_API_KEY not set", filesChanged: 0, diagnosis: "" };
+    }
+    const governor = this.deps.governor ?? getBudgetGovernor();
+    if (!governor.canSpend()) {
+      const s = governor.snapshot();
+      return { ok: false, detail: `daily Claude budget reached ($${s.spentUsd}/$${s.capUsd}) — paused until UTC reset`, filesChanged: 0, diagnosis: "" };
     }
     const cfg = fleetConfig();
     const cwd = workspaceDir(this.deps.workspaceRoot, input.projectId);
@@ -72,8 +79,9 @@ export class ClaudeRemediator {
             if (b.type === "tool_use" && (b.name === "Write" || b.name === "Edit")) filesChanged++;
           }
           this.deps.onEvent?.({ kind: "agent_message", agent: "remediation", content: "(remediating)" });
-        } else if (msg?.type === "result" && msg.is_error) {
-          errored = true;
+        } else if (msg?.type === "result") {
+          if (msg.is_error) errored = true;
+          if (typeof (msg as any).total_cost_usd === "number") governor.record((msg as any).total_cost_usd);
         }
       }
     } catch (err) {

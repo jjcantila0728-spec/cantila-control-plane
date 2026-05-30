@@ -20,3 +20,12 @@ test("agents default to idle status", () => {
   const someAgent = org.divisions.flatMap((d) => d.agents)[0];
   assert.equal(someAgent.status, "idle");
 });
+
+test("buildAgentOrg includes a budget snapshot", () => {
+  const reg = new FleetSessionRegistry();
+  const org = buildAgentOrg(reg);
+  assert.ok(org.budget, "budget present");
+  assert.equal(typeof org.budget.capUsd, "number");
+  assert.equal(typeof org.budget.spentUsd, "number");
+  assert.equal(typeof org.budget.blocked, "boolean");
+});

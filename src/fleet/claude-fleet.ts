@@ -8,11 +8,13 @@ import { mapSdkMessage, type MapCtx } from "./event-map";
 import { FleetSessionRegistry } from "./session-registry";
 import { fleetConfig } from "./config";
 import { ALLOWED_TOOLS, DISALLOWED_BASH } from "./tool-policy";
+import { getBudgetGovernor, type BudgetGovernor } from "./budget";
 
 export interface ClaudeFleetDeps {
   query: QueryFn | null;
   workspaceRoot: string;
   registry: FleetSessionRegistry;
+  governor?: BudgetGovernor;
 }
 
 export class ClaudeFleet {
@@ -38,6 +40,7 @@ export class ClaudeFleet {
 
   private async run(projectId: string, prompt: string, onEvent: OrchestratorEventHandler, result: { name: string; url: string; stack: string }): Promise<void> {
     const cfg = fleetConfig();
+    const governor = this.deps.governor ?? getBudgetGovernor();
     let doneSent = false;
     const emit: OrchestratorEventHandler = (e) => {
       if (e.kind === "done") {
@@ -48,6 +51,12 @@ export class ClaudeFleet {
     };
     if (!this.deps.query) {
       emit({ kind: "agent_message", agent: "orchestrator", content: "Fleet is offline — set ANTHROPIC_API_KEY and install the Claude Agent SDK to run a live build." });
+      emit({ kind: "done" });
+      return;
+    }
+    if (!governor.canSpend()) {
+      const s = governor.snapshot();
+      emit({ kind: "agent_message", agent: "orchestrator", content: `Daily Claude budget reached ($${s.spentUsd}/$${s.capUsd}) — paused until UTC reset.` });
       emit({ kind: "done" });
       return;
     }
@@ -76,6 +85,9 @@ export class ClaudeFleet {
         } as any,
       });
       for await (const msg of stream) {
+        if (msg && (msg as any).type === "result" && typeof (msg as any).total_cost_usd === "number") {
+          governor.record((msg as any).total_cost_usd);
+        }
         for (const ev of mapSdkMessage(msg, ctx)) {
           if (ev.kind === "op_started") this.deps.registry.setAgentStatus(projectId, ev.agent, "working");
           if (ev.kind === "op_finished") this.deps.registry.setAgentStatus(projectId, ev.agent, ev.status === "ok" ? "done" : "failed");
