@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { ClaudeRemediator } from "./remediation";
 import type { QueryFn } from "./sdk";
+import { BudgetGovernor } from "./budget";
 
 const deployment = { id: "dpl_1", status: "failed", createdAt: new Date(0).toISOString(), logs: ["npm ci", "next build", "Error: Module not found: './missing'"] };
 
@@ -55,4 +56,27 @@ test("offline (null query) returns ok=false with an offline message", async () =
   const out = await r.remediate({ projectId: "p1", deployment });
   assert.equal(out.ok, false);
   assert.match(out.detail, /offline|ANTHROPIC/i);
+});
+
+test("remediate is blocked (no query call) when over daily budget", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "rem-"));
+  let calls = 0;
+  const gov = new BudgetGovernor({ capUsd: 1 });
+  gov.record(1);
+  const q = (() => { calls++; return (async function* () {})(); }) as any;
+  const r = new ClaudeRemediator({ query: q, workspaceRoot: root, governor: gov } as any);
+  const out = await r.remediate({ projectId: "p1", deployment });
+  assert.equal(out.ok, false);
+  assert.match(out.detail, /budget/i);
+  assert.equal(calls, 0);
+});
+
+test("remediate records session cost", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "rem-"));
+  const gov = new BudgetGovernor({ capUsd: 100 });
+  const transcript = [{ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "t1", name: "Edit", input: {} }, { type: "text", text: "REMEDIATION_RESULT: ok" }] } }, { type: "result", subtype: "success", is_error: false, total_cost_usd: 0.33 }];
+  const q = (() => async function* () { for (const m of transcript) yield m; })();
+  const r = new ClaudeRemediator({ query: q as any, workspaceRoot: root, governor: gov } as any);
+  await r.remediate({ projectId: "p1", deployment });
+  assert.equal(gov.snapshot().spentUsd, 0.33);
 });
