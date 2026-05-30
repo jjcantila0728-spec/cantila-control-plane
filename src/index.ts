@@ -933,10 +933,18 @@ app.get("/v1/projects/:id/files", async (request, reply) => {
   const { id } = request.params as { id: string };
   const { ref } = request.query as { ref?: string };
   if (!(await assertProjectAccess(request, reply, id))) return;
-  const result = await cp.listProjectFiles(id, ref);
-  if (result === null) return reply.code(404).send({ error: "project not found" });
-  if ("error" in result) return reply.code(409).send({ error: result.error });
-  return result;
+  try {
+    const result = await cp.listProjectFiles(id, ref);
+    if (result === null) return reply.code(404).send({ error: "project not found" });
+    if ("error" in result) return reply.code(409).send({ error: result.error });
+    return result;
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 502;
+    // Treat an upstream GitHub "not found" (e.g. private repo with no/invalid
+    // token) as a 409 so the console shows the "no repo connected" empty state
+    // rather than a hard error.
+    return reply.code(status === 404 ? 409 : status).send({ error: (err as Error).message });
+  }
 });
 
 app.get("/v1/projects/:id/files/content", async (request, reply) => {
@@ -944,10 +952,15 @@ app.get("/v1/projects/:id/files/content", async (request, reply) => {
   const { path, ref } = request.query as { path?: string; ref?: string };
   if (!path) return reply.code(400).send({ error: "path required" });
   if (!(await assertProjectAccess(request, reply, id))) return;
-  const result = await cp.readProjectFile(id, path, ref);
-  if (result === null) return reply.code(404).send({ error: "project not found" });
-  if ("error" in result) return reply.code(409).send({ error: result.error });
-  return result;
+  try {
+    const result = await cp.readProjectFile(id, path, ref);
+    if (result === null) return reply.code(404).send({ error: "project not found" });
+    if ("error" in result) return reply.code(409).send({ error: result.error });
+    return result;
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 502;
+    return reply.code(status).send({ error: (err as Error).message });
+  }
 });
 
 app.put("/v1/projects/:id/files/content", async (request, reply) => {
