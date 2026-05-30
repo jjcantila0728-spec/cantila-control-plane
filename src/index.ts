@@ -9,8 +9,8 @@ import { config } from "./config";
 import { createStore } from "./domain/create-store";
 import { seedOwnerAccount } from "./domain/seed-owner";
 import { seedPlatformProject } from "./domain/seed-platform";
-import { stubProvisioner } from "./dataplane/stub";
 import { selectDataPlane } from "./dataplane/factory";
+import { selectProvisioner } from "./dataplane/coolify-provisioner";
 import { ControlPlane } from "./core/control-plane";
 import type { ApiKey, AccountPlan } from "./domain/types";
 import { now } from "./lib/ids";
@@ -85,6 +85,15 @@ const dataPlaneSelection = selectDataPlane(process.env, { store });
 const dataPlane = dataPlaneSelection.dataPlane;
 console.log(`[dataplane] ${dataPlaneSelection.label} (${dataPlaneSelection.live ? "live" : "stub"})`);
 
+// Service provisioner (plan §4.2 — auto-wired DB/mail). Goes live with a
+// real Coolify Postgres provisioner when the Coolify creds + server/project
+// pair are set; otherwise stays the stub. Mailbox creation stays on the
+// stub regardless (Cantila Mail is a separate backend).
+const provisionerSelection = selectProvisioner(process.env);
+console.log(
+  `[provisioner] ${provisionerSelection.live ? "Coolify (real Postgres)" : "stub"} (${provisionerSelection.live ? "live" : "stub"})`,
+);
+
 // Cantila Automations (plan §4.10) — engine adapter registry. Phase A
 // ships stubs for both kinds; Phase B + D swap in `N8nEngineAdapter` and
 // `OpenClawEngineAdapter` when their env vars are set.
@@ -110,7 +119,7 @@ const readConnectionSecret = async (
 
 const cp = new ControlPlane({
   store,
-  provisioner: stubProvisioner,
+  provisioner: provisionerSelection.provisioner,
   dataPlane,
   stripe,
   aiAnalyser,
@@ -617,6 +626,12 @@ const deploySchema = z.object({
       ref: z.string().optional(),
     })
     .default({ kind: "git" }),
+  // Convenience: connect a git repo as part of the deploy. When set and
+  // the project isn't already pointed at this repo, the deploy connects
+  // it first (equivalent to POST /v1/projects/:id/git) then builds — so a
+  // one-shot "deploy this repo" works without a separate connect call.
+  repoUrl: z.string().url().optional(),
+  branch: z.string().optional(),
 });
 
 const setEnvSchema = z.object({
@@ -774,6 +789,21 @@ app.post("/v1/projects/:id/deploy", async (request, reply) => {
     return reply.code(400).send({ error: parsed.error.flatten() });
   }
   if (!(await assertProjectAccess(request, reply, id))) return;
+  // Optional inline git-connect (see deploySchema.repoUrl). Connect only
+  // when the repo is new or changed so we don't rotate the webhook secret
+  // on every deploy.
+  if (parsed.data.repoUrl) {
+    const existing = await cp.getProject(id);
+    if (existing && existing.repoUrl !== parsed.data.repoUrl) {
+      const connected = await cp.connectGit(id, {
+        repoUrl: parsed.data.repoUrl,
+        branch: parsed.data.branch,
+      });
+      if ("error" in connected) {
+        return reply.code(400).send({ error: connected.error });
+      }
+    }
+  }
   // Dunning gate (plan §8 / §15.2) — block deploys for an account
   // suspended/canceled for non-payment. 402 Payment Required.
   const billingGate = await cp.assertDeployAllowed(id);
@@ -803,6 +833,20 @@ app.post("/v1/projects/:id/deploy/stream", async (request, reply) => {
   // Ownership check BEFORE hijacking the socket — otherwise a 403 turns
   // into a half-open SSE stream the client can't make sense of.
   if (!(await assertProjectAccess(request, reply, id))) return;
+  // Optional inline git-connect (see deploySchema.repoUrl) — done before
+  // the socket is hijacked so a bad repo returns a clean 400.
+  if (parsed.data.repoUrl) {
+    const existing = await cp.getProject(id);
+    if (existing && existing.repoUrl !== parsed.data.repoUrl) {
+      const connected = await cp.connectGit(id, {
+        repoUrl: parsed.data.repoUrl,
+        branch: parsed.data.branch,
+      });
+      if ("error" in connected) {
+        return reply.code(400).send({ error: connected.error });
+      }
+    }
+  }
   // Dunning gate — checked before the socket is hijacked so a blocked
   // deploy returns a clean 402 instead of a half-open SSE stream.
   const billingGate = await cp.assertDeployAllowed(id);

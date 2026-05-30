@@ -140,6 +140,21 @@ export async function runDeploy(
   const project = await store.getProject(input.projectId);
   if (!project) throw new Error(`project not found: ${input.projectId}`);
 
+  // Fail loudly when a git deploy has no source. Without a connected
+  // repository (or an uploaded image) the data plane falls through to an
+  // `nginx:alpine` placeholder and then reports a misleading "live" — the
+  // exact trap that makes a deploy look successful while serving the
+  // default nginx page. Require the caller to connect a repo first
+  // (POST /v1/projects/:id/git, or pass `repoUrl` in the deploy body) or
+  // deploy an uploaded image (`source.kind: "upload"`).
+  if (input.source.kind === "git" && !project.repoUrl) {
+    throw new Error(
+      "no git source connected — connect a repository first " +
+        "(POST /v1/projects/:id/git, or include repoUrl in the deploy body), " +
+        "or deploy an uploaded image, before deploying",
+    );
+  }
+
   const isPreview = Boolean(input.previewBranch);
   const deployment = await store.createDeployment({
     id: id("dpl"),
