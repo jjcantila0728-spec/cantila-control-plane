@@ -48,4 +48,9 @@ export const config = {
   githubToken: process.env.GITHUB_TOKEN ?? "",
   /** owner/repo of the cantila-console repo the SeoAgent commits into. */
   githubRepo: process.env.GITHUB_REPO ?? "",
+  /** Cantila-hosted Gitea base URL (e.g. https://git.cantila.app). Empty →
+   *  the StubGitProvider is used for repoHost="cantila" projects. */
+  giteaUrl: process.env.GITEA_URL ?? "",
+  /** Gitea admin API token used to create orgs/repos and read/write files. */
+  giteaToken: process.env.GITEA_TOKEN ?? "",
 } as const;
