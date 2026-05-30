@@ -391,6 +391,7 @@ export class AgentBrain {
         sms: { observations: 0, actions: 0 },
         automation: { observations: 0, actions: 0 },
         seo: { observations: 0, actions: 0 },
+        remediation: { observations: 0, actions: 0 },
       };
     for (const o of this.observations) stats[o.agent].observations++;
     for (const a of this.actions) stats[a.agent].actions++;

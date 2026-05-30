@@ -7,13 +7,7 @@ import { agentDefinitions } from "./roster/agent-defs";
 import { mapSdkMessage, type MapCtx } from "./event-map";
 import { FleetSessionRegistry } from "./session-registry";
 import { fleetConfig } from "./config";
-
-const DISALLOWED = [
-  "Bash(rm:*)", "Bash(sudo:*)", "Bash(mv:*)", "Bash(chmod:*)",
-  "Bash(git push:*)", "Bash(git clone:*)", "Bash(git reset:*)",
-  "Bash(curl:*)", "Bash(wget:*)",
-];
-const ALLOWED = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent"];
+import { ALLOWED_TOOLS, DISALLOWED_BASH } from "./tool-policy";
 
 export interface ClaudeFleetDeps {
   query: QueryFn | null;
@@ -73,8 +67,8 @@ export class ClaudeFleet {
         options: {
           cwd,
           agents: agentDefinitions(),
-          allowedTools: ALLOWED,
-          disallowedTools: DISALLOWED,
+          allowedTools: ALLOWED_TOOLS,
+          disallowedTools: DISALLOWED_BASH,
           permissionMode: "dontAsk",
           maxTurns: cfg.maxAgentSteps * cfg.maxRounds,
           maxBudgetUsd: cfg.maxBudgetUsd,
