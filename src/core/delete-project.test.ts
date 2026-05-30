@@ -4,7 +4,7 @@
    deleteProjectDatabase removes just the DB + DATABASE_URL.
    ============================================================ */
 
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 
 import { ControlPlane } from "./control-plane";
@@ -12,6 +12,7 @@ import { InMemoryStore } from "../domain/store";
 import { stubProvisioner, stubDataPlane } from "../dataplane/stub";
 import { StubStripeAdapter } from "../billing/stripe";
 import { RuleBasedAiAnalyser } from "../ai/analyser";
+import { mailboxProvisioner } from "../mail/provisioner";
 
 function makeCp(): { cp: ControlPlane; store: InMemoryStore } {
   const store = new InMemoryStore();
@@ -94,4 +95,66 @@ test("deleteProjectDatabase with no database returns an error", async () => {
   const project = await seedProject(cp, store);
   const result = await cp.deleteProjectDatabase(project.id);
   assert.deepEqual(result, { error: "no database on this project" });
+});
+
+test("deleteProject deletes real mailboxes via the provisioner (best-effort)", async () => {
+  const { cp, store } = makeCp();
+  const project = await seedProject(cp, store);
+  const made = await cp.createHostedMailbox({
+    projectId: project.id,
+    address: "hello@example.com",
+  });
+  assert.ok(!("error" in made), "mailbox seed should succeed");
+
+  const spy = mock.method(mailboxProvisioner, "deleteMailbox");
+  try {
+    const result = await cp.deleteProject(project.id);
+    assert.deepEqual(result, { ok: true, slug: project.slug });
+    assert.equal(spy.mock.callCount(), 1);
+    assert.deepEqual(spy.mock.calls[0].arguments, ["hello@example.com"]);
+    assert.equal(
+      (await store.listHostedMailboxesByProject(project.id)).length,
+      0,
+    );
+  } finally {
+    spy.mock.restore();
+  }
+});
+
+test("deleteProject still succeeds when mailbox teardown throws", async () => {
+  const { cp, store } = makeCp();
+  const project = await seedProject(cp, store);
+  await cp.createHostedMailbox({ projectId: project.id, address: "x@example.com" });
+
+  const spy = mock.method(mailboxProvisioner, "deleteMailbox", async () => {
+    throw new Error("mailcow down");
+  });
+  try {
+    const result = await cp.deleteProject(project.id);
+    assert.deepEqual(result, { ok: true, slug: project.slug });
+    assert.equal(await store.getProject(project.id), null);
+  } finally {
+    spy.mock.restore();
+  }
+});
+
+test("deleteProject releases the project's SMS number", async () => {
+  const { cp, store } = makeCp();
+  const project = await seedProject(cp, store);
+  const phone = await cp.activateSms("acc_test", project.id, {
+    country: "US",
+    numberType: "local",
+  });
+  assert.ok(!("error" in phone), "SMS activation should succeed");
+  const stored = await store.getPhoneNumberByProject(project.id);
+  assert.ok(stored?.marketplaceNumberId, "number linked to a marketplace row");
+  const mpId = stored!.marketplaceNumberId!;
+
+  const result = await cp.deleteProject(project.id);
+  assert.deepEqual(result, { ok: true, slug: project.slug });
+
+  // Project number row is gone (cascade) and the carrier lease was released.
+  assert.equal(await store.getPhoneNumberByProject(project.id), null);
+  const mp = await store.getMarketplaceNumber(mpId);
+  assert.equal(mp?.status, "released");
 });

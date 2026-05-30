@@ -8555,6 +8555,29 @@ export class ControlPlane {
       }
     }
 
+    // Tear down the real hosted mailboxes in the MTA (best-effort). The
+    // record cascade below removes the rows regardless; this releases the
+    // actual Mailcow mailboxes so deleting a project leaves no live inbox.
+    const mailboxes =
+      await this.deps.store.listHostedMailboxesByProject(projectId);
+    for (const mb of mailboxes) {
+      try {
+        await mailboxProvisioner.deleteMailbox(mb.address);
+      } catch {
+        /* swallow — a stale/already-gone mailbox must not block removal */
+      }
+    }
+
+    // Release the project's carrier number + stop its billing (best-effort).
+    // deactivateSms releases the lease, stops Stripe billing, and strips the
+    // SMS env; it is a no-op when the project has no number. Swallow failures
+    // so a stuck number never blocks project removal.
+    try {
+      await this.deactivateSms(project.accountId, projectId);
+    } catch {
+      /* swallow */
+    }
+
     const removed = await this.deps.store.deleteProject(projectId);
     if (!removed) return { error: "project not found" };
 
