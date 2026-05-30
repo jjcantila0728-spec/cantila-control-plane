@@ -5,6 +5,15 @@ import { ownerAccountId } from "../lib/owner-account";
 import type { DeploymentLike, RemediationResult } from "../fleet/remediation";
 
 const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+const AUTO_WINDOW_MS = 60 * 60 * 1000;
+
+export type RemediationMode = "off" | "propose" | "auto";
+
+/** Read the remediation mode from env. Default "propose" (auto-apply is opt-in). */
+export function remediationMode(): RemediationMode {
+  const m = (process.env.FLEET_REMEDIATION || "propose").toLowerCase();
+  return m === "off" || m === "auto" ? m : "propose";
+}
 
 /** Minimal remediator surface (the real one is fleet/remediation.ClaudeRemediator). */
 export interface Remediator {
@@ -15,22 +24,25 @@ export interface RemediationAgentDeps {
   remediator: Remediator;
   /** Owner account to scan. Defaults to ownerAccountId(). */
   accountId?: string;
+  mode?: RemediationMode;
 }
 
 export class RemediationAgent implements Agent {
   readonly name = "remediation" as const;
-  private readonly account: string;
   /** Deployment ids already remediated this process — prevents re-proposing
    *  (and re-running an expensive session) for the same failure each tick. */
   private addressed = new Set<string>();
+  private readonly account: string;
+  private readonly mode: RemediationMode;
 
   constructor(private deps: RemediationAgentDeps) {
     this.account = deps.accountId ?? ownerAccountId();
+    this.mode = deps.mode ?? remediationMode();
   }
 
-  private async recentFailures(cp: ControlPlane): Promise<Array<{ projectId: string; projectName: string; deployment: DeploymentLike }>> {
+  private async recentFailures(cp: ControlPlane, windowMs: number): Promise<Array<{ projectId: string; projectName: string; deployment: DeploymentLike }>> {
     const projects = await cp.listProjects(this.account);
-    const since = Date.now() - RECENT_WINDOW_MS;
+    const since = Date.now() - windowMs;
     const out: Array<{ projectId: string; projectName: string; deployment: DeploymentLike }> = [];
     for (const project of projects) {
       const deploys = (await cp.listProjectDeployments(project.id)) as unknown as DeploymentLike[];
@@ -43,7 +55,7 @@ export class RemediationAgent implements Agent {
   }
 
   async observe(cp: ControlPlane): Promise<Observation[]> {
-    const fails = await this.recentFailures(cp);
+    const fails = await this.recentFailures(cp, RECENT_WINDOW_MS);
     return fails.map((f) => ({
       at: now(),
       agent: this.name,
@@ -54,22 +66,28 @@ export class RemediationAgent implements Agent {
   }
 
   async propose(cp: ControlPlane): Promise<Proposal[]> {
-    const fails = await this.recentFailures(cp);
+    if (this.mode === "off") return [];
+
+    const windowMs = this.mode === "auto" ? AUTO_WINDOW_MS : RECENT_WINDOW_MS;
+    const fails = await this.recentFailures(cp, windowMs);
     const out: Proposal[] = [];
     for (const f of fails) {
       if (this.addressed.has(f.deployment.id)) continue;
       this.addressed.add(f.deployment.id);
       const deployment = f.deployment;
       const projectId = f.projectId;
+      const isAuto = this.mode === "auto";
       out.push({
         id: `prop_remediate_${deployment.id}`,
         at: now(),
         agent: this.name,
         kind: "claude_code_fix",
         title: `${f.projectName}: auto-diagnose + prepare a fix`,
-        body: `Deployment ${deployment.id} failed. A bounded Claude Code session will diagnose the logs, fix the project workspace, and confirm it builds. The fix is prepared only — redeploying stays a separate, human-approved step.`,
+        body: isAuto
+          ? `Deployment ${deployment.id} failed. A bounded Claude Code session will diagnose the logs, fix the project workspace, and confirm it builds. The fix is prepared only — redeploying stays a separate, human-approved step.`
+          : `Deployment ${deployment.id} failed. Approve to run a bounded Claude Code session that diagnoses the logs and prepares a fix in the project workspace (no production changes).`,
         confidence: "high",
-        actionClass: "safe",
+        actionClass: isAuto ? "safe" : "destructive",
         projectId,
         hints: [{ label: "Inspect", hint: `cantila troubleshoot ${projectId} ${deployment.id}` }],
         execute: async (_cp: ControlPlane) => {
