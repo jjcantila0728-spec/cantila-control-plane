@@ -46,3 +46,26 @@ test("offline (null query) emits a message + done, no fake success", async () =>
   assert.equal(events.at(-1)!.kind, "done");
   assert.ok(!events.some((e) => e.kind === "result"));
 });
+
+test("stream ending without a result message still emits exactly one done", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "cf-"));
+  const events: OrchestratorEvent[] = [];
+  const q = (() => async function* () {
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "working" }] } };
+    // stream ends with NO result message
+  })();
+  const fleet = new ClaudeFleet({ query: q as any, workspaceRoot: root, registry: new FleetSessionRegistry() });
+  await fleet.build({ projectId: "p3", plan, onEvent: (e) => events.push(e) });
+  const dones = events.filter((e) => e.kind === "done");
+  assert.equal(dones.length, 1, "exactly one done");
+});
+
+test("query that throws emits error then exactly one done", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "cf-"));
+  const events: OrchestratorEvent[] = [];
+  const q = (() => async function* () { throw new Error("boom"); })();
+  const fleet = new ClaudeFleet({ query: q as any, workspaceRoot: root, registry: new FleetSessionRegistry() });
+  await fleet.build({ projectId: "p4", plan, onEvent: (e) => events.push(e) });
+  assert.ok(events.some((e) => e.kind === "error"));
+  assert.equal(events.filter((e) => e.kind === "done").length, 1);
+});

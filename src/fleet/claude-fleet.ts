@@ -9,7 +9,9 @@ import { FleetSessionRegistry } from "./session-registry";
 import { fleetConfig } from "./config";
 
 const DISALLOWED = [
-  "Bash(rm:*)", "Bash(sudo:*)", "Bash(git push:*)", "Bash(curl:*)", "Bash(wget:*)",
+  "Bash(rm:*)", "Bash(sudo:*)", "Bash(mv:*)", "Bash(chmod:*)",
+  "Bash(git push:*)", "Bash(git clone:*)", "Bash(git reset:*)",
+  "Bash(curl:*)", "Bash(wget:*)",
 ];
 const ALLOWED = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent"];
 
@@ -42,14 +44,22 @@ export class ClaudeFleet {
 
   private async run(projectId: string, prompt: string, onEvent: OrchestratorEventHandler, result: { name: string; url: string; stack: string }): Promise<void> {
     const cfg = fleetConfig();
+    let doneSent = false;
+    const emit: OrchestratorEventHandler = (e) => {
+      if (e.kind === "done") {
+        if (doneSent) return;
+        doneSent = true;
+      }
+      onEvent(e);
+    };
     if (!this.deps.query) {
-      onEvent({ kind: "agent_message", agent: "orchestrator", content: "Fleet is offline — set ANTHROPIC_API_KEY and install the Claude Agent SDK to run a live build." });
-      onEvent({ kind: "done" });
+      emit({ kind: "agent_message", agent: "orchestrator", content: "Fleet is offline — set ANTHROPIC_API_KEY and install the Claude Agent SDK to run a live build." });
+      emit({ kind: "done" });
       return;
     }
     if (this.inFlight >= cfg.maxConcurrentBuilds) {
-      onEvent({ kind: "agent_message", agent: "orchestrator", content: "Fleet is at capacity; queued. Try again shortly." });
-      onEvent({ kind: "done" });
+      emit({ kind: "agent_message", agent: "orchestrator", content: "Fleet is at capacity; queued. Try again shortly." });
+      emit({ kind: "done" });
       return;
     }
     this.inFlight++;
@@ -75,15 +85,15 @@ export class ClaudeFleet {
         for (const ev of mapSdkMessage(msg, ctx)) {
           if (ev.kind === "op_started") this.deps.registry.setAgentStatus(projectId, ev.agent, "working");
           if (ev.kind === "op_finished") this.deps.registry.setAgentStatus(projectId, ev.agent, ev.status === "ok" ? "done" : "failed");
-          onEvent(ev);
+          emit(ev);
         }
       }
     } catch (err) {
-      onEvent({ kind: "error", error: err instanceof Error ? err.message : "fleet run failed" });
-      onEvent({ kind: "done" });
+      emit({ kind: "error", error: err instanceof Error ? err.message : "fleet run failed" });
     } finally {
       this.inFlight--;
       this.deps.registry.endBuild(projectId);
+      emit({ kind: "done" });
     }
   }
 }
