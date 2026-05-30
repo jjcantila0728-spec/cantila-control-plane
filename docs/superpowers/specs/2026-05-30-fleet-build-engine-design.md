@@ -1,7 +1,11 @@
 # Cantila Fleet Build Engine — Design
 
 **Date:** 2026-05-30
-**Status:** Approved (brainstorming) → ready for implementation plan
+**Status:** ⛔ SUPERSEDED by `2026-05-30-phase1-claude-code-fleet-design.md`. After approval, the
+direction changed to "all agents live, powered by Claude Code" (Claude Agent SDK) as part of the
+Cantila agent-organization north-star. The hand-rolled Anthropic-SDK tool-use engine below is
+replaced by an SDK-backed engine. Tasks 1–4 of its plan (config/types/workspace/memory) were built
+and survive; the runner/orchestrator/skill tasks are dropped. Kept for history.
 **Scope (slice 1):** A real, server-side multi-agent build engine in the control-plane that
 replaces the *simulated* internals of `ProjectOrchestrator`, wiring **all 78 AgentFleet agents**
 into Cantila's chat → project-builder flow. Produces **real files** in a per-project workspace,
