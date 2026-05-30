@@ -6214,6 +6214,13 @@ export class ControlPlane {
     const project = await this.deps.store.getProject(projectId);
     if (!project) return null;
     if (project.repoUrl) return project; // already has a repo
+    // Production safety: never provision via the in-memory StubGitProvider for
+    // real traffic. When GITEA_URL is unset in production there is no durable
+    // Cantila git backend, so leave the project repo-less — the file methods
+    // then surface the existing "no repo connected" state rather than letting
+    // edits vanish into an ephemeral per-process store. (Dev/test still
+    // provision against the stub so native editing is exercisable offline.)
+    if (config.nodeEnv === "production" && !config.giteaUrl) return project;
     const account = await this.deps.store.getAccount(project.accountId);
     if (!account) return null;
     const owner = orgNameForAccount(account);
