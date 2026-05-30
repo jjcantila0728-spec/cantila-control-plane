@@ -43,12 +43,14 @@ export class GithubError extends Error {
     message: string,
   ) {
     super(message);
+    this.name = "GithubError";
   }
 }
 
 function headers(token: string): Record<string, string> {
   const h: Record<string, string> = {
     accept: "application/vnd.github+json",
+    "content-type": "application/json",
     "user-agent": "cantila-console",
     "x-github-api-version": "2022-11-28",
   };
@@ -87,7 +89,10 @@ export async function listTree(
   token: string,
 ): Promise<FileNode[]> {
   const data = await gh<{ tree: { path: string; type: string; sha: string }[] }>(
-    `${API}/repos/${ref.owner}/${ref.repo}/git/trees/${encodeURIComponent(branch)}?recursive=1`,
+    `${API}/repos/${ref.owner}/${ref.repo}/git/trees/${branch
+      .split("/")
+      .map(encodeURIComponent)
+      .join("/")}?recursive=1`,
     token,
   );
   return data.tree
