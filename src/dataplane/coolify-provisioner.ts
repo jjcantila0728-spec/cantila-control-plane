@@ -137,6 +137,24 @@ export class CoolifyServiceProvisioner implements ServiceProvisioner {
     return this.mailbox.createMailbox(project);
   }
 
+  async destroyDatabase(connectionUri: string): Promise<void> {
+    const uuid = coolifyDbUuidFromUri(connectionUri);
+    // Stub / unknown URIs (e.g. the dotted `db-x.int.cantila.cloud` host)
+    // have no Coolify resource behind them — nothing to delete.
+    if (!uuid) return;
+    await this.request(
+      "DELETE",
+      `/databases/${encodeURIComponent(uuid)}?cleanup=true`,
+      undefined,
+      {
+        apiUrl: this.defaultApiUrl,
+        apiToken: this.defaultApiToken,
+        serverUuid: this.serverUuid,
+        projectUuid: this.projectUuid,
+      },
+    );
+  }
+
   private async request<T = unknown>(
     method: "GET" | "POST" | "PATCH" | "DELETE",
     path: string,
@@ -161,6 +179,21 @@ export class CoolifyServiceProvisioner implements ServiceProvisioner {
     }
     if (res.status === 204) return {} as T;
     return (await res.json()) as T;
+  }
+}
+
+/** Extract the Coolify database uuid from a connection URI. Coolify's
+ *  `internal_db_url` uses the DB container's uuid as the host
+ *  (`postgres://postgres:pw@<uuid>:5432/postgres`), so the uuid is just
+ *  the hostname. Returns null for stub URIs (dotted `*.int.cantila.cloud`
+ *  hosts) and anything unparseable — the caller then skips Coolify
+ *  teardown. */
+export function coolifyDbUuidFromUri(uri: string): string | null {
+  try {
+    const host = new URL(uri).hostname;
+    return /^[a-z0-9]{16,}$/.test(host) ? host : null;
+  } catch {
+    return null;
   }
 }
 

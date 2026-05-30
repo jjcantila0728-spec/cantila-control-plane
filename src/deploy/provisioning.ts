@@ -29,6 +29,11 @@ export interface ServiceProvisioner {
     smtpUser: string;
     smtpPassword: string;
   }>;
+  /** Tear down a previously-provisioned database. Optional — the stub
+   *  omits it (no real backend); the Coolify provisioner deletes the
+   *  underlying managed Postgres identified by its connection URI.
+   *  Best-effort by contract. */
+  destroyDatabase?(connectionUri: string): Promise<void>;
 }
 
 export interface ProvisionResult {

@@ -277,6 +277,58 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
       },
     },
 
+    /* ---------- cantila_delete_project ---------- */
+    {
+      name: "cantila_delete_project",
+      description:
+        "Permanently delete a Cantila project — tears down its app and managed database and removes all of its data. This cannot be undone.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          projectId: {
+            type: "string",
+            description: "The Cantila project id to delete.",
+          },
+        },
+        required: ["projectId"],
+      },
+      handler: async (args) => {
+        const projectId = String(args.projectId ?? "");
+        if (!projectId) return errorText("projectId is required.");
+        const result = await cp.deleteProject(projectId);
+        if ("error" in result) return errorText(result.error);
+        return text(
+          `Deleted project ${result.slug} (${projectId}) — app and database torn down.`,
+        );
+      },
+    },
+
+    /* ---------- cantila_delete_database ---------- */
+    {
+      name: "cantila_delete_database",
+      description:
+        "Delete a Cantila project's managed database — tears down the Postgres and strips DATABASE_URL. The app is left in place; re-provision later with cantila_provision_db.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          projectId: {
+            type: "string",
+            description: "The Cantila project id.",
+          },
+        },
+        required: ["projectId"],
+      },
+      handler: async (args) => {
+        const projectId = String(args.projectId ?? "");
+        if (!projectId) return errorText("projectId is required.");
+        const result = await cp.deleteProjectDatabase(projectId);
+        if ("error" in result) return errorText(result.error);
+        return text(
+          `Deleted the database on ${projectId} — DATABASE_URL removed. Re-provision with cantila_provision_db.`,
+        );
+      },
+    },
+
     /* ---------- cantila_add_domain ---------- */
     {
       name: "cantila_add_domain",

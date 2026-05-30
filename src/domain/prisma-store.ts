@@ -506,6 +506,19 @@ export class PrismaStore implements Store {
     return rows.map(toProject);
   }
 
+  async deleteProject(id: string): Promise<boolean> {
+    // FK relations (database, mailbox, domains, env vars, deployments,
+    // phone number, …) all declare `onDelete: Cascade`, so deleting the
+    // project row removes them too. Append-only audit logs (ActivityEvent
+    // etc.) have no FK relation and are intentionally retained.
+    try {
+      await this.db.project.delete({ where: { id } });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /* ----- managed database ----- */
 
   async getDatabaseByProject(
@@ -531,6 +544,15 @@ export class PrismaStore implements Store {
       },
     });
     return toDatabase(row);
+  }
+
+  async deleteDatabase(projectId: string): Promise<boolean> {
+    try {
+      await this.db.managedDatabase.delete({ where: { projectId } });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /* ----- mailbox ----- */

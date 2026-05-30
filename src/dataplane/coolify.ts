@@ -292,6 +292,23 @@ export class CoolifyDataPlane implements DataPlane {
     );
   }
 
+  async destroyApp(project: Project): Promise<void> {
+    const region = this.regionFor(project);
+    const uuid = await this.findAppUuid(project);
+    if (!uuid) return; // nothing provisioned (or already gone) — no-op.
+    // Delete the Coolify Application, cleaning up its container, volumes
+    // and Traefik route. `cleanup=true` removes attached configurations.
+    await this.request(
+      "DELETE",
+      `/applications/${encodeURIComponent(uuid)}?cleanup=true`,
+      undefined,
+      region,
+    );
+    // Drop the cache entry so a re-created project with the same id
+    // doesn't resolve to the deleted app uuid.
+    this.appUuids.delete(project.id);
+  }
+
   async route(project: Project): Promise<{ url: string }> {
     // Match the Cantila URL convention (plan §4.2 / §7.4) — the same shape
     // the Console and CLI assume everywhere. The user must wire

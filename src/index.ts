@@ -3760,6 +3760,32 @@ app.post("/v1/projects/:id/database", async (request, reply) => {
   return reply.code(201).send(result);
 });
 
+// Delete a project's managed database — tears down the Coolify Postgres,
+// removes the row, and strips the injected DATABASE_URL.
+app.delete("/v1/projects/:id/database", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.deleteProjectDatabase(id);
+  if ("error" in result) {
+    return reply
+      .code(result.error === "project not found" ? 404 : 400)
+      .send({ error: result.error });
+  }
+  return reply.code(200).send(result);
+});
+
+// Delete a project entirely — tears down its app + database on the data
+// plane, then removes the project and every FK-related row.
+app.delete("/v1/projects/:id", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.deleteProject(id);
+  if ("error" in result) {
+    return reply.code(404).send({ error: result.error });
+  }
+  return reply.code(200).send(result);
+});
+
 /* ----- boot ----- */
 
 // ----- cantilapay (plan §25 — the 12th product surface) -----

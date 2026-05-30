@@ -130,9 +130,15 @@ export interface Store {
   getProject(id: string): Promise<Project | null>;
   updateProject(id: string, patch: Partial<Project>): Promise<Project>;
   listProjects(accountId: string): Promise<Project[]>;
+  /** Delete a project and every FK-related row (database, mailbox,
+   *  domains, env vars, deployments, phone number). Returns false when
+   *  the project doesn't exist. */
+  deleteProject(id: string): Promise<boolean>;
 
   getDatabaseByProject(projectId: string): Promise<ManagedDatabase | null>;
   createDatabase(d: ManagedDatabase): Promise<ManagedDatabase>;
+  /** Delete a project's managed database row. Returns false when none. */
+  deleteDatabase(projectId: string): Promise<boolean>;
 
   getMailboxByProject(projectId: string): Promise<Mailbox | null>;
   createMailbox(m: Mailbox): Promise<Mailbox>;
@@ -531,6 +537,32 @@ export class InMemoryStore implements Store {
     return updated;
   }
 
+  async deleteProject(id: string): Promise<boolean> {
+    if (!this.projects.has(id)) return false;
+    // Cascade every project-scoped collection — mirrors the Prisma
+    // schema's `onDelete: Cascade` so both stores behave identically.
+    this.projects.delete(id);
+    this.databases.delete(id);
+    this.mailboxes.delete(id);
+    this.phoneNumbers.delete(id);
+    for (const [mapId, v] of this.envVars) {
+      if (v.projectId === id) this.envVars.delete(mapId);
+    }
+    for (const [mapId, d] of this.deployments) {
+      if (d.projectId === id) this.deployments.delete(mapId);
+    }
+    for (const [mapId, d] of this.domains) {
+      if (d.projectId === id) this.domains.delete(mapId);
+    }
+    for (const [mapId, m] of this.hostedMailboxes) {
+      if (m.projectId === id) this.hostedMailboxes.delete(mapId);
+    }
+    for (const [mapId, a] of this.mailAliases) {
+      if (a.projectId === id) this.mailAliases.delete(mapId);
+    }
+    return true;
+  }
+
   async getDatabaseByProject(
     projectId: string,
   ): Promise<ManagedDatabase | null> {
@@ -540,6 +572,10 @@ export class InMemoryStore implements Store {
   async createDatabase(d: ManagedDatabase): Promise<ManagedDatabase> {
     this.databases.set(d.projectId, d);
     return d;
+  }
+
+  async deleteDatabase(projectId: string): Promise<boolean> {
+    return this.databases.delete(projectId);
   }
 
   async getMailboxByProject(projectId: string): Promise<Mailbox | null> {

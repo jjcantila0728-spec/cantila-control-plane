@@ -47,6 +47,12 @@ export interface DataPlane {
    *  data plane synthesises this from project state, the real one will
    *  read Docker / kube stats + the LB's request counters. */
   sampleMetrics(project: Project): Promise<ProjectMetricSample[]>;
+  /** Tear down the project's running app on the data plane. Optional —
+   *  the stub omits it (nothing real to remove); the Coolify data plane
+   *  deletes the underlying Application. Best-effort by contract: callers
+   *  treat a failure as non-fatal so a stale Coolify app never blocks
+   *  removing the Cantila project. */
+  destroyApp?(project: Project): Promise<void>;
 }
 
 /** Emitted once for each pipeline step as it completes. The HTTP SSE

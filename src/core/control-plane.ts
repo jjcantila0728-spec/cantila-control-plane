@@ -8524,4 +8524,78 @@ export class ControlPlane {
     );
     return maskDatabase(created) as ManagedDatabase;
   }
+
+  /** Delete a project: tear down its Coolify app + managed database
+   *  (best-effort on both), then remove the project and every FK-related
+   *  row. Returns `{ ok, slug }` or `{ error }`. */
+  async deleteProject(
+    projectId: string,
+  ): Promise<{ ok: true; slug: string } | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+
+    // Tear down the running app on the data plane (DELETE the Coolify
+    // Application). Best-effort — a stale or already-gone app must not
+    // block removing the Cantila project.
+    if (this.deps.dataPlane.destroyApp) {
+      try {
+        await this.deps.dataPlane.destroyApp(project);
+      } catch {
+        /* swallow — the project row is removed regardless */
+      }
+    }
+
+    // Tear down the managed database (DELETE the Coolify Postgres).
+    const db = await this.deps.store.getDatabaseByProject(projectId);
+    if (db && this.deps.provisioner.destroyDatabase) {
+      try {
+        await this.deps.provisioner.destroyDatabase(db.connectionUri);
+      } catch {
+        /* swallow */
+      }
+    }
+
+    const removed = await this.deps.store.deleteProject(projectId);
+    if (!removed) return { error: "project not found" };
+
+    await this.recordEvent(
+      project.accountId,
+      "system",
+      `Project ${project.name} deleted`,
+      `${project.slug} · ${project.region}`,
+      projectId,
+    );
+    return { ok: true, slug: project.slug };
+  }
+
+  /** Delete a project's managed database: tear down the Coolify Postgres
+   *  (best-effort), remove the database row, and strip the injected
+   *  DATABASE_URL so a later re-provision starts clean. */
+  async deleteProjectDatabase(
+    projectId: string,
+  ): Promise<{ ok: true } | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+    const db = await this.deps.store.getDatabaseByProject(projectId);
+    if (!db) return { error: "no database on this project" };
+
+    if (this.deps.provisioner.destroyDatabase) {
+      try {
+        await this.deps.provisioner.destroyDatabase(db.connectionUri);
+      } catch {
+        /* swallow */
+      }
+    }
+    await this.deps.store.deleteDatabase(projectId);
+    await this.deps.store.deleteEnvVar(projectId, "DATABASE_URL");
+
+    await this.recordEvent(
+      project.accountId,
+      "database",
+      `Database deleted on ${project.name}`,
+      `${db.engine} · ${db.region}`,
+      projectId,
+    );
+    return { ok: true };
+  }
 }
