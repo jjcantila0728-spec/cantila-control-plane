@@ -6,6 +6,7 @@ import path from "node:path";
 import { ClaudeFleet } from "./claude-fleet";
 import { FleetSessionRegistry } from "./session-registry";
 import type { OrchestratorEvent } from "../agents/project-orchestrator";
+import { BudgetGovernor } from "./budget";
 
 const plan = { name: "shop", stack: "Next.js", summary: "a shop", kind: "live_app" } as any;
 
@@ -68,4 +69,28 @@ test("query that throws emits error then exactly one done", async () => {
   await fleet.build({ projectId: "p4", plan, onEvent: (e) => events.push(e) });
   assert.ok(events.some((e) => e.kind === "error"));
   assert.equal(events.filter((e) => e.kind === "done").length, 1);
+});
+
+test("build is blocked (no query call) when the daily budget is exhausted", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "cf-"));
+  let calls = 0;
+  const gov = new BudgetGovernor({ capUsd: 1 });
+  gov.record(1); // at cap → blocked
+  const events: OrchestratorEvent[] = [];
+  const fleet = new ClaudeFleet({ query: (() => { calls++; return (async function* () {})(); }) as any, workspaceRoot: root, registry: new FleetSessionRegistry(), governor: gov } as any);
+  await fleet.build({ projectId: "pb", plan, onEvent: (e) => events.push(e) });
+  assert.equal(calls, 0, "query must not be called when over budget");
+  assert.ok(events.some((e) => e.kind === "agent_message" && /budget/i.test((e as any).content)));
+  assert.equal(events.at(-1)!.kind, "done");
+});
+
+test("build records the session cost into the governor", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "cf-"));
+  const gov = new BudgetGovernor({ capUsd: 100 });
+  const q = (() => async function* () {
+    yield { type: "result", subtype: "success", is_error: false, total_cost_usd: 0.42 };
+  })();
+  const fleet = new ClaudeFleet({ query: q as any, workspaceRoot: root, registry: new FleetSessionRegistry(), governor: gov } as any);
+  await fleet.build({ projectId: "pc", plan, onEvent: () => {} });
+  assert.equal(gov.snapshot().spentUsd, 0.42);
 });
