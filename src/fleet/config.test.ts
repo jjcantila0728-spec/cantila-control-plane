@@ -19,3 +19,9 @@ test("fleetConfig reads ANTHROPIC_API_KEY for the live flag", () => {
   assert.equal(fleetConfig().live, false);
   if (prev !== undefined) process.env.ANTHROPIC_API_KEY = prev;
 });
+
+test("fleetConfig exposes budget + concurrency caps", () => {
+  const c = fleetConfig();
+  assert.ok(c.maxBudgetUsd > 0);
+  assert.ok(c.maxConcurrentBuilds >= 1);
+});

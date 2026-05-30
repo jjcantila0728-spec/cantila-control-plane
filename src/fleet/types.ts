@@ -71,3 +71,9 @@ export function isAgentRole(v: unknown): v is AgentRole {
     typeof r.systemPrompt === "string"
   );
 }
+
+export const SDK_TOOL_NAMES = ["Read", "Write", "Edit", "Glob", "Grep", "Bash", "Agent"] as const;
+export type SdkToolName = (typeof SDK_TOOL_NAMES)[number];
+
+export const AGENT_SESSION_STATUSES = ["idle", "working", "done", "failed"] as const;
+export type AgentSessionStatus = (typeof AGENT_SESSION_STATUSES)[number];

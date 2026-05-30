@@ -11,6 +11,10 @@ export interface FleetConfig {
   maxConcurrency: number;
   /** Soft cap on total output tokens spent in one build. */
   buildTokenBudget: number;
+  /** Max USD spend allowed across a fleet run. */
+  maxBudgetUsd: number;
+  /** Max number of builds running concurrently at the fleet level. */
+  maxConcurrentBuilds: number;
 }
 
 function num(envKey: string, fallback: number): number {
@@ -26,5 +30,7 @@ export function fleetConfig(): FleetConfig {
     maxAgentSteps: num("FLEET_MAX_AGENT_STEPS", 8),
     maxConcurrency: num("FLEET_MAX_CONCURRENCY", 4),
     buildTokenBudget: num("FLEET_BUILD_TOKEN_BUDGET", 300_000),
+    maxBudgetUsd: num("FLEET_MAX_BUDGET_USD", 2),
+    maxConcurrentBuilds: num("FLEET_MAX_CONCURRENT_BUILDS", 2),
   };
 }
