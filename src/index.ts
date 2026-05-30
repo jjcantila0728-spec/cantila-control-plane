@@ -2597,6 +2597,11 @@ app.post("/v1/agents/resume", async () => {
   return { paused: false };
 });
 
+app.get("/v1/agents/org", async () => {
+  const { buildAgentOrg } = await import("./fleet/org");
+  return buildAgentOrg(projectOrchestrator.sessionRegistry);
+});
+
 /* ----- Owner-queued agent proposals (admin-only, in-memory v1).
  *  These let the founder add new agent ideas from the Console chat;
  *  they appear as dimmed satellites on the agents canvas until a real
