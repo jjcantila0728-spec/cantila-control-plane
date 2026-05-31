@@ -76,3 +76,65 @@ test("commits files to the project's cantila repo and deploys", async () => {
   const deployments = await cp.listProjectDeployments(project.id);
   assert.ok(deployments.length >= 1);
 });
+
+test("deploy:false commits without deploying", async () => {
+  const { cp, store } = makeCp();
+  const project = await seededProject(cp, store);
+  const res = await pushTool(cp).handler({
+    projectId: project.id,
+    files: [{ path: "index.html", content: "hi" }],
+    deploy: false,
+  });
+  assert.ok(!res.isError, textOf(res));
+  assert.match(textOf(res), /Skipped deploy/);
+  const deployments = await cp.listProjectDeployments(project.id);
+  assert.equal(deployments.length, 0);
+});
+
+test("base64 content is decoded before commit", async () => {
+  const { cp, store } = makeCp();
+  const project = await seededProject(cp, store);
+  const encoded = Buffer.from("<h1>b64</h1>", "utf-8").toString("base64");
+  const res = await pushTool(cp).handler({
+    projectId: project.id,
+    files: [{ path: "index.html", content: encoded, encoding: "base64" }],
+    deploy: false,
+  });
+  assert.ok(!res.isError, textOf(res));
+  const read = await cp.readProjectFile(project.id, "index.html");
+  assert.ok(read && "content" in read && read.content === "<h1>b64</h1>");
+});
+
+test("re-pushing a path updates its content", async () => {
+  const { cp, store } = makeCp();
+  const project = await seededProject(cp, store);
+  const tool = pushTool(cp);
+  await tool.handler({
+    projectId: project.id,
+    files: [{ path: "index.html", content: "v1" }],
+    deploy: false,
+  });
+  const res = await tool.handler({
+    projectId: project.id,
+    files: [{ path: "index.html", content: "v2" }],
+    deploy: false,
+  });
+  assert.ok(!res.isError, textOf(res));
+  const read = await cp.readProjectFile(project.id, "index.html");
+  assert.ok(read && "content" in read && read.content === "v2");
+});
+
+test("empty files array errors with no side effect", async () => {
+  const { cp, store } = makeCp();
+  const project = await seededProject(cp, store);
+  const res = await pushTool(cp).handler({ projectId: project.id, files: [] });
+  assert.equal(res.isError, true);
+});
+
+test("missing projectId errors", async () => {
+  const { cp } = makeCp();
+  const res = await pushTool(cp).handler({
+    files: [{ path: "a.txt", content: "b" }],
+  });
+  assert.equal(res.isError, true);
+});
