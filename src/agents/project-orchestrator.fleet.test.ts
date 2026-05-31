@@ -35,3 +35,41 @@ test("runChat persists the user message and streams a done", async () => {
   const msgs = orch.listMessages("p2");
   assert.ok(msgs.some((m) => m.role === "user" && /footer/.test(m.content)), "user message persisted");
 });
+
+function fakeQueryOk() {
+  return (() => async function* () {
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "FLEET_BUILD_RESULT: ok" }] } };
+    yield { type: "result", subtype: "success", is_error: false, total_cost_usd: 0.01 };
+  })();
+}
+
+test("autodeploy OFF: bridge not invoked even on buildOk", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "po-"));
+  const prev = process.env.FLEET_AUTODEPLOY; delete process.env.FLEET_AUTODEPLOY;
+  let bridgeCalls = 0;
+  const orch = new ProjectOrchestrator({ cp: { getProject: async () => ({ id: "p1", accountId: "acc" }) } as any, planner: planner as any, images: images as any, fleet: { query: fakeQueryOk() as any, workspaceRoot: root }, deployBridge: { publish: async () => { bridgeCalls++; return { deployed: true, detail: "x" }; } } } as any);
+  await orch.runBuild({ projectId: "p1", plan: await planner.plan() as any, onEvent: () => {} });
+  assert.equal(bridgeCalls, 0);
+  if (prev !== undefined) process.env.FLEET_AUTODEPLOY = prev;
+});
+
+test("autodeploy ON + buildOk + owner account: bridge invoked once", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "po-"));
+  const prev = process.env.FLEET_AUTODEPLOY; process.env.FLEET_AUTODEPLOY = "on";
+  const { ownerAccountId } = await import("../lib/owner-account");
+  let bridgeCalls = 0;
+  const orch = new ProjectOrchestrator({ cp: { getProject: async () => ({ id: "p1", accountId: ownerAccountId() }) } as any, planner: planner as any, images: images as any, fleet: { query: fakeQueryOk() as any, workspaceRoot: root }, deployBridge: { publish: async () => { bridgeCalls++; return { deployed: true, detail: "x", liveUrl: "https://x.cantila.app" }; } } } as any);
+  await orch.runBuild({ projectId: "p1", plan: await planner.plan() as any, onEvent: () => {} });
+  assert.equal(bridgeCalls, 1);
+  if (prev === undefined) delete process.env.FLEET_AUTODEPLOY; else process.env.FLEET_AUTODEPLOY = prev;
+});
+
+test("autodeploy ON + buildOk + NON-owner account: bridge NOT invoked", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "po-"));
+  const prev = process.env.FLEET_AUTODEPLOY; process.env.FLEET_AUTODEPLOY = "on";
+  let bridgeCalls = 0;
+  const orch = new ProjectOrchestrator({ cp: { getProject: async () => ({ id: "p1", accountId: "some-other-acct" }) } as any, planner: planner as any, images: images as any, fleet: { query: fakeQueryOk() as any, workspaceRoot: root }, deployBridge: { publish: async () => { bridgeCalls++; return { deployed: true, detail: "x" }; } } } as any);
+  await orch.runBuild({ projectId: "p1", plan: await planner.plan() as any, onEvent: () => {} });
+  assert.equal(bridgeCalls, 0);
+  if (prev === undefined) delete process.env.FLEET_AUTODEPLOY; else process.env.FLEET_AUTODEPLOY = prev;
+});
