@@ -87,6 +87,38 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "Project.repoHost — which git host backs the project's source: \"github\" (user-connected external repo) or \"cantila\" (auto-provisioned Gitea repo). New column WITH a default, so existing rows backfill to 'github'.",
     sql: `ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "repoHost" TEXT DEFAULT 'github';`,
   },
+  {
+    id: "20260530020000_create_conversation_table",
+    description:
+      'Conversation — multi-conversation chat history (conversations design 2026-05-30). One thread of chat per row; legacy ProjectMessage rows backfill into a "Main" conversation. FK to Project with cascade so deleting a project drops its conversations.',
+    sql: `CREATE TABLE IF NOT EXISTS "Conversation" (
+      "id" TEXT NOT NULL,
+      "projectId" TEXT NOT NULL,
+      "title" TEXT NOT NULL DEFAULT 'New chat',
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "Conversation_pkey" PRIMARY KEY ("id"),
+      CONSTRAINT "Conversation_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );`,
+  },
+  {
+    id: "20260530020001_create_conversation_project_index",
+    description:
+      "Conversation [projectId, updatedAt] index — backs the conversation list ordered by most-recently-active.",
+    sql: 'CREATE INDEX IF NOT EXISTS "Conversation_projectId_updatedAt_idx" ON "Conversation"("projectId", "updatedAt");',
+  },
+  {
+    id: "20260530020002_add_project_message_conversation_id",
+    description:
+      "ProjectMessage.conversationId — links a chat message to its conversation (conversations design 2026-05-30). Nullable so pre-existing rows keep working until ensureDefaultConversation backfills them into 'Main'.",
+    sql: 'ALTER TABLE "ProjectMessage" ADD COLUMN IF NOT EXISTS "conversationId" TEXT;',
+  },
+  {
+    id: "20260530020003_create_project_message_conversation_index",
+    description:
+      "ProjectMessage [conversationId, createdAt] index — backs the scoped per-conversation history load.",
+    sql: 'CREATE INDEX IF NOT EXISTS "ProjectMessage_conversationId_createdAt_idx" ON "ProjectMessage"("conversationId", "createdAt");',
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.

@@ -62,6 +62,11 @@ import type {
   ConnectionAuditEvent,
   WorkflowExecutionRecord,
   WorkflowExecutionEvent,
+  Conversation,
+  ConversationSummary,
+  ProjectChatMessage,
+  ProjectMessageRole,
+  ProjectMessageKind,
 } from "../domain/types";
 import type { ServiceProvisioner } from "../deploy/provisioning";
 import {
@@ -773,6 +778,15 @@ function stripWebhookSecret(p: Project): Project {
   if (!p.webhookSecret) return p;
   const { webhookSecret: _ws, ...rest } = p;
   return rest;
+}
+
+/** Derive a conversation title from the first user message — collapse
+ *  whitespace and truncate to ~60 chars (conversations design 2026-05-30).
+ *  Falls back to "New chat" for an empty prompt. */
+function titleFromPrompt(prompt: string): string {
+  const cleaned = prompt.replace(/\s+/g, " ").trim();
+  if (!cleaned) return "New chat";
+  return cleaned.length > 60 ? cleaned.slice(0, 57) + "…" : cleaned;
 }
 
 function stripList(ps: Project[]): Project[] {
@@ -4287,6 +4301,193 @@ export class ControlPlane {
   async getProject(projectId: string): Promise<Project | null> {
     const p = await this.deps.store.getProject(projectId);
     return p ? stripWebhookSecret(p) : null;
+  }
+
+  /* ----- multi-conversation chat history (conversations design 2026-05-30) -----
+   *  A project owns many `Conversation` threads. Legacy single-thread
+   *  history is backfilled into a "Main" conversation the first time the
+   *  list (or chat/build) is touched, so existing chats appear intact. */
+
+  /** Idempotent backfill. If the project already has at least one
+   *  conversation, returns the most-recently-active one. Otherwise mints a
+   *  "Main" conversation and attaches every null-conversation message in
+   *  the project to it. Safe to call repeatedly. Returns the default
+   *  conversation id. */
+  async ensureDefaultConversation(projectId: string): Promise<string> {
+    const existing = await this.deps.store.listConversations(projectId);
+    if (existing.length > 0) return existing[0].id;
+    const ts = now();
+    const conversation: Conversation = {
+      id: id("conv"),
+      projectId,
+      title: "Main",
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    await this.deps.store.createConversation(conversation);
+    await this.deps.store.attachNullMessagesToConversation(
+      projectId,
+      conversation.id,
+    );
+    return conversation.id;
+  }
+
+  /** List a project's conversations as Console list-rows — ensures the
+   *  default "Main" exists first, then returns `{ id, title, createdAt,
+   *  updatedAt, messageCount, lastPreview }[]` ordered by `updatedAt`
+   *  desc. Returns null when the project doesn't exist. */
+  async listConversations(
+    projectId: string,
+  ): Promise<ConversationSummary[] | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    await this.ensureDefaultConversation(projectId);
+    const conversations = await this.deps.store.listConversations(projectId);
+    const summaries: ConversationSummary[] = [];
+    for (const c of conversations) {
+      const messages = await this.deps.store.listChatMessages(c.id);
+      const last = messages.at(-1);
+      summaries.push({
+        ...c,
+        messageCount: messages.length,
+        lastPreview: last ? last.content.slice(0, 120) : "",
+      });
+    }
+    return summaries;
+  }
+
+  /** Create a fresh conversation. Title defaults to "New chat". Returns
+   *  null when the project doesn't exist. */
+  async createConversation(
+    projectId: string,
+    title?: string,
+  ): Promise<Conversation | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    const ts = now();
+    const conversation: Conversation = {
+      id: id("conv"),
+      projectId,
+      title: title?.trim() || "New chat",
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    return this.deps.store.createConversation(conversation);
+  }
+
+  /** Rename a conversation. Returns null when the conversation doesn't
+   *  exist or belongs to a different project (404 at the route). */
+  async renameConversation(
+    projectId: string,
+    conversationId: string,
+    title: string,
+  ): Promise<Conversation | null> {
+    const conversation = await this.deps.store.getConversation(conversationId);
+    if (!conversation || conversation.projectId !== projectId) return null;
+    return this.deps.store.updateConversation(conversationId, {
+      title: title.trim() || conversation.title,
+      updatedAt: now(),
+    });
+  }
+
+  /** Delete a conversation (cascades its messages). Returns null when the
+   *  conversation doesn't exist or belongs to a different project; `{ ok:
+   *  true }` on success. */
+  async deleteConversation(
+    projectId: string,
+    conversationId: string,
+  ): Promise<{ ok: true } | null> {
+    const conversation = await this.deps.store.getConversation(conversationId);
+    if (!conversation || conversation.projectId !== projectId) return null;
+    await this.deps.store.deleteConversation(conversationId);
+    return { ok: true };
+  }
+
+  /** Scoped chat history. When `conversationId` is omitted, resolves the
+   *  project's default ("Main") conversation. Returns null when the
+   *  project doesn't exist, or when a supplied `conversationId` is not a
+   *  conversation of this project. */
+  async getChat(
+    projectId: string,
+    conversationId?: string,
+  ): Promise<{ conversationId: string; messages: ProjectChatMessage[] } | null> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    let cid = conversationId;
+    if (cid) {
+      const conversation = await this.deps.store.getConversation(cid);
+      if (!conversation || conversation.projectId !== projectId) return null;
+    } else {
+      cid = await this.ensureDefaultConversation(projectId);
+    }
+    const messages = await this.deps.store.listChatMessages(cid);
+    return { conversationId: cid, messages };
+  }
+
+  /** Persist one chat message into a conversation and thread the
+   *  side-effects the conversation list depends on: auto-title an
+   *  untitled conversation from the first user message, and bump
+   *  `updatedAt` so the thread floats to the top of the list. When
+   *  `conversationId` is omitted the project's default conversation is
+   *  used (creating "Main" if needed). Returns the persisted message.
+   *  This is the store-backed persist path the chat/build streaming
+   *  layer threads `conversationId` through. */
+  async appendChatMessage(input: {
+    projectId: string;
+    conversationId?: string;
+    role: ProjectMessageRole;
+    kind: ProjectMessageKind;
+    content: string;
+    agent?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<ProjectChatMessage> {
+    // Scope guard: only honor a supplied conversationId when it actually
+    // belongs to this project. A foreign/missing id falls back to the
+    // project's default conversation so a caller scoped to project A can
+    // never write rows into project B's thread.
+    let cid: string;
+    if (input.conversationId) {
+      const supplied = await this.deps.store.getConversation(
+        input.conversationId,
+      );
+      cid =
+        supplied && supplied.projectId === input.projectId
+          ? input.conversationId
+          : await this.ensureDefaultConversation(input.projectId);
+    } else {
+      cid = await this.ensureDefaultConversation(input.projectId);
+    }
+    const ts = now();
+    const message: ProjectChatMessage = {
+      id: id("pmsg"),
+      projectId: input.projectId,
+      conversationId: cid,
+      role: input.role,
+      kind: input.kind,
+      content: input.content,
+      agent: input.agent,
+      metadata: input.metadata,
+      createdAt: ts,
+    };
+    await this.deps.store.createChatMessage(message);
+
+    // Auto-title: the first user message of an untitled conversation
+    // ("New chat") names the thread from a truncated prompt. "Main" (the
+    // backfilled default) is left as-is.
+    const conversation = await this.deps.store.getConversation(cid);
+    const patch: Partial<Conversation> = { updatedAt: ts };
+    if (
+      conversation &&
+      conversation.title === "New chat" &&
+      input.role === "user" &&
+      input.kind === "message"
+    ) {
+      patch.title = titleFromPrompt(input.content);
+    }
+    if (conversation) {
+      await this.deps.store.updateConversation(cid, patch);
+    }
+    return message;
   }
 
   /** Resolve a project from an account handle + project name pair.

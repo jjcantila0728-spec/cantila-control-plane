@@ -425,6 +425,7 @@ model Project {
   phoneNumber PhoneNumber?
 
   // per-project brain & build outputs (plan §4.9 + complete-builder)
+  conversations Conversation[]
   messages ProjectMessage[]
   memory   ProjectMemory?
   assets   ProjectAsset[]
@@ -1006,10 +1007,32 @@ enum ProjectMessageKind {
   asset
 }
 
+/// A single chat conversation (thread) within a project — like a
+/// ChatGPT/Claude conversation (conversations design 2026-05-30). A
+/// project can hold many; the legacy single-thread history is backfilled
+/// into one titled "Main". Messages hang off a conversation; deleting a
+/// conversation cascades its messages.
+model Conversation {
+  id        String           @id @default(cuid())
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId String
+  title     String           @default("New chat")
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  messages  ProjectMessage[]
+
+  @@index([projectId, updatedAt])
+}
+
 model ProjectMessage {
   id        String              @id @default(cuid())
   project   Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
   projectId String
+  /// The conversation (thread) this message belongs to (conversations
+  /// design 2026-05-30). Nullable so pre-existing rows keep working until
+  /// `ensureDefaultConversation` backfills them into the project's "Main".
+  conversation   Conversation? @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversationId String?
   role      ProjectMessageRole
   /// Specialist agent or skill that emitted this row, when not the user
   /// (e.g. "deploy", "scale", "generate_image", "orchestrator").
@@ -1023,6 +1046,7 @@ model ProjectMessage {
   createdAt DateTime            @default(now())
 
   @@index([projectId, createdAt])
+  @@index([conversationId, createdAt])
 }
 
 model ProjectMemory {

@@ -38,6 +38,8 @@ import type {
   ConnectionAuditEvent,
   WorkflowExecutionRecord,
   WorkflowExecutionEvent,
+  Conversation,
+  ProjectChatMessage,
 } from "./types";
 
 /** Durable shape of one entry in the agent brain's action journal (plan
@@ -451,6 +453,35 @@ export interface Store {
     connectionId?: string;
     limit?: number;
   }): Promise<ConnectionAuditEvent[]>;
+
+  /* ----- multi-conversation chat history (conversations design 2026-05-30) -----
+   *  Each project owns many `Conversation` threads; `ProjectChatMessage`
+   *  rows hang off a conversation. `ensureDefaultConversation` backfills
+   *  legacy null-conversation messages into one titled "Main". */
+
+  createConversation(c: Conversation): Promise<Conversation>;
+  getConversation(id: string): Promise<Conversation | null>;
+  listConversations(projectId: string): Promise<Conversation[]>;
+  updateConversation(
+    id: string,
+    patch: Partial<Conversation>,
+  ): Promise<Conversation>;
+  /** Delete a conversation and cascade-delete its messages. Returns false
+   *  when the conversation doesn't exist. */
+  deleteConversation(id: string): Promise<boolean>;
+
+  createChatMessage(m: ProjectChatMessage): Promise<ProjectChatMessage>;
+  /** Messages scoped to a conversation, oldest-first. */
+  listChatMessages(conversationId: string): Promise<ProjectChatMessage[]>;
+  /** Every message in a project, oldest-first — regardless of conversation.
+   *  Backs the legacy single-thread fallback and the backfill scan. */
+  listChatMessagesByProject(projectId: string): Promise<ProjectChatMessage[]>;
+  /** Backfill: attach every null-conversation message in a project to the
+   *  given conversation. Returns the number of rows updated. */
+  attachNullMessagesToConversation(
+    projectId: string,
+    conversationId: string,
+  ): Promise<number>;
 }
 
 export class InMemoryStore implements Store {
@@ -563,6 +594,12 @@ export class InMemoryStore implements Store {
     }
     for (const [mapId, a] of this.mailAliases) {
       if (a.projectId === id) this.mailAliases.delete(mapId);
+    }
+    for (const [mapId, c] of this.conversations) {
+      if (c.projectId === id) this.conversations.delete(mapId);
+    }
+    for (const [mapId, m] of this.chatMessages) {
+      if (m.projectId === id) this.chatMessages.delete(mapId);
     }
     return true;
   }
@@ -1615,5 +1652,95 @@ export class InMemoryStore implements Store {
       .slice()
       .sort((a, b) => b.at.localeCompare(a.at))
       .slice(0, limit);
+  }
+
+  /* ----- multi-conversation chat history (conversations design 2026-05-30) ----- */
+
+  private conversations = new Map<string, Conversation>(); //   keyed by id
+  private chatMessages = new Map<string, ProjectChatMessage>(); // keyed by id
+
+  async createConversation(c: Conversation): Promise<Conversation> {
+    this.conversations.set(c.id, c);
+    return c;
+  }
+
+  async getConversation(id: string): Promise<Conversation | null> {
+    return this.conversations.get(id) ?? null;
+  }
+
+  async listConversations(projectId: string): Promise<Conversation[]> {
+    return [...this.conversations.values()]
+      .filter((c) => c.projectId === projectId)
+      .sort(
+        (a, b) =>
+          // Most-recently-active first; tie-break on createdAt desc so the
+          // ordering is stable even when two threads share a millisecond.
+          b.updatedAt.localeCompare(a.updatedAt) ||
+          b.createdAt.localeCompare(a.createdAt),
+      );
+  }
+
+  async updateConversation(
+    id: string,
+    patch: Partial<Conversation>,
+  ): Promise<Conversation> {
+    const existing = this.conversations.get(id);
+    if (!existing) throw new Error(`conversation not found: ${id}`);
+    const updated: Conversation = {
+      ...existing,
+      ...patch,
+      id: existing.id,
+      projectId: existing.projectId,
+    };
+    this.conversations.set(id, updated);
+    return updated;
+  }
+
+  async deleteConversation(id: string): Promise<boolean> {
+    if (!this.conversations.has(id)) return false;
+    this.conversations.delete(id);
+    // Cascade — drop every message scoped to this conversation, mirroring
+    // the Prisma `onDelete: Cascade` on ProjectMessage.conversationId.
+    for (const [mapId, m] of this.chatMessages) {
+      if (m.conversationId === id) this.chatMessages.delete(mapId);
+    }
+    return true;
+  }
+
+  async createChatMessage(
+    m: ProjectChatMessage,
+  ): Promise<ProjectChatMessage> {
+    this.chatMessages.set(m.id, m);
+    return m;
+  }
+
+  async listChatMessages(
+    conversationId: string,
+  ): Promise<ProjectChatMessage[]> {
+    return [...this.chatMessages.values()]
+      .filter((m) => m.conversationId === conversationId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  async listChatMessagesByProject(
+    projectId: string,
+  ): Promise<ProjectChatMessage[]> {
+    return [...this.chatMessages.values()]
+      .filter((m) => m.projectId === projectId)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }
+
+  async attachNullMessagesToConversation(
+    projectId: string,
+    conversationId: string,
+  ): Promise<number> {
+    let updated = 0;
+    for (const [mapId, m] of this.chatMessages) {
+      if (m.projectId === projectId && m.conversationId === null) {
+        this.chatMessages.set(mapId, { ...m, conversationId });
+        updated++;
+      }
+    }
+    return updated;
   }
 }
