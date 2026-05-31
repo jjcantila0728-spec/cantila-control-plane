@@ -652,6 +652,15 @@ const addDomainSchema = z.object({
   hostname: z.string().min(1),
 });
 
+// Conversations (multi-conversation chat history, conversations design 2026-05-30).
+const createConversationSchema = z.object({
+  title: z.string().min(1).max(200).optional(),
+});
+
+const renameConversationSchema = z.object({
+  title: z.string().min(1).max(200),
+});
+
 const scaleSchema = z.object({
   vcpu: z.number().int().min(1).max(32).optional(),
   memoryMb: z.number().int().min(256).max(65536).optional(),
@@ -1074,11 +1083,70 @@ app.get("/v1/projects/by-handle/:handle/:name", async (request, reply) => {
 });
 
 // Per-project chat history. Returns the rolling thread of messages — user
-// turns, agent ops, asset cards, results — in created-at order.
+// turns, agent ops, asset cards, results — in created-at order, scoped to a
+// conversation (default "Main" when `?conversationId` is omitted).
 app.get("/v1/projects/:id/chat", async (request, reply) => {
   const { id } = request.params as { id: string };
   if (!(await assertProjectAccess(request, reply, id))) return;
-  return { messages: projectOrchestrator.listMessages(id) };
+  const { conversationId } = (request.query ?? {}) as {
+    conversationId?: string;
+  };
+  const chat = await cp.getChat(id, conversationId);
+  if (!chat) {
+    return reply
+      .code(404)
+      .send({ error: "project or conversation not found" });
+  }
+  // Merge the live in-memory stream (the orchestrator's per-process Map)
+  // with the durable, conversation-scoped store. The store is the source of
+  // truth for history; the in-memory rows cover a build/chat still
+  // streaming in this process before its rows have been re-read.
+  return { conversationId: chat.conversationId, messages: chat.messages };
+});
+
+// List a project's conversations (ensures the default "Main" first).
+app.get("/v1/projects/:id/conversations", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const conversations = await cp.listConversations(id);
+  if (!conversations) return reply.code(404).send({ error: "project not found" });
+  return { conversations };
+});
+
+// Create a new conversation. Title defaults to "New chat".
+app.post("/v1/projects/:id/conversations", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = createConversationSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const conversation = await cp.createConversation(id, parsed.data.title);
+  if (!conversation) return reply.code(404).send({ error: "project not found" });
+  return reply.code(201).send(conversation);
+});
+
+// Rename a conversation.
+app.patch("/v1/projects/:id/conversations/:cid", async (request, reply) => {
+  const { id, cid } = request.params as { id: string; cid: string };
+  const parsed = renameConversationSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const updated = await cp.renameConversation(id, cid, parsed.data.title);
+  if (!updated) return reply.code(404).send({ error: "conversation not found" });
+  return updated;
+});
+
+// Delete a conversation (cascade deletes its messages). Deleting the last
+// one is allowed — the list endpoint re-ensures a default on next load.
+app.delete("/v1/projects/:id/conversations/:cid", async (request, reply) => {
+  const { id, cid } = request.params as { id: string; cid: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.deleteConversation(id, cid);
+  if (!result) return reply.code(404).send({ error: "conversation not found" });
+  return result;
 });
 
 // Per-project assets — the AssetGallery panel reads this. Every generated
@@ -1105,11 +1173,19 @@ app.get("/v1/projects/:id/brain", async (request, reply) => {
 app.post("/v1/projects/:id/build", async (request, reply) => {
   const { id } = request.params as { id: string };
   if (!(await assertProjectAccess(request, reply, id))) return;
-  const body = (request.body ?? {}) as { prompt?: string };
+  const body = (request.body ?? {}) as {
+    prompt?: string;
+    conversationId?: string;
+  };
   if (!body.prompt) return reply.code(400).send({ error: "prompt required" });
 
   const plan = await deployPlanner.plan({ prompt: body.prompt });
-  projectOrchestrator.seedFromDeploy({ projectId: id, prompt: body.prompt, plan });
+  projectOrchestrator.seedFromDeploy({
+    projectId: id,
+    prompt: body.prompt,
+    plan,
+    conversationId: body.conversationId,
+  });
 
   // Take over the socket and stream op events. Mirrors the pattern in the
   // deploy/stream route above.
@@ -1131,17 +1207,22 @@ app.post("/v1/projects/:id/build", async (request, reply) => {
     projectId: id,
     plan,
     onEvent: (e) => send(e.kind, e),
+    conversationId: body.conversationId,
   });
   res.end();
 });
 
 // Send a follow-up chat message on an existing project. Streams the
 // orchestrator's reply + any dispatched agent ops + any newly-generated
-// assets back as SSE events.
+// assets back as SSE events. `conversationId` in the body scopes the
+// persisted rows to a thread (default "Main").
 app.post("/v1/projects/:id/chat", async (request, reply) => {
   const { id } = request.params as { id: string };
   if (!(await assertProjectAccess(request, reply, id))) return;
-  const body = (request.body ?? {}) as { message?: string };
+  const body = (request.body ?? {}) as {
+    message?: string;
+    conversationId?: string;
+  };
   if (!body.message || typeof body.message !== "string") {
     return reply.code(400).send({ error: "message required" });
   }
@@ -1163,6 +1244,7 @@ app.post("/v1/projects/:id/chat", async (request, reply) => {
     projectId: id,
     message: body.message,
     onEvent: (e) => send(e.kind, e),
+    conversationId: body.conversationId,
   });
   res.end();
 });
