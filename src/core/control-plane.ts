@@ -4441,9 +4441,22 @@ export class ControlPlane {
     agent?: string;
     metadata?: Record<string, unknown>;
   }): Promise<ProjectChatMessage> {
-    const cid =
-      input.conversationId ??
-      (await this.ensureDefaultConversation(input.projectId));
+    // Scope guard: only honor a supplied conversationId when it actually
+    // belongs to this project. A foreign/missing id falls back to the
+    // project's default conversation so a caller scoped to project A can
+    // never write rows into project B's thread.
+    let cid: string;
+    if (input.conversationId) {
+      const supplied = await this.deps.store.getConversation(
+        input.conversationId,
+      );
+      cid =
+        supplied && supplied.projectId === input.projectId
+          ? input.conversationId
+          : await this.ensureDefaultConversation(input.projectId);
+    } else {
+      cid = await this.ensureDefaultConversation(input.projectId);
+    }
     const ts = now();
     const message: ProjectChatMessage = {
       id: id("pmsg"),

@@ -269,6 +269,55 @@ test("listConversations orders by updatedAt desc and reports messageCount + last
   );
 });
 
+test("appendChatMessage with a conversationId from a DIFFERENT project falls back to the caller project's default (cross-project write scoping)", async () => {
+  const { cp, store } = makeCp();
+
+  // Two projects under the same account. `seedProject` creates project A;
+  // create project B directly so we have a foreign conversation to target.
+  const projectA = await seedProject(cp, store);
+  const projectB = (
+    await cp.createProject({
+      accountId: "acc_test",
+      name: "Other",
+      runtime: "node",
+      region: "fsn1",
+    })
+  ).id;
+
+  // A conversation that belongs to project B.
+  const foreign = await cp.createConversation(projectB, "B-thread");
+  assert.ok(foreign);
+
+  // Caller is scoped to project A but supplies project B's conversationId.
+  const msg = await cp.appendChatMessage({
+    projectId: projectA,
+    conversationId: foreign!.id,
+    role: "user",
+    kind: "message",
+    content: "should not land in project B",
+  });
+
+  // The write must NOT land in the foreign conversation.
+  assert.notEqual(
+    msg.conversationId,
+    foreign!.id,
+    "did not write into the other project's thread",
+  );
+  assert.equal(
+    (await store.listChatMessages(foreign!.id)).length,
+    0,
+    "foreign conversation untouched",
+  );
+
+  // It fell back to project A's default ("Main") conversation.
+  const defaultA = await cp.ensureDefaultConversation(projectA);
+  assert.equal(msg.conversationId, defaultA, "fell back to caller's default");
+  const scoped = await store.listChatMessages(defaultA);
+  assert.equal(scoped.length, 1, "message landed in caller's default thread");
+  assert.equal(scoped[0].content, "should not land in project B");
+  assert.equal(scoped[0].projectId, projectA, "message is scoped to project A");
+});
+
 test("listConversations ensures a default Main when the project has none", async () => {
   const { cp, store } = makeCp();
   const projectId = await seedProject(cp, store);
