@@ -30,6 +30,10 @@ import type { ImageProvider } from "../skills/image-provider";
 import { ClaudeFleet } from "../fleet/claude-fleet";
 import { FleetSessionRegistry } from "../fleet/session-registry";
 import { loadQuery, type QueryFn } from "../fleet/sdk";
+import { DeployBridge } from "../fleet/deploy-bridge";
+import { fleetConfig } from "../fleet/config";
+import { workspaceDir } from "../fleet/workspace";
+import { ownerAccountId } from "../lib/owner-account";
 
 /* ---------- types ---------- */
 
@@ -108,6 +112,8 @@ export interface ProjectOrchestratorDeps {
   images: ImageProvider;
   /** Fleet wiring. Defaults to the real SDK query + env workspace root. Tests inject a fake query. */
   fleet?: { query?: QueryFn | null; workspaceRoot?: string; registry?: FleetSessionRegistry };
+  /** Optional deploy bridge override — injected by tests, defaults to real DeployBridge. */
+  deployBridge?: { publish(input: { projectId: string; workspaceDir: string; onEvent: OrchestratorEventHandler }): Promise<{ deployed: boolean; detail: string; liveUrl?: string }> };
 }
 
 interface ProjectState {
@@ -119,6 +125,7 @@ interface ProjectState {
 export class ProjectOrchestrator {
   private state: Map<string, ProjectState> = new Map();
   private claudeFleet: ClaudeFleet;
+  private deployBridge: { publish(input: { projectId: string; workspaceDir: string; onEvent: OrchestratorEventHandler }): Promise<{ deployed: boolean; detail: string; liveUrl?: string }> };
   readonly sessionRegistry: FleetSessionRegistry;
 
   constructor(private deps: ProjectOrchestratorDeps) {
@@ -126,6 +133,13 @@ export class ProjectOrchestrator {
     const workspaceRoot = this.deps.fleet?.workspaceRoot ?? process.env.FLEET_WORKSPACE_ROOT ?? "runtime/projects";
     this.sessionRegistry = this.deps.fleet?.registry ?? new FleetSessionRegistry();
     this.claudeFleet = new ClaudeFleet({ query, workspaceRoot, registry: this.sessionRegistry });
+    this.deployBridge = this.deps.deployBridge ?? new DeployBridge({
+      cp: {
+        ensureProjectRepo: (id: string) => this.deps.cp.ensureProjectRepo(id),
+        getAccount: (id: string) => this.deps.cp.getAccount(id),
+        deploy: (id: string, opts: any) => this.deps.cp.deploy(id, opts),
+      },
+    });
   }
 
   /* ----- state accessors (the HTTP layer reads these) ----- */
@@ -180,13 +194,21 @@ export class ProjectOrchestrator {
 
   /** Run the multi-round build for a freshly-created project. Streams
    *  every step to the handler so the project workspace's chat UI can
-   *  render op cards as they happen. Delegates to the ClaudeFleet engine. */
+   *  render op cards as they happen. Delegates to the ClaudeFleet engine.
+   *  When FLEET_AUTODEPLOY=on and the build succeeds, auto-deploys via
+   *  DeployBridge (owner-account projects only in v1). */
   async runBuild(input: {
     projectId: string;
     plan: DeployPlan;
     onEvent: OrchestratorEventHandler;
   }): Promise<void> {
-    await this.claudeFleet.build({ projectId: input.projectId, plan: input.plan, onEvent: (e) => this.persistAndForward(input.projectId, e, input.onEvent) });
+    const { projectId, plan, onEvent } = input;
+    const res = await this.claudeFleet.build({ projectId, plan, onEvent: (e) => this.persistAndForward(projectId, e, onEvent) });
+    if (!res?.buildOk || !fleetConfig().autodeploy) return;
+    const project = await this.deps.cp.getProject(projectId);
+    if (!project || project.accountId !== ownerAccountId()) return; // owner-account only in v1
+    const root = this.deps.fleet?.workspaceRoot ?? process.env.FLEET_WORKSPACE_ROOT ?? "runtime/projects";
+    await this.deployBridge.publish({ projectId, workspaceDir: workspaceDir(root, projectId), onEvent: (e) => this.persistAndForward(projectId, e, onEvent) });
   }
 
   /** Continue the conversation on an existing project. Persists the user
