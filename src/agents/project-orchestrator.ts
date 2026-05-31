@@ -169,6 +169,10 @@ export class ProjectOrchestrator {
     projectId: string;
     prompt: string;
     plan: DeployPlan;
+    /** Conversation (thread) the seeded rows attach to. Omitted →
+     *  the project's default "Main" conversation (conversations design
+     *  2026-05-30). */
+    conversationId?: string;
   }): void {
     const s = this.ensure(input.projectId);
     s.messages.push(this.makeMessage({
@@ -184,6 +188,21 @@ export class ProjectOrchestrator {
       kind: "message",
       content: `${input.plan.summary} Stack: ${input.plan.stack}.`,
     }));
+    // Mirror the seed into the durable, conversation-scoped store so the
+    // thread auto-titles + floats to the top of the conversation list.
+    // Fire-and-forget — the in-memory state above is what the live stream
+    // renders from; this is the persistence layer behind it.
+    void this.persistToConversation(input.projectId, input.conversationId, {
+      role: "user",
+      kind: "message",
+      content: input.prompt,
+    });
+    void this.persistToConversation(input.projectId, input.conversationId, {
+      role: "agent",
+      agent: "orchestrator",
+      kind: "message",
+      content: `${input.plan.summary} Stack: ${input.plan.stack}.`,
+    });
     s.memory = {
       ...s.memory,
       summary: this.composeSummary(s.memory.summary, input.prompt, input.plan),
@@ -201,46 +220,57 @@ export class ProjectOrchestrator {
     projectId: string;
     plan: DeployPlan;
     onEvent: OrchestratorEventHandler;
+    /** Conversation the build's streamed rows attach to (default "Main"). */
+    conversationId?: string;
   }): Promise<void> {
-    const { projectId, plan, onEvent } = input;
-    const res = await this.claudeFleet.build({ projectId, plan, onEvent: (e) => this.persistAndForward(projectId, e, onEvent) });
+    const { projectId, plan, onEvent, conversationId } = input;
+    const res = await this.claudeFleet.build({ projectId, plan, onEvent: (e) => this.persistAndForward(projectId, e, onEvent, conversationId) });
     if (!res?.buildOk || !fleetConfig().autodeploy) return;
     const project = await this.deps.cp.getProject(projectId);
     if (!project || project.accountId !== ownerAccountId()) return; // owner-account only in v1
     const root = this.deps.fleet?.workspaceRoot ?? process.env.FLEET_WORKSPACE_ROOT ?? "runtime/projects";
-    await this.deployBridge.publish({ projectId, workspaceDir: workspaceDir(root, projectId), onEvent: (e) => this.persistAndForward(projectId, e, onEvent) });
+    await this.deployBridge.publish({ projectId, workspaceDir: workspaceDir(root, projectId), onEvent: (e) => this.persistAndForward(projectId, e, onEvent, conversationId) });
   }
 
   /** Continue the conversation on an existing project. Persists the user
-   *  message then delegates to the ClaudeFleet engine for a live response. */
+   *  message then delegates to the ClaudeFleet engine for a live response.
+   *  `conversationId` scopes the persisted rows to a thread (default
+   *  "Main"). */
   async runChat(input: {
     projectId: string;
     message: string;
     onEvent: OrchestratorEventHandler;
+    conversationId?: string;
   }): Promise<void> {
-    this.appendMessage(input.projectId, { role: "user", kind: "message", content: input.message }, input.onEvent);
-    await this.claudeFleet.chat({ projectId: input.projectId, message: input.message, onEvent: (e) => this.persistAndForward(input.projectId, e, input.onEvent) });
+    this.appendMessage(input.projectId, { role: "user", kind: "message", content: input.message }, input.onEvent, input.conversationId);
+    await this.claudeFleet.chat({ projectId: input.projectId, message: input.message, onEvent: (e) => this.persistAndForward(input.projectId, e, input.onEvent, input.conversationId) });
   }
 
   /* ----- internals ----- */
 
-  /** Mirror streamed fleet events into the existing in-memory state, then forward. */
-  private persistAndForward(projectId: string, e: OrchestratorEvent, onEvent: OrchestratorEventHandler): void {
+  /** Mirror streamed fleet events into the existing in-memory state, then
+   *  forward. Also persists each row into the conversation-scoped store so
+   *  the thread's `updatedAt` floats and the history survives a restart. */
+  private persistAndForward(projectId: string, e: OrchestratorEvent, onEvent: OrchestratorEventHandler, conversationId?: string): void {
     switch (e.kind) {
       case "agent_message":
         this.ensure(projectId).messages.push(this.makeMessage({ projectId, role: "agent", agent: e.agent, kind: "message", content: e.content }));
+        void this.persistToConversation(projectId, conversationId, { role: "agent", agent: e.agent, kind: "message", content: e.content });
         break;
       case "op_started":
         this.ensure(projectId).messages.push(this.makeMessage({ projectId, role: "agent", agent: e.agent, kind: "op_card", content: e.title, metadata: { opKey: e.opKey, status: "running" } }));
+        void this.persistToConversation(projectId, conversationId, { role: "agent", agent: e.agent, kind: "op_card", content: e.title, metadata: { opKey: e.opKey, status: "running" } });
         break;
       case "op_finished":
         this.ensure(projectId).messages.push(this.makeMessage({ projectId, role: "agent", agent: e.agent, kind: "op_card", content: e.title, metadata: { opKey: e.opKey, status: e.status === "ok" ? "done" : "failed", detail: e.detail } }));
+        void this.persistToConversation(projectId, conversationId, { role: "agent", agent: e.agent, kind: "op_card", content: e.title, metadata: { opKey: e.opKey, status: e.status === "ok" ? "done" : "failed", detail: e.detail } });
         break;
       case "asset_created":
         this.ensure(projectId).assets.push(e.asset);
         break;
       case "result":
         this.ensure(projectId).messages.push(this.makeMessage({ projectId, role: "agent", agent: "orchestrator", kind: "result", content: `${e.name} is ready.`, metadata: { name: e.name, url: e.url, stack: e.stack } }));
+        void this.persistToConversation(projectId, conversationId, { role: "agent", agent: "orchestrator", kind: "result", content: `${e.name} is ready.`, metadata: { name: e.name, url: e.url, stack: e.stack } });
         break;
       default:
         break;
@@ -248,13 +278,37 @@ export class ProjectOrchestrator {
     onEvent(e);
   }
 
+  /** Persist a single message into the conversation-scoped store via the
+   *  control plane, which auto-titles untitled threads from the first user
+   *  message and bumps `updatedAt`. Best-effort: a store failure must not
+   *  break the live stream the user is watching. */
+  private async persistToConversation(
+    projectId: string,
+    conversationId: string | undefined,
+    partial: {
+      role: ProjectMessageRole;
+      kind: ProjectMessageKind;
+      content: string;
+      agent?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    try {
+      await this.deps.cp.appendChatMessage({ projectId, conversationId, ...partial });
+    } catch {
+      // swallow — durable persistence is best-effort behind the live stream
+    }
+  }
+
   private appendMessage(
     projectId: string,
     partial: Omit<ProjectMessage, "id" | "projectId" | "createdAt">,
     onEvent: OrchestratorEventHandler,
+    conversationId?: string,
   ): ProjectMessage {
     const msg = this.makeMessage({ projectId, ...partial });
     this.ensure(projectId).messages.push(msg);
+    void this.persistToConversation(projectId, conversationId, { role: partial.role, kind: partial.kind, content: partial.content, agent: partial.agent, metadata: partial.metadata });
     onEvent({ kind: "message_persisted", message: msg });
     return msg;
   }
