@@ -36,6 +36,40 @@ function isDir(p) {
   }
 }
 
+/* --- Self-heal an EMPTY database (incident recovery) -------------------
+   Baselining marks every migration "applied" WITHOUT running its SQL — it
+   assumes the schema already exists (prod was first provisioned via
+   `prisma db push`). If the database is empty (tables dropped / a fresh
+   DATABASE_URL), baselining then leaves the app with no tables and every
+   query 500s. So: before baselining, check for a core table; if it's
+   missing, materialise the full schema with `prisma db push` (idempotent,
+   non-destructive without --accept-data-loss — it only CREATES what's
+   missing). On a healthy DB this is a no-op and behaviour is unchanged. */
+{
+  const { PrismaClient } = await import("@prisma/client");
+  const prisma = new PrismaClient();
+  let schemaMissing = false;
+  try {
+    await prisma.$queryRawUnsafe('SELECT 1 FROM "Project" LIMIT 1');
+  } catch (e) {
+    if (/does not exist/i.test(String(e?.message ?? e))) schemaMissing = true;
+  } finally {
+    await prisma.$disconnect();
+  }
+  if (schemaMissing) {
+    console.log("▸ core schema missing — running `prisma db push` to create it");
+    const r = spawnSync(
+      "npx",
+      ["--yes", "prisma", "db", "push", "--skip-generate"],
+      { stdio: "inherit", env: process.env, shell: true },
+    );
+    if (r.status !== 0) {
+      console.error("`prisma db push` failed — aborting baseline");
+      process.exit(1);
+    }
+  }
+}
+
 const names = readdirSync(MIGRATIONS_DIR)
   .filter((n) => isDir(resolve(MIGRATIONS_DIR, n)))
   .sort();
