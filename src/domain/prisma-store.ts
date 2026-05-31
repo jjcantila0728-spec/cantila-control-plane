@@ -41,6 +41,8 @@ import type {
   Session as DbSession,
   Invite as DbInvite,
   Membership as DbMembership,
+  Conversation as DbConversation,
+  ProjectMessage as DbProjectMessage,
 } from "@prisma/client";
 import type {
   Store,
@@ -85,6 +87,10 @@ import type {
   ConnectionAuditEvent,
   WorkflowExecutionRecord,
   WorkflowExecutionEvent,
+  Conversation,
+  ProjectChatMessage,
+  ProjectMessageRole,
+  ProjectMessageKind,
 } from "./types";
 import { getPrisma } from "../lib/prisma";
 
@@ -2169,6 +2175,140 @@ export class PrismaStore implements Store {
       .sort((a, b) => b.at.localeCompare(a.at))
       .slice(0, limit);
   }
+
+  /* ----- multi-conversation chat history (conversations design 2026-05-30) ----- */
+
+  async createConversation(c: Conversation): Promise<Conversation> {
+    const row = await this.db.conversation.create({
+      data: {
+        id: c.id,
+        projectId: c.projectId,
+        title: c.title,
+        createdAt: new Date(c.createdAt),
+        updatedAt: new Date(c.updatedAt),
+      },
+    });
+    return toConversation(row);
+  }
+
+  async getConversation(id: string): Promise<Conversation | null> {
+    const row = await this.db.conversation.findUnique({ where: { id } });
+    return row ? toConversation(row) : null;
+  }
+
+  async listConversations(projectId: string): Promise<Conversation[]> {
+    const rows = await this.db.conversation.findMany({
+      where: { projectId },
+      // Most-recently-active first; tie-break on createdAt desc so the
+      // ordering is stable even when two threads share a timestamp.
+      orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }],
+    });
+    return rows.map(toConversation);
+  }
+
+  async updateConversation(
+    id: string,
+    patch: Partial<Conversation>,
+  ): Promise<Conversation> {
+    const row = await this.db.conversation.update({
+      where: { id },
+      data: {
+        ...(patch.title !== undefined ? { title: patch.title } : {}),
+        // Bump updatedAt explicitly when asked; otherwise Prisma's
+        // @updatedAt handles it on any write.
+        ...(patch.updatedAt !== undefined
+          ? { updatedAt: new Date(patch.updatedAt) }
+          : {}),
+      },
+    });
+    return toConversation(row);
+  }
+
+  async deleteConversation(id: string): Promise<boolean> {
+    // ProjectMessage.conversationId declares onDelete: Cascade, so deleting
+    // the conversation row removes its messages too.
+    try {
+      await this.db.conversation.delete({ where: { id } });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async createChatMessage(
+    m: ProjectChatMessage,
+  ): Promise<ProjectChatMessage> {
+    const row = await this.db.projectMessage.create({
+      data: {
+        id: m.id,
+        projectId: m.projectId,
+        conversationId: m.conversationId ?? null,
+        role: m.role,
+        agent: m.agent ?? null,
+        kind: m.kind,
+        content: m.content,
+        metadata: (m.metadata ?? null) as Prisma.InputJsonValue,
+        createdAt: new Date(m.createdAt),
+      },
+    });
+    return toChatMessage(row);
+  }
+
+  async listChatMessages(
+    conversationId: string,
+  ): Promise<ProjectChatMessage[]> {
+    const rows = await this.db.projectMessage.findMany({
+      where: { conversationId },
+      orderBy: { createdAt: "asc" },
+    });
+    return rows.map(toChatMessage);
+  }
+
+  async listChatMessagesByProject(
+    projectId: string,
+  ): Promise<ProjectChatMessage[]> {
+    const rows = await this.db.projectMessage.findMany({
+      where: { projectId },
+      orderBy: { createdAt: "asc" },
+    });
+    return rows.map(toChatMessage);
+  }
+
+  async attachNullMessagesToConversation(
+    projectId: string,
+    conversationId: string,
+  ): Promise<number> {
+    const res = await this.db.projectMessage.updateMany({
+      where: { projectId, conversationId: null },
+      data: { conversationId },
+    });
+    return res.count;
+  }
+}
+
+function toConversation(r: DbConversation): Conversation {
+  return {
+    id: r.id,
+    projectId: r.projectId,
+    title: r.title,
+    createdAt: r.createdAt.toISOString(),
+    updatedAt: r.updatedAt.toISOString(),
+  };
+}
+
+function toChatMessage(r: DbProjectMessage): ProjectChatMessage {
+  return {
+    id: r.id,
+    projectId: r.projectId,
+    conversationId: r.conversationId ?? null,
+    role: r.role as ProjectMessageRole,
+    agent: r.agent ?? undefined,
+    kind: r.kind as ProjectMessageKind,
+    content: r.content,
+    metadata:
+      (r.metadata as Record<string, unknown> | null) ?? undefined,
+    createdAt: r.createdAt.toISOString(),
+  };
 }
 
 function encodeVerified(v: StoredAgentAction["verified"]): string {

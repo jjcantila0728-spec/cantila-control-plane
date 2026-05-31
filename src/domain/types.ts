@@ -1075,3 +1075,56 @@ export interface ApiKey {
   lastUsedAt?: string;
   createdAt: string;
 }
+
+/* ----- multi-conversation chat history (conversations design 2026-05-30) ----- */
+
+/** Who/what emitted a chat message. Mirrors the Prisma `ProjectMessageRole`
+ *  enum (and the orchestrator's own role union). */
+export type ProjectMessageRole = "user" | "agent" | "system" | "tool";
+
+/** Variant of a chat message — a plain message, an op card, a result card,
+ *  or an asset card. Mirrors the Prisma `ProjectMessageKind` enum. */
+export type ProjectMessageKind = "message" | "op_card" | "result" | "asset";
+
+/** One chat conversation (thread) within a project — like a ChatGPT/Claude
+ *  conversation (conversations design 2026-05-30). A project can hold many;
+ *  the legacy single-thread history is backfilled into one titled "Main".
+ *  Messages hang off a conversation; deleting a conversation cascades its
+ *  messages. */
+export interface Conversation {
+  id: string;
+  projectId: string;
+  title: string;
+  createdAt: string;
+  /** Bumped on each new message in the thread — drives the list ordering. */
+  updatedAt: string;
+}
+
+/** A persisted chat message scoped to a conversation. The store-layer
+ *  shape of the orchestrator's `ProjectMessage`; the `conversationId` is
+ *  nullable so legacy rows survive until `ensureDefaultConversation`
+ *  backfills them into the project's "Main" conversation. */
+export interface ProjectChatMessage {
+  id: string;
+  projectId: string;
+  /** The conversation this message belongs to. Null on legacy rows until
+   *  backfilled. */
+  conversationId: string | null;
+  role: ProjectMessageRole;
+  /** Specialist agent / skill that emitted the row, when not the user. */
+  agent?: string;
+  kind: ProjectMessageKind;
+  content: string;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+}
+
+/** Conversation list-row the Console renders — the bare `Conversation`
+ *  plus the two derived fields the list view needs (message count + a
+ *  short preview of the last message). */
+export interface ConversationSummary extends Conversation {
+  messageCount: number;
+  /** First ~120 chars of the most recent message's content, or "" when
+   *  the conversation is empty. */
+  lastPreview: string;
+}
