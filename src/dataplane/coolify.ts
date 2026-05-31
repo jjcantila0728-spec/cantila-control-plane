@@ -23,6 +23,7 @@
        node_exporter / docker-stats SSH path (plan §19.7).
    ============================================================ */
 
+import { generateKeyPairSync, createPublicKey } from "node:crypto";
 import type { Project, ProjectMetricSample, Region, Runtime } from "../domain/types";
 import type { DataPlane, DeploySource } from "../deploy/pipeline";
 import type { MetricsCollector } from "./metrics-collector";
@@ -99,6 +100,15 @@ export interface CoolifyDataPlaneOptions {
    *  implementation is `TraefikRpsCollector` — Prometheus scrape
    *  of Coolify's bundled Traefik. */
   rpsCollector?: RpsCollector;
+  /** Cantila Gitea base URL (e.g. https://git.cantila.app). When set
+   *  together with `giteaToken`, `repoHost: "cantila"` projects deploy
+   *  via Coolify's private-deploy-key flow (SSH + a per-project deploy
+   *  key) instead of `/applications/public` — which mangles a
+   *  self-hosted HTTPS URL into an unclonable `owner/repo` path. */
+  giteaApiUrl?: string;
+  /** Gitea admin token, used to register each project's deploy key on
+   *  its repo. */
+  giteaToken?: string;
 }
 
 /** Concrete per-project routing — apiUrl/apiToken/serverUuid/projectUuid
@@ -144,6 +154,8 @@ export class CoolifyDataPlane implements DataPlane {
   ) => Promise<void>;
   private readonly metricsCollector?: MetricsCollector;
   private readonly rpsCollector?: RpsCollector;
+  private readonly giteaApiUrl?: string;
+  private readonly giteaToken?: string;
 
   constructor(opts: CoolifyDataPlaneOptions) {
     this.defaultApiUrl = opts.apiUrl.replace(/\/+$/, "");
@@ -153,6 +165,8 @@ export class CoolifyDataPlane implements DataPlane {
     this.persistAppUuid = opts.persistAppUuid;
     this.metricsCollector = opts.metricsCollector;
     this.rpsCollector = opts.rpsCollector;
+    this.giteaApiUrl = opts.giteaApiUrl?.replace(/\/+$/, "") || undefined;
+    this.giteaToken = opts.giteaToken || undefined;
 
     const regions = new Map<Region, ResolvedRegionGroup>();
     if (opts.regions && Object.keys(opts.regions).length > 0) {
@@ -467,8 +481,22 @@ export class CoolifyDataPlane implements DataPlane {
       return created.uuid;
     }
 
+    // Cantila-hosted Gitea repo: Coolify's `/applications/public` mangles a
+    // self-hosted HTTPS URL into an unclonable `owner/repo` path, so we use
+    // the private-deploy-key (SSH) flow — register a per-project deploy key
+    // on the Gitea repo + in Coolify, then create the app pointing at the
+    // scp-style SSH URL (which Coolify stores verbatim).
+    if (
+      project.repoHost === "cantila" &&
+      project.repoUrl &&
+      this.giteaApiUrl &&
+      this.giteaToken
+    ) {
+      return this.createCantilaGitApp(project, region, name, fqdn);
+    }
+
     if (project.repoUrl) {
-      // Public git deploy via Nixpacks (the common case).
+      // Public git deploy via Nixpacks (GitHub etc.).
       const body = {
         project_uuid: region.projectUuid,
         server_uuid: region.serverUuid,
@@ -510,6 +538,94 @@ export class CoolifyDataPlane implements DataPlane {
       region,
     );
     return created.uuid;
+  }
+
+  /** Create a Coolify app for a Cantila-hosted (Gitea) repo via the
+   *  private-deploy-key flow. Generates a per-project RSA key, registers
+   *  the public half on the Gitea repo (read-only) and the private half in
+   *  Coolify, then creates the app pointing at the scp-style SSH URL —
+   *  which Coolify stores verbatim (unlike `/applications/public`, which
+   *  strips the host of a self-hosted HTTPS URL). */
+  private async createCantilaGitApp(
+    project: Project,
+    region: ResolvedRegion,
+    name: string,
+    fqdn: string,
+  ): Promise<string> {
+    const parsed = parseGiteaRepo(project.repoUrl!);
+    if (!parsed) {
+      throw new Error(`cannot parse Cantila repo URL: ${project.repoUrl}`);
+    }
+    const { host, owner, repo } = parsed;
+    const sshUrl = `git@${host}:${owner}/${repo}.git`;
+
+    // 1. Per-project RSA keypair (no ssh-keygen dependency in the container).
+    const { privateKey, publicKey } = generateKeyPairSync("rsa", {
+      modulusLength: 4096,
+      publicKeyEncoding: { type: "spki", format: "pem" },
+      privateKeyEncoding: { type: "pkcs1", format: "pem" },
+    });
+    const sshPub = sshRsaFromPublicPem(publicKey as string);
+
+    // 2. Register the public key as a read-only deploy key on the Gitea repo
+    //    (idempotent — 422 means it's already there).
+    await this.addGiteaDeployKey(owner, repo, sshPub, `coolify-${project.id}`);
+
+    // 3. Register the private key in Coolify.
+    const key = await this.request<{ uuid: string }>(
+      "POST",
+      "/security/keys",
+      { name: `cantila-${project.id}`, private_key: privateKey as string },
+      region,
+    );
+
+    // 4. Create the app via the deploy-key endpoint (SSH URL kept verbatim).
+    const created = await this.request<{ uuid: string }>(
+      "POST",
+      "/applications/private-deploy-key",
+      {
+        project_uuid: region.projectUuid,
+        server_uuid: region.serverUuid,
+        environment_name: this.environmentName,
+        name,
+        private_key_uuid: key.uuid,
+        git_repository: sshUrl,
+        git_branch: project.branch ?? "main",
+        build_pack: "nixpacks",
+        ports_exposes: "3000",
+        domains: fqdn,
+        instant_deploy: false,
+      },
+      region,
+    );
+    return created.uuid;
+  }
+
+  /** Add a read-only deploy key to a Gitea repo. Tolerates 422 (already set). */
+  private async addGiteaDeployKey(
+    owner: string,
+    repo: string,
+    publicKey: string,
+    title: string,
+  ): Promise<void> {
+    const res = await fetch(
+      `${this.giteaApiUrl}/api/v1/repos/${owner}/${repo}/keys`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `token ${this.giteaToken}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({ title, key: publicKey, read_only: true }),
+      },
+    );
+    if (!res.ok && res.status !== 422) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        `Gitea add deploy key → ${res.status}: ${text.slice(0, 300)}`,
+      );
+    }
   }
 
   private async syncEnv(
@@ -584,6 +700,52 @@ interface CoolifyResource {
   /** Free-text from the Coolify backend, e.g. "running:unknown",
    *  "running:healthy", "exited", "restarting". */
   status?: string;
+}
+
+/** Parse a Cantila Gitea clone URL into host/owner/repo (repo without .git). */
+function parseGiteaRepo(
+  url: string,
+): { host: string; owner: string; repo: string } | null {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.replace(/^\/+/, "").split("/");
+    if (parts.length < 2) return null;
+    const owner = parts[0]!;
+    const repo = parts[1]!.replace(/\.git$/, "");
+    if (!owner || !repo) return null;
+    return { host: u.host, owner, repo };
+  } catch {
+    return null;
+  }
+}
+
+/** Encode an RSA public key (SPKI PEM) as an OpenSSH `ssh-rsa AAAA...` line. */
+function sshRsaFromPublicPem(pem: string): string {
+  const jwk = createPublicKey(pem).export({ format: "jwk" }) as {
+    n: string;
+    e: string;
+  };
+  const blob = Buffer.concat([
+    sshField(Buffer.from("ssh-rsa")),
+    sshField(mpint(Buffer.from(jwk.e, "base64url"))),
+    sshField(mpint(Buffer.from(jwk.n, "base64url"))),
+  ]);
+  return `ssh-rsa ${blob.toString("base64")}`;
+}
+
+/** Length-prefixed (uint32 BE) SSH wire field. */
+function sshField(buf: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(buf.length, 0);
+  return Buffer.concat([len, buf]);
+}
+
+/** SSH mpint: prepend 0x00 when the high bit is set (values are signed). */
+function mpint(buf: Buffer): Buffer {
+  if (buf.length > 0 && (buf[0]! & 0x80) !== 0) {
+    return Buffer.concat([Buffer.from([0x00]), buf]);
+  }
+  return buf;
 }
 
 function appNameFor(project: Project): string {

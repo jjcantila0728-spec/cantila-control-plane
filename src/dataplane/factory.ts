@@ -259,6 +259,8 @@ export function selectDataPlane(
         persistAppUuid,
         metricsCollector,
         rpsCollector,
+        giteaApiUrl: env.GITEA_URL?.trim() || undefined,
+        giteaToken: env.GITEA_TOKEN?.trim() || undefined,
       }),
       label: liveLabel,
       live: true,
