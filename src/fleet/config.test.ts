@@ -25,3 +25,16 @@ test("fleetConfig exposes budget + concurrency caps", () => {
   assert.ok(c.maxBudgetUsd > 0);
   assert.ok(c.maxConcurrentBuilds >= 1);
 });
+
+test("autodeploy defaults off; FLEET_AUTODEPLOY=on enables it", () => {
+  const prev = process.env.FLEET_AUTODEPLOY;
+  delete process.env.FLEET_AUTODEPLOY;
+  assert.equal(fleetConfig().autodeploy, false);
+  process.env.FLEET_AUTODEPLOY = "on";
+  assert.equal(fleetConfig().autodeploy, true);
+  process.env.FLEET_AUTODEPLOY = "true";
+  assert.equal(fleetConfig().autodeploy, true);
+  process.env.FLEET_AUTODEPLOY = "off";
+  assert.equal(fleetConfig().autodeploy, false);
+  if (prev === undefined) delete process.env.FLEET_AUTODEPLOY; else process.env.FLEET_AUTODEPLOY = prev;
+});

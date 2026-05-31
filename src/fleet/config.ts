@@ -15,6 +15,8 @@ export interface FleetConfig {
   maxBudgetUsd: number;
   /** Max number of builds running concurrently at the fleet level. */
   maxConcurrentBuilds: number;
+  /** When true, passing builds are automatically deployed to production. */
+  autodeploy: boolean;
 }
 
 function num(envKey: string, fallback: number): number {
@@ -32,5 +34,6 @@ export function fleetConfig(): FleetConfig {
     buildTokenBudget: num("FLEET_BUILD_TOKEN_BUDGET", 300_000),
     maxBudgetUsd: num("FLEET_MAX_BUDGET_USD", 2),
     maxConcurrentBuilds: num("FLEET_MAX_CONCURRENT_BUILDS", 2),
+    autodeploy: /^(on|true|1)$/i.test(process.env.FLEET_AUTODEPLOY ?? ""),
   };
 }
