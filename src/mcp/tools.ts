@@ -1107,5 +1107,168 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
         );
       },
     },
+
+    /* ---------- cantila_push_files ---------- */
+    {
+      name: "cantila_push_files",
+      description:
+        "Commit a set of files into a project's own Cantila git repo (auto-created if the project has none) and deploy. Lets an agent ship an app with no public repo and no GitHub credentials — files land in the project's git.cantila.app repo and go live.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          projectId: {
+            type: "string",
+            description: "The Cantila project id.",
+          },
+          files: {
+            type: "array",
+            description:
+              "Files to commit. Each entry: { path, content, encoding?, message? }.",
+            items: {
+              type: "object",
+              properties: {
+                path: {
+                  type: "string",
+                  description: "Repo-relative path, e.g. src/app/page.tsx.",
+                },
+                content: { type: "string", description: "File contents." },
+                encoding: {
+                  type: "string",
+                  enum: ["utf-8", "base64"],
+                  description:
+                    "Content encoding. Use base64 for binary assets. Defaults to utf-8.",
+                },
+                message: {
+                  type: "string",
+                  description: "Optional per-file commit message.",
+                },
+              },
+              required: ["path", "content"],
+            },
+          },
+          message: {
+            type: "string",
+            description:
+              "Default commit message for files that don't carry their own.",
+          },
+          deploy: {
+            type: "boolean",
+            description: "Deploy after committing. Defaults to true.",
+          },
+        },
+        required: ["projectId", "files"],
+      },
+      handler: async (args) => {
+        const projectId = String(args.projectId ?? "");
+        if (!projectId) return errorText("projectId is required.");
+        const rawFiles = Array.isArray(args.files) ? args.files : [];
+        if (rawFiles.length === 0) {
+          return errorText("files must be a non-empty array.");
+        }
+
+        // Validate + normalise every entry before any side effect.
+        const files: { path: string; content: string; message?: string }[] = [];
+        for (const f of rawFiles) {
+          if (!f || typeof f !== "object") {
+            return errorText("each file must be an object.");
+          }
+          const rec = f as Record<string, unknown>;
+          const path = String(rec.path ?? "").trim();
+          if (!path) return errorText("each file needs a non-empty path.");
+          if (typeof rec.content !== "string") {
+            return errorText(`file ${path}: content must be a string.`);
+          }
+          let content = rec.content;
+          if (rec.encoding === "base64") {
+            try {
+              content = Buffer.from(rec.content, "base64").toString("utf-8");
+            } catch {
+              return errorText(`file ${path}: invalid base64 content.`);
+            }
+          }
+          files.push({
+            path,
+            content,
+            message:
+              typeof rec.message === "string" ? rec.message : undefined,
+          });
+        }
+
+        // Ensure the project has a Cantila git repo.
+        const ensured = await cp.ensureProjectRepo(projectId);
+        if (!ensured) return errorText("project not found.");
+        if (!ensured.repoUrl) {
+          return errorText(
+            "Cantila git backend not configured (GITEA_URL unset) — cannot host files for this project.",
+          );
+        }
+
+        // Look up existing blob shas so re-pushed paths update instead of failing.
+        const listing = await cp.listProjectFiles(projectId);
+        const shaByPath = new Map<string, string>();
+        if (listing && "files" in listing) {
+          for (const node of listing.files) {
+            if (node.sha) shaByPath.set(node.path, node.sha);
+          }
+        }
+
+        const defaultMessage =
+          typeof args.message === "string" && args.message.trim()
+            ? args.message.trim()
+            : "Push files via Cantila MCP";
+
+        let committed = 0;
+        let lastCommitSha = "";
+        for (const file of files) {
+          const result = await cp.writeProjectFile(projectId, {
+            path: file.path,
+            content: file.content,
+            sha: shaByPath.get(file.path),
+            message: file.message ?? defaultMessage,
+          });
+          if (!result || "error" in result) {
+            const reason =
+              result && "error" in result ? result.error : "unknown";
+            return errorText(
+              `Committed ${committed}/${files.length} file(s); failed on ${file.path}: ${reason}.`,
+            );
+          }
+          committed += 1;
+          lastCommitSha = result.commitSha;
+        }
+
+        const lines = [
+          `Committed ${committed} file(s) to ${ensured.repoUrl} (${ensured.branch ?? "main"})`,
+          `Last commit: ${lastCommitSha}`,
+        ];
+
+        if (args.deploy === false) {
+          lines.push(
+            "Skipped deploy (deploy:false) — run cantila_deploy when ready.",
+          );
+          return text(lines.join("\n"));
+        }
+
+        try {
+          const outcome = await cp.deploy(projectId, {
+            trigger: "mcp",
+            source: { kind: "chat" },
+          });
+          lines.push(
+            `Deploy ${outcome.status} — ${outcome.url}`,
+            `Deployment: ${outcome.deploymentId}`,
+            `Steps: ${outcome.steps.join(" -> ")}`,
+          );
+        } catch (err) {
+          lines.push(
+            `Files committed, but deploy failed: ${
+              err instanceof Error ? err.message : "deploy failed"
+            }. Retry with cantila_deploy.`,
+          );
+          return errorText(lines.join("\n"));
+        }
+        return text(lines.join("\n"));
+      },
+    },
   ];
 }
