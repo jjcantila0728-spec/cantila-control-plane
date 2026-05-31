@@ -144,6 +144,18 @@ export interface Store {
 
   getMailboxByProject(projectId: string): Promise<Mailbox | null>;
   createMailbox(m: Mailbox): Promise<Mailbox>;
+  /** Patch an auto-wired mailbox by id (used by the boot reconcile to
+   *  migrate legacy addresses to the canonical scheme). Returns null
+   *  when no mailbox has that id. */
+  updateMailbox(
+    id: string,
+    patch: Partial<
+      Pick<
+        Mailbox,
+        "address" | "sendingDomain" | "smtpHost" | "smtpUser" | "status"
+      >
+    >,
+  ): Promise<Mailbox | null>;
 
   /* ----- hosted mailboxes (plan §4.4 — real inboxes, many per project) ----- */
 
@@ -626,6 +638,26 @@ export class InMemoryStore implements Store {
   async createMailbox(m: Mailbox): Promise<Mailbox> {
     this.mailboxes.set(m.projectId, m);
     return m;
+  }
+
+  async updateMailbox(
+    id: string,
+    patch: Partial<
+      Pick<
+        Mailbox,
+        "address" | "sendingDomain" | "smtpHost" | "smtpUser" | "status"
+      >
+    >,
+  ): Promise<Mailbox | null> {
+    // The map is keyed by projectId, so find the row by its id.
+    for (const [projectId, m] of this.mailboxes) {
+      if (m.id === id) {
+        const next = { ...m, ...patch };
+        this.mailboxes.set(projectId, next);
+        return next;
+      }
+    }
+    return null;
   }
 
   /* ----- hosted mailboxes (plan §4.4) ----- */

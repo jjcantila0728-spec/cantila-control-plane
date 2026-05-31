@@ -588,6 +588,27 @@ export class PrismaStore implements Store {
     return toMailbox(row);
   }
 
+  async updateMailbox(
+    id: string,
+    patch: Partial<
+      Pick<
+        Mailbox,
+        "address" | "sendingDomain" | "smtpHost" | "smtpUser" | "status"
+      >
+    >,
+  ): Promise<Mailbox | null> {
+    try {
+      const row = await this.db.mailbox.update({
+        where: { id },
+        data: { ...patch },
+      });
+      return toMailbox(row);
+    } catch {
+      // No row with that id (P2025) — treat as a no-op miss.
+      return null;
+    }
+  }
+
   /* ----- hosted mailboxes (plan §4.4) ----- */
 
   async createHostedMailbox(m: HostedMailbox): Promise<HostedMailbox> {

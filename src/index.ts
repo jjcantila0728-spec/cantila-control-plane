@@ -9,6 +9,7 @@ import { config } from "./config";
 import { createStore } from "./domain/create-store";
 import { seedOwnerAccount } from "./domain/seed-owner";
 import { seedPlatformProject } from "./domain/seed-platform";
+import { reconcileProjectMailboxes } from "./domain/reconcile-mailboxes";
 import { selectDataPlane } from "./dataplane/factory";
 import { selectProvisioner } from "./dataplane/coolify-provisioner";
 import { ControlPlane } from "./core/control-plane";
@@ -4043,6 +4044,12 @@ app
     const platformSeed = await seedPlatformProject(store);
     app.log.info(
       `platform seed: account=${platformSeed.accountId} created=${platformSeed.created}`,
+    );
+    // Migrate any legacy auto-wired mailbox addresses to the canonical
+    // info@<slug>.cantila.app scheme (plan §4.4). Idempotent.
+    const mbxReco = await reconcileProjectMailboxes(store);
+    app.log.info(
+      `mailbox reconcile: updated=${mbxReco.updated}/${mbxReco.scanned}`,
     );
     cp.startBackgroundJobs();
     app.log.info("background jobs started (uptime sweeps every 30s)");

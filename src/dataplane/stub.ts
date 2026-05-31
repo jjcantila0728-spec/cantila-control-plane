@@ -10,6 +10,7 @@ import type { Project, ProjectMetricSample, Runtime } from "../domain/types";
 import type { ServiceProvisioner } from "../deploy/provisioning";
 import type { DataPlane, DeploySource } from "../deploy/pipeline";
 import { id, secret } from "../lib/ids";
+import { defaultProjectMailbox } from "../mail/default-mailbox";
 
 export const stubProvisioner: ServiceProvisioner = {
   async createDatabase(project: Project) {
@@ -21,12 +22,9 @@ export const stubProvisioner: ServiceProvisioner = {
   },
 
   async createMailbox(project: Project) {
-    const sendingDomain = `${project.slug}.send.cantila.email`;
+    // Canonical default: info@<slug>.cantila.app (plan §4.4 / §7.4).
     return {
-      address: `mailer@${sendingDomain}`,
-      sendingDomain,
-      smtpHost: "smtp.cantila.email",
-      smtpUser: project.slug,
+      ...defaultProjectMailbox(project.slug),
       smtpPassword: secret().slice(0, 32),
     };
   },
