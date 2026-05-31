@@ -540,12 +540,19 @@ export class CoolifyDataPlane implements DataPlane {
     return created.uuid;
   }
 
-  /** Create a Coolify app for a Cantila-hosted (Gitea) repo via the
-   *  private-deploy-key flow. Generates a per-project RSA key, registers
-   *  the public half on the Gitea repo (read-only) and the private half in
-   *  Coolify, then creates the app pointing at the scp-style SSH URL —
-   *  which Coolify stores verbatim (unlike `/applications/public`, which
-   *  strips the host of a self-hosted HTTPS URL). */
+  /** Create a Coolify app for a Cantila-hosted (Gitea) repo.
+   *
+   *  Coolify's `/applications/public` mangles a self-hosted HTTPS URL into
+   *  an unclonable `owner/repo` path; its `/applications/private-deploy-key`
+   *  endpoint stores `git_repository` verbatim. We therefore use the
+   *  deploy-key endpoint but point it at an **HTTPS clone URL with an
+   *  embedded token** — cloning over HTTPS (the same transport the
+   *  control-plane already uses for the Gitea API) sidesteps the host's
+   *  SSH server entirely (git.cantila.app:22 is the host's OpenSSH, not
+   *  Gitea's key-only SSH, so SSH deploy keys can't authenticate there).
+   *  The endpoint still requires a `private_key_uuid`, so we register a
+   *  throwaway key purely to satisfy it; the HTTPS URL is what actually
+   *  authenticates the clone. */
   private async createCantilaGitApp(
     project: Project,
     region: ResolvedRegion,
@@ -557,21 +564,17 @@ export class CoolifyDataPlane implements DataPlane {
       throw new Error(`cannot parse Cantila repo URL: ${project.repoUrl}`);
     }
     const { host, owner, repo } = parsed;
-    const sshUrl = `git@${host}:${owner}/${repo}.git`;
+    // Token-authenticated HTTPS clone URL. Coolify redacts URLs in its
+    // deploy logs; the token lives only in the trusted Coolify app config.
+    const httpsUrl = `https://oauth2:${this.giteaToken}@${host}/${owner}/${repo}.git`;
 
-    // 1. Per-project RSA keypair (no ssh-keygen dependency in the container).
-    const { privateKey, publicKey } = generateKeyPairSync("rsa", {
-      modulusLength: 4096,
+    // The deploy-key endpoint requires a private_key_uuid; register a
+    // throwaway key to satisfy it (unused — the clone goes over HTTPS).
+    const { privateKey } = generateKeyPairSync("rsa", {
+      modulusLength: 2048,
       publicKeyEncoding: { type: "spki", format: "pem" },
       privateKeyEncoding: { type: "pkcs1", format: "pem" },
     });
-    const sshPub = sshRsaFromPublicPem(publicKey as string);
-
-    // 2. Register the public key as a read-only deploy key on the Gitea repo
-    //    (idempotent — 422 means it's already there).
-    await this.addGiteaDeployKey(owner, repo, sshPub, `coolify-${project.id}`);
-
-    // 3. Register the private key in Coolify.
     const key = await this.request<{ uuid: string }>(
       "POST",
       "/security/keys",
@@ -579,7 +582,6 @@ export class CoolifyDataPlane implements DataPlane {
       region,
     );
 
-    // 4. Create the app via the deploy-key endpoint (SSH URL kept verbatim).
     const created = await this.request<{ uuid: string }>(
       "POST",
       "/applications/private-deploy-key",
@@ -589,7 +591,7 @@ export class CoolifyDataPlane implements DataPlane {
         environment_name: this.environmentName,
         name,
         private_key_uuid: key.uuid,
-        git_repository: sshUrl,
+        git_repository: httpsUrl,
         git_branch: project.branch ?? "main",
         build_pack: "nixpacks",
         ports_exposes: "3000",
