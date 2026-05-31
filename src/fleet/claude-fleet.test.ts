@@ -94,3 +94,32 @@ test("build records the session cost into the governor", async () => {
   await fleet.build({ projectId: "pc", plan, onEvent: () => {} });
   assert.equal(gov.snapshot().spentUsd, 0.42);
 });
+
+test("build returns buildOk:true when the success sentinel is present", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "cf-"));
+  const q = (() => async function* () {
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "Built it. FLEET_BUILD_RESULT: ok" }] } };
+    yield { type: "result", subtype: "success", is_error: false, total_cost_usd: 0.01 };
+  })();
+  const fleet = new ClaudeFleet({ query: q as any, workspaceRoot: root, registry: new FleetSessionRegistry() } as any);
+  const res = await fleet.build({ projectId: "pok", plan, onEvent: () => {} });
+  assert.equal(res.buildOk, true);
+});
+
+test("build returns buildOk:false on failed/absent sentinel", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "cf-"));
+  const q = (() => async function* () {
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "Could not finish. FLEET_BUILD_RESULT: failed" }] } };
+    yield { type: "result", subtype: "success", is_error: false, total_cost_usd: 0.01 };
+  })();
+  const fleet = new ClaudeFleet({ query: q as any, workspaceRoot: root, registry: new FleetSessionRegistry() } as any);
+  const res = await fleet.build({ projectId: "pfail", plan, onEvent: () => {} });
+  assert.equal(res.buildOk, false);
+});
+
+test("build returns buildOk:false when offline (null query)", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "cf-"));
+  const fleet = new ClaudeFleet({ query: null, workspaceRoot: root, registry: new FleetSessionRegistry() } as any);
+  const res = await fleet.build({ projectId: "poff", plan, onEvent: () => {} });
+  assert.equal(res.buildOk, false);
+});
