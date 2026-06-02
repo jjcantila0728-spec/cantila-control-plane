@@ -44,6 +44,8 @@ import {
   resolveActorAccountId,
 } from "./auth/account";
 import type { SessionAuth } from "./auth/account";
+import { authorizeSuperuser } from "./auth/superuser";
+import type { PlatformRole } from "./domain/types";
 
 // 10 auth attempts per IP per minute, shared across login/register/sso.
 const authRateLimit = createRateLimiter({ windowMs: 60_000, max: 10 });
@@ -272,6 +274,7 @@ app.addHook("onRequest", async (req) => {
         // which throws NoAccountContextError (→ 401) rather than inventing one.
         accountId: resolved.currentAccountId ?? resolved.user.accountId,
         sessionId: resolved.sessionId,
+        platformRole: resolved.user.platformRole,
       };
       return;
     }
@@ -556,6 +559,28 @@ function requireBillingPrincipal(
     return null;
   }
   return actAs ?? key?.accountId ?? session?.accountId ?? null;
+}
+
+/* ----- super-user route guard (super-user management, slice 1).
+ *  Resolves the caller's session, asserts the platform role, and — on
+ *  success — returns the SessionAuth. On failure it sends the mapped
+ *  status and returns null. Read routes pass `["superadmin","support"]`. */
+function requireSuper(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  allow: PlatformRole[] = ["superadmin"],
+): SessionAuth | null {
+  const decision = authorizeSuperuser(getSessionAuth(request), allow);
+  if (!decision.ok) {
+    cp.recordAuthFailure({
+      reason: "scope_denied",
+      method: request.method,
+      route: request.url.split("?")[0],
+    });
+    reply.code(decision.status).send({ error: decision.error });
+    return null;
+  }
+  return decision.session;
 }
 
 /** Validate that `projectId` exists AND (when auth is enforced) belongs to
@@ -3725,6 +3750,106 @@ app.post("/v1/me/orgs/leave", async (request, reply) => {
     return reply.code(400).send({ error: result.error });
   }
   return result;
+});
+
+/* ============================================================
+   Platform super-user back-office — read-only (super-user
+   management, slice 1). All under /v1/admin/*, all behind
+   requireSuper. Every cross-tenant read writes an AuditLog row,
+   EXCEPT GET /v1/admin/audit (reading the log is not itself logged).
+   ============================================================ */
+
+const ADMIN_READ: PlatformRole[] = ["superadmin", "support"];
+
+app.get("/v1/admin/accounts", async (request, reply) => {
+  const session = requireSuper(request, reply, ADMIN_READ);
+  if (!session) return;
+  const q = request.query as { q?: string; plan?: string; billingStatus?: string };
+  const accounts = await cp.adminListAccounts({
+    q: q.q,
+    plan: q.plan,
+    billingStatus: q.billingStatus,
+  });
+  await cp.recordAdminAudit({
+    actorUserId: session.userId,
+    action: "admin.account.list",
+    targetType: "account",
+    metadata: { q: q.q, plan: q.plan, billingStatus: q.billingStatus },
+    ip: request.ip,
+  });
+  return { accounts };
+});
+
+app.get("/v1/admin/accounts/:id", async (request, reply) => {
+  const session = requireSuper(request, reply, ADMIN_READ);
+  if (!session) return;
+  const { id: accountId } = request.params as { id: string };
+  const account = await cp.getAccount(accountId);
+  if (!account) return reply.code(404).send({ error: "account not found" });
+  const [projects, members] = await Promise.all([
+    cp.listProjects(accountId),
+    cp.listMembershipsByAccount(accountId),
+  ]);
+  await cp.recordAdminAudit({
+    actorUserId: session.userId,
+    action: "admin.account.read",
+    targetType: "account",
+    targetId: accountId,
+    accountId,
+    ip: request.ip,
+  });
+  return { account, projects, members };
+});
+
+app.get("/v1/admin/users", async (request, reply) => {
+  const session = requireSuper(request, reply, ADMIN_READ);
+  if (!session) return;
+  const q = request.query as { q?: string };
+  const users = await cp.adminListUsers({ q: q.q });
+  await cp.recordAdminAudit({
+    actorUserId: session.userId,
+    action: "admin.user.list",
+    targetType: "user",
+    metadata: { q: q.q },
+    ip: request.ip,
+  });
+  return { users };
+});
+
+app.get("/v1/admin/projects", async (request, reply) => {
+  const session = requireSuper(request, reply, ADMIN_READ);
+  if (!session) return;
+  const q = request.query as { accountId?: string; status?: string };
+  const projects = await cp.adminListProjects({ accountId: q.accountId, status: q.status });
+  await cp.recordAdminAudit({
+    actorUserId: session.userId,
+    action: "admin.project.list",
+    targetType: "project",
+    metadata: { accountId: q.accountId, status: q.status },
+    ip: request.ip,
+  });
+  return { projects };
+});
+
+app.get("/v1/admin/audit", async (request, reply) => {
+  const session = requireSuper(request, reply, ADMIN_READ);
+  if (!session) return;
+  const q = request.query as {
+    actorUserId?: string;
+    action?: string;
+    targetType?: string;
+    targetId?: string;
+    limit?: string;
+  };
+  const events = await cp.listAdminAudit({
+    actorUserId: q.actorUserId,
+    action: q.action,
+    targetType: q.targetType,
+    targetId: q.targetId,
+    limit: q.limit ? Math.max(1, Math.min(500, Number(q.limit))) : 100,
+  });
+  // Deliberately NOT audited — reading the log must not generate log noise.
+  return { events };
 });
 
 // Connect a git repository (plan §5.1 — git-based deploys). Response

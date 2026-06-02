@@ -37,6 +37,7 @@ import type {
   ActivityKind,
   TeamMember,
   MemberRole,
+  Membership,
   AuthUser,
   PlatformRole,
   AuditLog,
@@ -5973,6 +5974,13 @@ export class ControlPlane {
     limit?: number;
   }): Promise<AuditLog[]> {
     return this.deps.store.listAuditLogs(filter);
+  }
+
+  /** Every membership of one account — powers the super-user account
+   *  detail view (`GET /v1/admin/accounts/:id`). Cross-tenant; only
+   *  reachable behind authorizeSuperuser at the route layer. */
+  async listMembershipsByAccount(id: string): Promise<Membership[]> {
+    return this.deps.store.listMembershipsByAccount(id);
   }
 
   /** Promote/demote a user's platform role (super-user management). Used by
