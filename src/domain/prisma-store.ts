@@ -1202,6 +1202,19 @@ export class PrismaStore implements Store {
     return row ? toDomain(row) : null;
   }
 
+  async updateDomain(id: string, patch: Partial<Domain>): Promise<Domain> {
+    const row = await this.db.domain.update({
+      where: { id },
+      data: {
+        ...(patch.hostname !== undefined ? { hostname: patch.hostname } : {}),
+        ...(patch.kind !== undefined ? { kind: patch.kind } : {}),
+        ...(patch.sslActive !== undefined ? { sslActive: patch.sslActive } : {}),
+        ...(patch.primary !== undefined ? { primary: patch.primary } : {}),
+      },
+    });
+    return toDomain(row);
+  }
+
   /* ----- api keys ----- */
 
   async createApiKey(k: ApiKey): Promise<ApiKey> {

@@ -236,6 +236,7 @@ export interface Store {
   listDomains(projectId: string): Promise<Domain[]>;
   createDomain(d: Domain): Promise<Domain>;
   findDomainByHostname(hostname: string): Promise<Domain | null>;
+  updateDomain(id: string, patch: Partial<Domain>): Promise<Domain>;
 
   createApiKey(k: ApiKey): Promise<ApiKey>;
   listApiKeys(accountId: string): Promise<ApiKey[]>;
@@ -1011,6 +1012,14 @@ export class InMemoryStore implements Store {
     return (
       [...this.domains.values()].find((d) => d.hostname === hostname) ?? null
     );
+  }
+
+  async updateDomain(id: string, patch: Partial<Domain>): Promise<Domain> {
+    const existing = this.domains.get(id);
+    if (!existing) throw new Error(`domain ${id} not found`);
+    const updated = { ...existing, ...patch };
+    this.domains.set(id, updated);
+    return updated;
   }
 
   private apiKeys = new Map<string, ApiKey>();
