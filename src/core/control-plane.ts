@@ -38,6 +38,7 @@ import type {
   TeamMember,
   MemberRole,
   AuthUser,
+  PlatformRole,
   Invite,
   AccountBillingStatus,
   DunningNotice,
@@ -5793,6 +5794,7 @@ export class ControlPlane {
           name: string;
           avatarUrl?: string;
           accountId?: string;
+          platformRole?: PlatformRole;
         };
         expiresAt: string;
         currentAccountId?: string;
@@ -5822,10 +5824,155 @@ export class ControlPlane {
         name: user.name,
         avatarUrl: user.avatarUrl,
         accountId: user.accountId,
+        platformRole: user.platformRole,
       },
       expiresAt: session.expiresAt,
       currentAccountId: session.currentAccountId ?? user.accountId,
     };
+  }
+
+  /* ============================================================
+     Platform super-user back-office read model (super-user
+     management, slice 1). All cross-tenant; only reachable behind
+     authorizeSuperuser at the route layer. Reads only.
+     ============================================================ */
+
+  /** Every account with cheap per-account counts, filterable by plan and
+   *  a free-text query over name/handle. Newest first. */
+  async adminListAccounts(filter: {
+    q?: string;
+    plan?: string;
+    billingStatus?: string;
+    limit?: number;
+  }): Promise<
+    Array<{
+      id: string;
+      name: string;
+      handle: string;
+      plan: string;
+      billingStatus?: string;
+      projectCount: number;
+      memberCount: number;
+      createdAt: string;
+    }>
+  > {
+    const q = filter.q?.trim().toLowerCase();
+    const accounts = await this.deps.store.listAccounts();
+    const rows = [];
+    for (const a of accounts) {
+      if (filter.plan && a.plan !== filter.plan) continue;
+      if (filter.billingStatus && (a.billingStatus ?? "active") !== filter.billingStatus) continue;
+      if (q && !a.name.toLowerCase().includes(q) && !a.handle.toLowerCase().includes(q)) continue;
+      const [projects, members] = await Promise.all([
+        this.deps.store.listProjects(a.id),
+        this.deps.store.listMembershipsByAccount(a.id),
+      ]);
+      rows.push({
+        id: a.id,
+        name: a.name,
+        handle: a.handle,
+        plan: a.plan,
+        billingStatus: a.billingStatus,
+        projectCount: projects.length,
+        memberCount: members.length,
+        createdAt: a.createdAt,
+      });
+    }
+    rows.sort((x, y) => y.createdAt.localeCompare(x.createdAt));
+    return rows.slice(0, filter.limit ?? 200);
+  }
+
+  /** Every user across tenants, filterable by a free-text query over
+   *  email/name. Returns a privacy-conscious projection (no passwordHash). */
+  async adminListUsers(filter: { q?: string; limit?: number }): Promise<
+    Array<{
+      id: string;
+      email: string;
+      name: string;
+      platformRole?: string;
+      accountId?: string;
+      emailVerifiedAt?: string;
+      createdAt: string;
+    }>
+  > {
+    const q = filter.q?.trim().toLowerCase();
+    const users = await this.deps.store.listAllUsers();
+    return users
+      .filter(
+        (u) =>
+          !q ||
+          u.email.toLowerCase().includes(q) ||
+          u.name.toLowerCase().includes(q),
+      )
+      .slice(0, filter.limit ?? 200)
+      .map((u) => ({
+        id: u.id,
+        email: u.email,
+        name: u.name,
+        platformRole: u.platformRole,
+        accountId: u.accountId,
+        emailVerifiedAt: u.emailVerifiedAt,
+        createdAt: u.createdAt,
+      }));
+  }
+
+  /** Every project across accounts, filterable by account + status. */
+  async adminListProjects(filter: {
+    accountId?: string;
+    status?: string;
+    limit?: number;
+  }): Promise<Project[]> {
+    const all = await this.deps.store.listAllProjects();
+    return all
+      .filter(
+        (p) =>
+          (!filter.accountId || p.accountId === filter.accountId) &&
+          (!filter.status || p.status === filter.status),
+      )
+      .slice(0, filter.limit ?? 500);
+  }
+
+  /** Write one audit record. Looks up the actor's email so the trail is
+   *  attributable even after the user is deleted. */
+  async recordAdminAudit(input: {
+    actorUserId: string;
+    action: string;
+    targetType: string;
+    targetId?: string;
+    accountId?: string;
+    metadata?: Record<string, unknown>;
+    ip?: string;
+  }): Promise<void> {
+    const actor = await this.deps.store.getUser(input.actorUserId);
+    await this.deps.store.recordAuditLog({
+      id: id("aud"),
+      actorUserId: input.actorUserId,
+      actorEmail: actor?.email ?? "unknown",
+      action: input.action,
+      targetType: input.targetType,
+      targetId: input.targetId,
+      accountId: input.accountId,
+      metadata: input.metadata ?? {},
+      ip: input.ip,
+      createdAt: now(),
+    });
+  }
+
+  /** Read the audit log (newest first), filterable. */
+  async listAdminAudit(filter: {
+    actorUserId?: string;
+    action?: string;
+    targetType?: string;
+    targetId?: string;
+    limit?: number;
+  }) {
+    return this.deps.store.listAuditLogs(filter);
+  }
+
+  /** Promote/demote a user's platform role (super-user management). Used by
+   *  the owner seed today; later slices expose a guarded route. */
+  async setUserPlatformRole(userId: string, role: PlatformRole | null) {
+    return this.deps.store.setUserPlatformRole(userId, role);
   }
 
   /* ============================================================
