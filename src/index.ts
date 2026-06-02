@@ -2519,24 +2519,34 @@ app.post("/v1/account/me/change-password", async (request, reply) => {
 // `CANTILA_ADMIN_TOKEN` env var; returns 503 when the token is not set so
 // dev environments can't accidentally hand out resets.
 app.post("/v1/auth/admin/reset-password", async (request, reply) => {
-  const adminToken = process.env.CANTILA_ADMIN_TOKEN;
-  if (!adminToken) {
-    return reply
-      .code(503)
-      .send({ error: "admin reset disabled — CANTILA_ADMIN_TOKEN not set" });
+  // Primary path (super-user management, slice 1): a superadmin session.
+  const decision = authorizeSuperuser(getSessionAuth(request), ["superadmin"]);
+  let actorUserId: string | null = decision.ok ? decision.session.userId : null;
+
+  if (!decision.ok) {
+    // Deprecated fallback — the shared CANTILA_ADMIN_TOKEN. Kept so prod
+    // tooling does not break mid-migration; logs a deprecation warning.
+    // TODO(slice-2): remove this fallback once no caller relies on it.
+    const adminToken = process.env.CANTILA_ADMIN_TOKEN;
+    const provided = request.headers["x-cantila-admin-token"];
+    if (
+      adminToken &&
+      typeof provided === "string" &&
+      provided === adminToken
+    ) {
+      request.log.warn(
+        "DEPRECATED: x-cantila-admin-token used for admin reset — migrate to a superadmin session",
+      );
+    } else {
+      // Neither a superadmin session nor a valid token → mirror the guard's
+      // decision (401 when no session at all, 403 otherwise).
+      return reply.code(decision.status).send({ error: decision.error });
+    }
   }
-  const provided = request.headers["x-cantila-admin-token"];
-  if (typeof provided !== "string" || provided !== adminToken) {
-    return reply.code(403).send({ error: "forbidden" });
-  }
-  const body = (request.body ?? {}) as {
-    email?: unknown;
-    newPassword?: unknown;
-  };
+
+  const body = (request.body ?? {}) as { email?: unknown; newPassword?: unknown };
   if (typeof body.email !== "string" || typeof body.newPassword !== "string") {
-    return reply
-      .code(400)
-      .send({ error: "email and newPassword (string) required" });
+    return reply.code(400).send({ error: "email and newPassword (string) required" });
   }
   try {
     const result = await cp.adminResetPassword({
@@ -2546,10 +2556,17 @@ app.post("/v1/auth/admin/reset-password", async (request, reply) => {
     if (!result) {
       return reply.code(404).send({ error: "no user with that email" });
     }
+    await cp.recordAdminAudit({
+      actorUserId: actorUserId ?? "token:CANTILA_ADMIN_TOKEN",
+      action: "admin.user.reset_password",
+      targetType: "user",
+      metadata: { email: body.email, viaToken: actorUserId === null },
+      ip: request.ip,
+    });
     return reply.code(200).send(result);
   } catch (err) {
     return reply
-      .code(400)
+      .code(500)
       .send({ error: err instanceof Error ? err.message : "reset failed" });
   }
 });
