@@ -293,6 +293,12 @@ export class CoolifyDataPlane implements DataPlane {
       }
     }
 
+    // Ensure the schema-migration hook is set BEFORE we redeploy, so the
+    // tenant's Prisma schema is applied to its (freshly-provisioned, empty)
+    // Postgres in this very deploy — otherwise the app boots against a
+    // schema-less DB and every query throws P2021 ("table does not exist").
+    await this.ensureMigrateHook(uuid, region);
+
     // Push env vars (best-effort — Coolify returns 200 even for already-set keys).
     await this.syncEnv(uuid, env, region);
 
@@ -630,6 +636,38 @@ export class CoolifyDataPlane implements DataPlane {
     }
   }
 
+  /** (Re)assert the Coolify `pre_deployment_command` that applies the
+   *  tenant's Prisma schema to its database before the new container
+   *  serves traffic. Runs inside a container of the freshly-built image
+   *  (so `prisma`, the schema and `DATABASE_URL` are all present):
+   *    - no Prisma in the repo            → no-op (the `if` exits 0);
+   *    - schema + committed migrations     → `prisma migrate deploy`;
+   *    - schema only (AI-generated apps)   → `prisma db push` creates it.
+   *  Idempotent: set on every deploy so both new and pre-existing apps
+   *  converge. Best-effort — a failure to set the hook must not abort an
+   *  otherwise-valid deploy (the app is no worse off than before), but it
+   *  is the primary mechanism, so we surface failures to telemetry. */
+  private async ensureMigrateHook(
+    appUuid: string,
+    region: ResolvedRegion,
+  ): Promise<void> {
+    try {
+      await this.request(
+        "PATCH",
+        `/applications/${encodeURIComponent(appUuid)}`,
+        { pre_deployment_command: MIGRATE_PREDEPLOY_COMMAND },
+        region,
+      );
+    } catch (err) {
+      // Don't fail the deploy because the bookkeeping PATCH failed.
+      console.warn(
+        `[coolify] failed to set migrate pre_deployment_command on ${appUuid}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   private async syncEnv(
     appUuid: string,
     env: Record<string, string>,
@@ -749,6 +787,17 @@ function mpint(buf: Buffer): Buffer {
   }
   return buf;
 }
+
+/** Shell run inside a one-off container of the built image, before the
+ *  new container goes live, on every deploy. Guarded so non-Prisma apps
+ *  are a clean no-op; prefers committed migrations and falls back to
+ *  `db push` for apps that ship only a schema (typical of AI-generated
+ *  projects). `--accept-data-loss` is required for non-interactive
+ *  `db push`; on a fresh, empty database it only ever creates tables. */
+const MIGRATE_PREDEPLOY_COMMAND =
+  "sh -c 'if [ -f prisma/schema.prisma ]; then " +
+  "if [ -d prisma/migrations ]; then npx --yes prisma migrate deploy; " +
+  "else npx --yes prisma db push --accept-data-loss --skip-generate; fi; fi'";
 
 function appNameFor(project: Project): string {
   // Deterministic + reversible: lets us look the app back up from the

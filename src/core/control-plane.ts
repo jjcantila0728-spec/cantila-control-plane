@@ -4253,9 +4253,29 @@ export class ControlPlane {
     };
   }
 
+  /** Pick a globally-unique subdomain slug. Every project owns a
+   *  `<slug>.cantila.app` domain row, so two projects whose names
+   *  slugify to the same base would otherwise fight over the same
+   *  live URL (and Traefik route). When the base is taken we append a
+   *  numeric suffix — `homes`, `homes-2`, `homes-3`, … — using the
+   *  global domain table as the source of truth. */
+  private async uniqueSlug(base: string): Promise<string> {
+    const apex = "cantila.app";
+    for (let n = 1; n <= 10_000; n++) {
+      const candidate = n === 1 ? base : `${base}-${n}`;
+      const taken = await this.deps.store.findDomainByHostname(
+        `${candidate}.${apex}`,
+      );
+      if (!taken) return candidate;
+    }
+    // Pathological collision count — fall back to an id-suffixed slug so
+    // creation never hangs or throws.
+    return `${base}-${id("prj").slice(-6)}`;
+  }
+
   /** Register a new project. Its services are auto-wired on first deploy. */
   async createProject(input: CreateProjectInput): Promise<Project> {
-    const slug = slugify(input.name);
+    const slug = await this.uniqueSlug(slugify(input.name));
     const project: Project = {
       id: id("prj"),
       accountId: input.accountId,
