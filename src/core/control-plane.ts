@@ -5210,6 +5210,17 @@ export class ControlPlane {
     return { token, expiresAt };
   }
 
+  /** Public entry for the MCP OAuth connector (src/auth/oauth-provider.ts):
+   *  mint a session for a user who has just consented at /authorize. Same
+   *  semantics as a fresh Console login — scoped to the user's primary
+   *  membership — so the issued token resolves through the normal session
+   *  path and every MCP tool stays confined to that account. */
+  async mintSessionForOAuth(
+    userId: string,
+  ): Promise<{ token: string; expiresAt: string }> {
+    return this.mintSession(userId);
+  }
+
   /** Sign in with email + password. An unknown email or a wrong password
    *  both fail with the same generic message — there is no auto-register,
    *  so the endpoint can't be used to enumerate accounts. New users sign
