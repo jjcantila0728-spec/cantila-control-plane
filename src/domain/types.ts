@@ -62,6 +62,14 @@ export type ConnectionStatus = "active" | "expired" | "broken";
 /** Team roles — plan §5.5. Mirrors the Prisma `Role` enum. */
 export type MemberRole = "owner" | "admin" | "developer" | "viewer";
 
+/** Platform super-user role (super-user management, slice 1). Distinct
+ *  from tenant `MemberRole` — this grants access to the cross-tenant
+ *  back-office, NOT to any one account. Stored as a guarded string on
+ *  `User.platformRole` (null = ordinary tenant user). `superadmin` = full
+ *  system management; `support` = read-only back-office (and, in later
+ *  slices, impersonation). */
+export type PlatformRole = "superadmin" | "support";
+
 /** Plan tier — mirrors the Prisma `Plan` enum. Stored on Account so the
  *  billing surface can render the right limits without consulting the
  *  PLAN_CATALOG at every read. */
@@ -225,6 +233,10 @@ export interface AuthUser {
   /** Profile picture URL from a social IdP (Google `picture`, GitHub
    *  `avatar_url`). Undefined for password-only users. */
   avatarUrl?: string;
+  /** Platform super-user role (super-user management, slice 1). Undefined
+   *  for ordinary tenant users (every legacy row). Set to `"superadmin"`
+   *  for the founder by the owner seed. */
+  platformRole?: PlatformRole;
   createdAt: string;
 }
 
@@ -1127,4 +1139,24 @@ export interface ConversationSummary extends Conversation {
   /** First ~120 chars of the most recent message's content, or "" when
    *  the conversation is empty. */
   lastPreview: string;
+}
+
+/** One append-only platform audit record (super-user management, slice 1).
+ *  Written for every privileged `/v1/admin/*` action. `actorEmail` is
+ *  denormalized so the trail survives user deletion. `metadata` captures
+ *  the action's parameters (e.g. the search filter used on a read). */
+export interface AuditLog {
+  id: string;
+  actorUserId: string;
+  actorEmail: string;
+  /** Dotted action name, e.g. "admin.account.read", "admin.user.list". */
+  action: string;
+  /** "account" | "user" | "project" | "audit" | … (free-form). */
+  targetType: string;
+  targetId?: string;
+  /** The tenant the action touched, when applicable. */
+  accountId?: string;
+  metadata: Record<string, unknown>;
+  ip?: string;
+  createdAt: string;
 }
