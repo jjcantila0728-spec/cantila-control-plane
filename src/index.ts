@@ -3841,12 +3841,14 @@ app.get("/v1/admin/audit", async (request, reply) => {
     targetId?: string;
     limit?: string;
   };
+  const rawLimit = Number.parseInt(String(q.limit ?? ""), 10);
+  const limit = Number.isNaN(rawLimit) ? 100 : Math.max(1, Math.min(500, rawLimit));
   const events = await cp.listAdminAudit({
     actorUserId: q.actorUserId,
     action: q.action,
     targetType: q.targetType,
     targetId: q.targetId,
-    limit: q.limit ? Math.max(1, Math.min(500, Number(q.limit))) : 100,
+    limit,
   });
   // Deliberately NOT audited — reading the log must not generate log noise.
   return { events };
