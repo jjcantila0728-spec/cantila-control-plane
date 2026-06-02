@@ -3684,6 +3684,7 @@ app.get("/v1/me", async (request) => {
               name: user.name,
               emailVerifiedAt: user.emailVerifiedAt ?? null,
               avatarUrl: user.avatarUrl ?? null,
+              platformRole: user.platformRole ?? null,
             }
           : null,
       };
