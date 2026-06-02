@@ -1195,6 +1195,16 @@ export class ControlPlane {
    *  re-requests. Keyed by token id. The raw token never lands
    *  here — only `sha256(<id>:<raw>)`. */
   private oneShotTokens = new Map<string, OneShotToken>();
+  /** In-flight SSO logins, keyed by the OAuth `state`. The PKCE
+   *  codeVerifier is minted here and kept SERVER-SIDE — it must never be
+   *  trusted from the client at callback time. Each entry is single-use
+   *  (deleted on completion) and TTL-pruned. In-memory + short-lived, same
+   *  posture as `otpChallenges` (a restart just means re-initiating login;
+   *  multi-node would move this to a shared store). */
+  private ssoFlights = new Map<
+    string,
+    { codeVerifier: string; provider: string; expiresAt: number }
+  >();
 
   constructor(private deps: ControlPlaneDeps) {
     this.uptimeChecker = new UptimeChecker(
@@ -5611,6 +5621,17 @@ export class ControlPlane {
     const codeVerifier = generatePkceVerifier();
     const codeChallenge = derivePkceChallenge(codeVerifier);
     const { authorizeUrl } = p.startLogin({ redirectUri, state, codeChallenge });
+    // Keep the verifier server-side, bound to this state (single-use, TTL).
+    // Prune expired flights opportunistically so abandoned logins don't leak.
+    const now = Date.now();
+    for (const [key, flight] of this.ssoFlights) {
+      if (flight.expiresAt < now) this.ssoFlights.delete(key);
+    }
+    this.ssoFlights.set(state, {
+      codeVerifier,
+      provider,
+      expiresAt: now + 10 * 60 * 1000,
+    });
     return { authorizeUrl, provider: p.label, state, codeVerifier };
   }
 
@@ -5622,6 +5643,7 @@ export class ControlPlane {
     code?: string;
     email?: string;
     codeVerifier?: string;
+    state?: string;
   }): Promise<
     | {
         token: string;
@@ -5630,9 +5652,32 @@ export class ControlPlane {
       }
     | { error: string }
   > {
+    // When the callback presents a `state`, bind it to the server-side
+    // flight: the state must match a live, single-use entry for this
+    // provider, and the PKCE verifier is taken from the server — never
+    // from the request body. This closes login-CSRF / code-injection.
+    let codeVerifier = input.codeVerifier;
+    if (input.state !== undefined) {
+      const flight = this.ssoFlights.get(input.state);
+      this.ssoFlights.delete(input.state); // single-use, even on failure
+      if (
+        !flight ||
+        flight.expiresAt < Date.now() ||
+        flight.provider !== input.provider
+      ) {
+        return {
+          error: "login session expired or invalid — please sign in again",
+        };
+      }
+      codeVerifier = flight.codeVerifier;
+    }
     let profile: SsoProfile;
     try {
-      profile = await getSsoProvider(input.provider).completeLogin(input);
+      profile = await getSsoProvider(input.provider).completeLogin({
+        code: input.code,
+        email: input.email,
+        codeVerifier,
+      });
     } catch (err) {
       return {
         error: err instanceof Error ? err.message : "SSO login failed",

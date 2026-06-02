@@ -10,6 +10,7 @@
     "start": "npm run prisma:baseline && npm run prisma:deploy && node --env-file-if-exists=.env.local dist/index.js",
     "postinstall": "prisma generate",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"src/**/*.test.ts\"",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:baseline": "node scripts/baseline-prisma-migrations.mjs",

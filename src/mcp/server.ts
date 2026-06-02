@@ -21,12 +21,26 @@ export interface ToolResult {
   isError?: boolean;
 }
 
+/** Who is calling a tool. Threaded per-request by the transport so tools
+ *  can enforce tenant isolation. `accountId` is the authenticated account
+ *  for a remote (HTTP) caller; `null` means a trusted local stdio caller
+ *  (Claude Desktop running on the operator's own machine), which retains
+ *  the legacy owner-default behavior. */
+export interface McpContext {
+  accountId: string | null;
+}
+
+const LOCAL_CONTEXT: McpContext = { accountId: null };
+
 export interface ToolDefinition {
   name: string;
   description: string;
   /** JSON Schema describing the tool's arguments. */
   inputSchema: Record<string, unknown>;
-  handler: (args: Record<string, unknown>) => Promise<ToolResult>;
+  handler: (
+    args: Record<string, unknown>,
+    ctx: McpContext,
+  ) => Promise<ToolResult>;
 }
 
 const PROTOCOL_VERSION = "2024-11-05";
@@ -62,6 +76,7 @@ export class McpServer {
    *  to a 204). Same path the stdio transport uses internally. */
   async handleRpc(
     message: { id?: number | string; method?: string; params?: unknown },
+    ctx: McpContext = LOCAL_CONTEXT,
   ): Promise<JsonRpcResponse | null> {
     // notifications (e.g. notifications/initialized) carry no id — no reply
     if (message.id === undefined || message.method === undefined) return null;
@@ -70,6 +85,7 @@ export class McpServer {
       const result = await this.dispatch(
         message.method,
         (message.params ?? {}) as Record<string, unknown>,
+        ctx,
       );
       return { jsonrpc: "2.0", id, result };
     } catch (err) {
@@ -117,6 +133,7 @@ export class McpServer {
   private async dispatch(
     method: string,
     params: Record<string, unknown>,
+    ctx: McpContext,
   ): Promise<unknown> {
     switch (method) {
       case "initialize":
@@ -140,7 +157,7 @@ export class McpServer {
         const tool = this.tools.get(name);
         if (!tool) throw new Error(`unknown tool: ${name}`);
         const args = (params.arguments ?? {}) as Record<string, unknown>;
-        return await tool.handler(args);
+        return await tool.handler(args, ctx);
       }
       default:
         throw new Error(`unknown method: ${method}`);

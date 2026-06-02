@@ -55,6 +55,7 @@ import {
   createWebhookEndpoint,
   listWebhookEndpoints,
 } from "./services/webhooks-out";
+import { assertPublicHttpsUrl, SsrfBlockedError } from "./services/ssrf-guard";
 import {
   handleInboundWebhook,
   InboundSignatureError,
@@ -384,6 +385,18 @@ export function registerCantilapayRoutes(
       return reply
         .code(400)
         .send({ error: CantilapayError.invalidField(parsed.error.message).body });
+    }
+    // SSRF guard — the platform fetches this URL from inside the trusted
+    // network, so reject non-https / loopback / private / metadata targets.
+    try {
+      assertPublicHttpsUrl(parsed.data.url);
+    } catch (err) {
+      if (err instanceof SsrfBlockedError) {
+        return reply
+          .code(400)
+          .send({ error: CantilapayError.invalidField(err.message).body });
+      }
+      throw err;
     }
     const issued = await createWebhookEndpoint(prisma, {
       cantilapayAccountId: resolved.cantilapayAccountId,

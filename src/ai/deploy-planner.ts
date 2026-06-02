@@ -16,8 +16,8 @@
    ============================================================ */
 
 import Anthropic from "@anthropic-ai/sdk";
+import { resolveLlmEndpoint, llmSystem, type LlmEndpoint } from "./llm";
 
-const MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS = 1500;
 
 export type DeployPlanKind =
@@ -169,13 +169,13 @@ export class RuleBasedDeployPlanner implements DeployPlanner {
 
 /* ---------- Claude-backed planner ---------- */
 
-const SYSTEM_PROMPT = `You are Cantila's deploy planner. Cantila is a managed hosting + automation cloud — every project gets an auto-wired managed Postgres (when needed), a sending mailbox, and an SMS number. Projects fall into a fixed set of kinds: live_app, static_site, api, automation, worker, cron, ai_agent.
+export const SYSTEM_PROMPT = `You are Cantila's deploy planner. Cantila is a managed hosting + automation cloud — every project gets an auto-wired managed Postgres (when needed), a sending mailbox, and an SMS number. Projects fall into a fixed set of kinds: live_app, static_site, api, automation, worker, cron, ai_agent.
 
 Read a user's free-form chat prompt (sometimes with file attachments) and emit a single typed plan through the provided tool. Pick the kind, runtime, region, a friendly name, a one-line stack label, the auto-wired services it needs, an optional template reference, an ordered list of human-readable build steps, and the media assets the build agent should generate (logo, hero, favicon, icon set, hero animation, social OG image).
 
 Names: kebab-case, ≤ 32 chars, no leading dash. Build plan: 3–6 short imperative steps. Always emit a media object — set every field to false explicitly when none are needed. Never invent runtimes — pick from: static, node, python, php, go, ruby, docker.`;
 
-const PLAN_TOOL: Anthropic.Tool = {
+export const PLAN_TOOL: Anthropic.Tool = {
   name: "emit_deploy_plan",
   description: "Emit a single typed deploy plan for the prompt.",
   input_schema: {
@@ -223,17 +223,16 @@ export interface ClaudeDeployPlannerOptions {
 }
 
 export class ClaudeDeployPlanner implements DeployPlanner {
-  private client: Anthropic | null;
+  private endpoint: LlmEndpoint | null;
   private fallback: DeployPlanner;
 
   constructor(opts: ClaudeDeployPlannerOptions) {
-    const key = opts.apiKey ?? process.env.ANTHROPIC_API_KEY;
-    this.client = key ? new Anthropic({ apiKey: key }) : null;
+    this.endpoint = resolveLlmEndpoint(opts.apiKey);
     this.fallback = opts.fallback;
   }
 
   async plan(input: DeployPlannerInput): Promise<DeployPlan> {
-    if (!this.client) return this.fallback.plan(input);
+    if (!this.endpoint) return this.fallback.plan(input);
     try {
       const userTurn =
         `Prompt: ${input.prompt}\n` +
@@ -241,18 +240,12 @@ export class ClaudeDeployPlanner implements DeployPlanner {
           ? `Attached files: ${input.files.join(", ")}\n`
           : "");
 
-      const resp = await this.client.messages.create({
-        model: MODEL,
+      const resp = await this.endpoint.client.messages.create({
+        model: this.endpoint.model,
         max_tokens: MAX_TOKENS,
         tools: [PLAN_TOOL],
         tool_choice: { type: "tool", name: PLAN_TOOL.name },
-        system: [
-          {
-            type: "text",
-            text: SYSTEM_PROMPT,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
+        system: llmSystem(SYSTEM_PROMPT, this.endpoint.cache),
         messages: [{ role: "user", content: userTurn }],
       });
 
@@ -290,7 +283,7 @@ const STOPWORDS = new Set([
   "app", "project", "site",
 ]);
 
-function normalisePlan(plan: DeployPlan): DeployPlan {
+export function normalisePlan(plan: DeployPlan): DeployPlan {
   // Guard against missing nested fields when the LLM forgets a required
   // sub-property — defensive only, the tool schema makes them required.
   return {
@@ -311,14 +304,4 @@ function normalisePlan(plan: DeployPlan): DeployPlan {
       socialOgImage: !!plan.media?.socialOgImage,
     },
   };
-}
-
-/** Convenience factory — uses Claude when ANTHROPIC_API_KEY is set,
- *  rule-based otherwise. */
-export function buildDeployPlanner(): DeployPlanner {
-  const ruleBased = new RuleBasedDeployPlanner();
-  if (process.env.ANTHROPIC_API_KEY) {
-    return new ClaudeDeployPlanner({ fallback: ruleBased });
-  }
-  return ruleBased;
 }

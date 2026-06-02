@@ -21,8 +21,7 @@ import { cantilaTools } from "./mcp/tools";
 import { StubStripeAdapter, type StripeAdapter } from "./billing/stripe";
 import { StripeRealAdapter } from "./billing/stripe-real";
 import { RuleBasedAiAnalyser } from "./ai/analyser";
-import { ClaudeAiAnalyser } from "./ai/claude";
-import { buildDeployPlanner } from "./ai/deploy-planner";
+import { buildAiAnalyser, buildDeployPlanner } from "./ai/factory";
 import { buildImageProvider } from "./skills/image-provider";
 import { ProjectOrchestrator } from "./agents/project-orchestrator";
 import { buildDefaultRegistry } from "./automations/registry";
@@ -63,14 +62,14 @@ const stripe: StripeAdapter = process.env.STRIPE_SECRET_KEY
     })
   : new StubStripeAdapter();
 
-// AI analyser — auto-selects (plan §5.6 / §15.1). When `ANTHROPIC_API_KEY`
-// is set the Claude-backed analyser is wired with the rule-based one as
-// its fallback (any LLM error degrades to rule-based, not "broken").
-// Without the key the rule-based analyser runs standalone.
+// AI analyser — auto-selects for the configured provider (plan §5.6 /
+// §15.1). config.llm.provider picks Claude (default, ANTHROPIC_API_KEY) or
+// OpenAI (LLM_PROVIDER=openai + OPENAI_API_KEY, default gpt-5.4-mini); the
+// live analyser is wired with the rule-based one as its fallback (any LLM
+// error degrades to rule-based, not "broken"). Without a key the rule-based
+// analyser runs standalone.
 const ruleBased = new RuleBasedAiAnalyser();
-const aiAnalyser = process.env.ANTHROPIC_API_KEY
-  ? new ClaudeAiAnalyser({ fallback: ruleBased })
-  : ruleBased;
+const aiAnalyser = buildAiAnalyser(ruleBased);
 
 const store = createStore();
 
@@ -2395,6 +2394,9 @@ const ssoLoginSchema = z.object({
   code: z.string().optional(),
   email: z.string().optional(),
   codeVerifier: z.string().optional(),
+  // OAuth state — binds the callback to the server-side login flight so the
+  // control plane (not just the Console) enforces single-use CSRF protection.
+  state: z.string().optional(),
 });
 
 const sessionTokenSchema = z.object({
@@ -2928,7 +2930,19 @@ app.post("/v1/mcp", async (request, reply) => {
       error: { code: -32600, message: "invalid request" },
     });
   }
-  const response = await mcpServer.handleRpc(body);
+  // Thread the authenticated principal so every tool is confined to the
+  // caller's account (tenant isolation). For a remote HTTP caller this is
+  // always set when CANTILA_REQUIRE_AUTH is on (the onRequest gate above
+  // already rejected anonymous calls); `null` falls back to legacy
+  // owner-default behavior only when auth is off.
+  const mcpActAs = getActAs(request);
+  const mcpKey = getApiKey(request);
+  const mcpSession = getSessionAuth(request);
+  const mcpAccountId =
+    mcpActAs ?? mcpKey?.accountId ?? mcpSession?.accountId ?? null;
+  const response = await mcpServer.handleRpc(body, {
+    accountId: mcpAccountId,
+  });
   if (!response) {
     // notification — no reply body, just an empty 204
     return reply.code(204).send();

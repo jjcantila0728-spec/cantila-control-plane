@@ -62,7 +62,7 @@ test("commits files to the project's cantila repo and deploys", async () => {
       { path: "index.html", content: "<h1>Homes</h1>" },
       { path: "about.html", content: "<p>about</p>" },
     ],
-  });
+  }, { accountId: null });
   assert.ok(!res.isError, textOf(res));
   const out = textOf(res);
   assert.match(out, /Committed 2 file\(s\)/);
@@ -84,7 +84,7 @@ test("deploy:false commits without deploying", async () => {
     projectId: project.id,
     files: [{ path: "index.html", content: "hi" }],
     deploy: false,
-  });
+  }, { accountId: null });
   assert.ok(!res.isError, textOf(res));
   assert.match(textOf(res), /Skipped deploy/);
   const deployments = await cp.listProjectDeployments(project.id);
@@ -99,7 +99,7 @@ test("base64 content is decoded before commit", async () => {
     projectId: project.id,
     files: [{ path: "index.html", content: encoded, encoding: "base64" }],
     deploy: false,
-  });
+  }, { accountId: null });
   assert.ok(!res.isError, textOf(res));
   const read = await cp.readProjectFile(project.id, "index.html");
   assert.ok(read && "content" in read && read.content === "<h1>b64</h1>");
@@ -113,12 +113,12 @@ test("re-pushing a path updates its content", async () => {
     projectId: project.id,
     files: [{ path: "index.html", content: "v1" }],
     deploy: false,
-  });
+  }, { accountId: null });
   const res = await tool.handler({
     projectId: project.id,
     files: [{ path: "index.html", content: "v2" }],
     deploy: false,
-  });
+  }, { accountId: null });
   assert.ok(!res.isError, textOf(res));
   const read = await cp.readProjectFile(project.id, "index.html");
   assert.ok(read && "content" in read && read.content === "v2");
@@ -127,7 +127,10 @@ test("re-pushing a path updates its content", async () => {
 test("empty files array errors with no side effect", async () => {
   const { cp, store } = makeCp();
   const project = await seededProject(cp, store);
-  const res = await pushTool(cp).handler({ projectId: project.id, files: [] });
+  const res = await pushTool(cp).handler(
+    { projectId: project.id, files: [] },
+    { accountId: null },
+  );
   assert.equal(res.isError, true);
 });
 
@@ -135,6 +138,6 @@ test("missing projectId errors", async () => {
   const { cp } = makeCp();
   const res = await pushTool(cp).handler({
     files: [{ path: "a.txt", content: "b" }],
-  });
+  }, { accountId: null });
   assert.equal(res.isError, true);
 });

@@ -14,13 +14,11 @@ import { cantilaTools } from "./tools";
 import { StubStripeAdapter, type StripeAdapter } from "../billing/stripe";
 import { StripeRealAdapter } from "../billing/stripe-real";
 import { RuleBasedAiAnalyser } from "../ai/analyser";
-import { ClaudeAiAnalyser } from "../ai/claude";
+import { buildAiAnalyser } from "../ai/factory";
 
 async function main(): Promise<void> {
   const ruleBased = new RuleBasedAiAnalyser();
-  const aiAnalyser = process.env.ANTHROPIC_API_KEY
-    ? new ClaudeAiAnalyser({ fallback: ruleBased })
-    : ruleBased;
+  const aiAnalyser = buildAiAnalyser(ruleBased);
   const stripe: StripeAdapter = process.env.STRIPE_SECRET_KEY
     ? new StripeRealAdapter({
         secretKey: process.env.STRIPE_SECRET_KEY,

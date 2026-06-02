@@ -29,6 +29,7 @@ import type {
   CantilapayWebhookEndpointView,
 } from "../types";
 import { CANTILAPAY_WEBHOOK_SECRET_PREFIX } from "../types";
+import { assertUrlResolvesToPublic } from "./ssrf-guard";
 
 const MAX_BODY_PREVIEW = 512;
 const RETRY_SCHEDULE_SECONDS = [60, 300, 1800, 7200, 43200]; // 1m, 5m, 30m, 2h, 12h
@@ -242,6 +243,9 @@ export async function deliverPending(
     let responseBody = "";
     let success = false;
     try {
+      // Re-validate at delivery time to defeat DNS rebinding — the host may
+      // have resolved public when registered but private now.
+      await assertUrlResolvesToPublic(new URL(row.endpoint.url));
       const res = await fetch(row.endpoint.url, {
         method: "POST",
         headers: {

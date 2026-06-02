@@ -6,7 +6,7 @@
 
 import type { ControlPlane } from "../core/control-plane";
 import { ownerAccountId } from "../lib/owner-account";
-import type { ToolDefinition, ToolResult } from "./server";
+import type { McpContext, ToolDefinition, ToolResult } from "./server";
 import type {
   DbEngine,
   DeployTrigger,
@@ -59,8 +59,71 @@ function asEngine(value: unknown): DbEngine {
     : "postgres";
 }
 
+/* Per-call tenant-isolation guard for the MCP surface.
+ *
+ * The tool defs below are written for the trusted local (stdio) case and
+ * default account-scoped reads to the owner. Over HTTP (`POST /v1/mcp`)
+ * the transport threads the authenticated `ctx.accountId`, and EVERY tool
+ * must be confined to that account. Rather than sprinkle checks across ~28
+ * handlers, we derive each tool's scope from its declared inputSchema and
+ * enforce it in one place — fail-closed: a tool that declares neither
+ * `projectId` nor `accountId` (e.g. the global agents brain) is owner-only
+ * for remote callers, so future tools are safe by default too. */
+function withTenantGuard(
+  cp: ControlPlane,
+  def: ToolDefinition,
+): ToolDefinition {
+  const props = (def.inputSchema?.properties ?? {}) as Record<string, unknown>;
+  const scopesProject = "projectId" in props;
+  const scopesAccount = "accountId" in props;
+  const inner = def.handler;
+  return {
+    ...def,
+    handler: async (args, ctx) => {
+      // Trusted local stdio caller — legacy behavior, no confinement.
+      if (ctx.accountId == null) return inner(args, ctx);
+      const principal = ctx.accountId;
+
+      if (scopesProject) {
+        const projectId = String(args.projectId ?? "");
+        if (projectId) {
+          const project = await cp.getProject(projectId);
+          if (!project) return errorText(`Project ${projectId} not found.`);
+          if (
+            project.accountId !== principal &&
+            !(await cp.canActOnAccount(principal, project.accountId))
+          ) {
+            return errorText(
+              `Project ${projectId} belongs to a different account.`,
+            );
+          }
+        }
+      } else if (scopesAccount) {
+        const requested =
+          args.accountId != null ? String(args.accountId) : principal;
+        if (
+          requested !== principal &&
+          !(await cp.canActOnAccount(principal, requested))
+        ) {
+          return errorText(
+            `Account ${requested} is not accessible from your account.`,
+          );
+        }
+        // Pin the resolved account so the handler's `?? ownerAccountId()`
+        // fallback can never widen scope for a remote caller.
+        args = { ...args, accountId: requested };
+      } else if (principal !== ownerAccountId()) {
+        // Open/global tool (no project or account arg) — owner-only remotely.
+        return errorText("This tool is not available to your account.");
+      }
+
+      return inner(args, ctx);
+    },
+  };
+}
+
 export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
-  return [
+  const defs: ToolDefinition[] = [
     /* ---------- cantila_deploy ---------- */
     {
       name: "cantila_deploy",
@@ -1271,4 +1334,5 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
       },
     },
   ];
+  return defs.map((def) => withTenantGuard(cp, def));
 }

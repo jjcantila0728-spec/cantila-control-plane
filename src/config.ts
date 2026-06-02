@@ -53,4 +53,32 @@ export const config = {
   giteaUrl: process.env.GITEA_URL ?? "",
   /** Gitea admin API token used to create orgs/repos and read/write files. */
   giteaToken: process.env.GITEA_TOKEN ?? "",
+  /** Product-layer LLM provider (plan §5.6). Defaults reproduce the
+   *  original Anthropic/Claude behaviour exactly, so leaving these unset
+   *  changes nothing. Set LLM_PROVIDER=openai (with OPENAI_API_KEY) to
+   *  route the product analyser + deploy-planner to OpenAI — far cheaper
+   *  than Claude for these structured tool-calling tasks (default model
+   *  gpt-5.4-mini). Per-provider key/model resolution lives in ai/llm.ts.
+   *  NOTE 1: this governs the platform-default product LLM only — the
+   *  Fleet code-builder stays on the Claude Agent SDK.
+   *  NOTE 2: a tenant's bring-your-own Anthropic key (plan §4.3.1) always
+   *  targets real Anthropic regardless of these vars. */
+  llm: {
+    /** Active product provider: "anthropic" (default) or "openai". */
+    provider: (process.env.LLM_PROVIDER ?? "anthropic").trim().toLowerCase(),
+    /** Model id. Empty → per-provider default (claude-sonnet-4-6 for
+     *  anthropic, gpt-5.4-mini for openai). */
+    model: process.env.LLM_MODEL ?? "",
+    /** Base URL override for the active provider. Empty → provider default
+     *  (api.anthropic.com / api.openai.com). Point at a compatible endpoint
+     *  to use a self-hosted or alternate model. */
+    baseUrl: process.env.LLM_BASE_URL ?? "",
+    /** Explicit key override for the active provider. When unset the
+     *  provider-specific key below is used. */
+    apiKey: process.env.LLM_API_KEY ?? "",
+    /** Anthropic key — also the bring-your-own-key fallback. */
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
+    /** OpenAI key — used when provider is "openai". */
+    openaiApiKey: process.env.OPENAI_API_KEY ?? "",
+  },
 } as const;
