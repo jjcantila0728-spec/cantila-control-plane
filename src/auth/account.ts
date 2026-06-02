@@ -1,5 +1,5 @@
 import type { FastifyRequest } from "fastify";
-import type { ApiKey } from "../domain/types";
+import type { ApiKey, PlatformRole } from "../domain/types";
 
 /** The resolved Console session on a request. Set by the onRequest auth
  *  hook when a `cts_` Bearer token is presented. `accountId` is the
@@ -13,6 +13,10 @@ export interface SessionAuth {
   userId: string;
   accountId?: string;
   sessionId: string;
+  /** Platform super-user role for the signed-in user (super-user
+   *  management, slice 1). Undefined for ordinary tenant users. Set by the
+   *  onRequest auth hook from the resolved user row. */
+  platformRole?: PlatformRole;
 }
 
 /** Thrown by `resolveAccountId` / `resolveActorAccountId` when no
