@@ -39,6 +39,7 @@ import type {
   MemberRole,
   AuthUser,
   PlatformRole,
+  AuditLog,
   Invite,
   AccountBillingStatus,
   DunningNotice,
@@ -5863,6 +5864,7 @@ export class ControlPlane {
       if (filter.plan && a.plan !== filter.plan) continue;
       if (filter.billingStatus && (a.billingStatus ?? "active") !== filter.billingStatus) continue;
       if (q && !a.name.toLowerCase().includes(q) && !a.handle.toLowerCase().includes(q)) continue;
+      // N+1 acceptable: super-user only, not a hot path — batch if account count grows large
       const [projects, members] = await Promise.all([
         this.deps.store.listProjects(a.id),
         this.deps.store.listMembershipsByAccount(a.id),
@@ -5898,6 +5900,8 @@ export class ControlPlane {
     const q = filter.q?.trim().toLowerCase();
     const users = await this.deps.store.listAllUsers();
     return users
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
       .filter(
         (u) =>
           !q ||
@@ -5923,13 +5927,15 @@ export class ControlPlane {
     limit?: number;
   }): Promise<Project[]> {
     const all = await this.deps.store.listAllProjects();
-    return all
-      .filter(
-        (p) =>
-          (!filter.accountId || p.accountId === filter.accountId) &&
-          (!filter.status || p.status === filter.status),
-      )
-      .slice(0, filter.limit ?? 500);
+    return stripList(
+      all
+        .filter(
+          (p) =>
+            (!filter.accountId || p.accountId === filter.accountId) &&
+            (!filter.status || p.status === filter.status),
+        )
+        .slice(0, filter.limit ?? 500),
+    );
   }
 
   /** Write one audit record. Looks up the actor's email so the trail is
@@ -5965,13 +5971,13 @@ export class ControlPlane {
     targetType?: string;
     targetId?: string;
     limit?: number;
-  }) {
+  }): Promise<AuditLog[]> {
     return this.deps.store.listAuditLogs(filter);
   }
 
   /** Promote/demote a user's platform role (super-user management). Used by
    *  the owner seed today; later slices expose a guarded route. */
-  async setUserPlatformRole(userId: string, role: PlatformRole | null) {
+  async setUserPlatformRole(userId: string, role: PlatformRole | null): Promise<AuthUser> {
     return this.deps.store.setUserPlatformRole(userId, role);
   }
 
