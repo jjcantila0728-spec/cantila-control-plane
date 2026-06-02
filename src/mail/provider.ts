@@ -30,6 +30,7 @@
    ============================================================ */
 
 import type { MailEventKind } from "../core/control-plane";
+import { createMailcowMailProvider } from "./mailcow-mail-provider";
 
 /* ---------- outbound ---------- */
 
@@ -254,11 +255,13 @@ function parseJson(rawBody: string): Record<string, unknown> {
  *  determinism). The control plane reads `mailProvider` (the
  *  singleton) at module load. */
 export function createMailProvider(): MailProvider {
-  // Reserved env-var slot. When the real adapter ships, this
-  // becomes:
-  //   if (process.env.MAILCOW_URL && process.env.MAILCOW_API_KEY) {
-  //     return new MailcowMailProvider({ url: …, apiKey: … });
-  //   }
+  // Live SMTP submission when MAILCOW_SMTP_* is set (same env-gated
+  // one-file-swap pattern as createMailboxProvisioner / Stripe / SSO).
+  // Falls through to the deterministic stub otherwise — so today's
+  // offline behaviour and the reset/verify `debugLink` (suppressed only
+  // when `mailProvider.live`) are unchanged until the env is wired.
+  const live = createMailcowMailProvider();
+  if (live) return live;
   return new StubMailProvider();
 }
 

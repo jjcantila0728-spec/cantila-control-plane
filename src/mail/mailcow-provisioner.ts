@@ -74,10 +74,35 @@ export class MailcowMailboxProvisioner implements MailboxProvisioner {
       `/get/domain/${encodeURIComponent(domain)}`,
     );
     // A present domain returns an object containing "domain_name".
-    if (got.ok && got.detail.includes(`"domain_name"`)) return { ok: true };
+    if (got.ok && got.detail.includes(`"domain_name"`)) {
+      // Self-heal a domain that was added (e.g. manually in the UI) as a
+      // backup-MX / relay domain: such a domain hosts NO local mailboxes
+      // and relays everywhere, so inbound has no delivery target and no
+      // mailbox can send — the 2026-06-01 live send/receive break. Mailcow
+      // serialises these flags as bare numbers (`"backupmx": 1`); flip them
+      // off via /edit/domain so the domain delivers locally.
+      const isBackupMx =
+        /"backupmx"\s*:\s*"?1"?/.test(got.detail) ||
+        /"relay_all_recipients"\s*:\s*"?1"?/.test(got.detail);
+      if (isBackupMx) {
+        const fix = await this.call("POST", "/edit/domain", {
+          items: [domain],
+          attr: {
+            backupmx: "0",
+            relay_all_recipients: "0",
+            relay_unknown_only: "0",
+            active: "1",
+          },
+        });
+        if (!fix.ok) return { error: `ensureDomain repair failed: ${fix.detail}` };
+      }
+      return { ok: true };
+    }
     const add = await this.call("POST", "/add/domain", {
       domain,
       active: "1",
+      // Pin a primary (local-delivery) domain — never a backup-MX/relay.
+      backupmx: "0",
       restart_sogo: "0",
     });
     if (add.ok) return { ok: true };
