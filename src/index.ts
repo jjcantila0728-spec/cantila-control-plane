@@ -2515,9 +2515,10 @@ app.post("/v1/account/me/change-password", async (request, reply) => {
 });
 
 // Admin password reset — fills the gap until the real /forgot flow ships
-// (deferred to once Cantila Mail can deliver reset emails). Gated by the
-// `CANTILA_ADMIN_TOKEN` env var; returns 503 when the token is not set so
-// dev environments can't accidentally hand out resets.
+// (deferred to once Cantila Mail can deliver reset emails). Gated by a
+// platform `superadmin` session (super-user management, slice 1); the shared
+// `CANTILA_ADMIN_TOKEN` / `x-cantila-admin-token` header remains as a
+// DEPRECATED fallback that logs a warning when used (TODO(slice-2): remove).
 app.post("/v1/auth/admin/reset-password", async (request, reply) => {
   // Primary path (super-user management, slice 1): a superadmin session.
   const decision = authorizeSuperuser(getSessionAuth(request), ["superadmin"]);
