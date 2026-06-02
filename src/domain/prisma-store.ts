@@ -43,6 +43,7 @@ import type {
   Membership as DbMembership,
   Conversation as DbConversation,
   ProjectMessage as DbProjectMessage,
+  AuditLog as DbAuditLog,
 } from "@prisma/client";
 import type {
   Store,
@@ -91,6 +92,8 @@ import type {
   ProjectChatMessage,
   ProjectMessageRole,
   ProjectMessageKind,
+  AuditLog,
+  PlatformRole,
 } from "./types";
 import { getPrisma } from "../lib/prisma";
 
@@ -510,6 +513,13 @@ export class PrismaStore implements Store {
   async listProjects(accountId: string): Promise<Project[]> {
     const rows = await this.db.project.findMany({
       where: { accountId, platform: false },
+      orderBy: { createdAt: "desc" },
+    });
+    return rows.map(toProject);
+  }
+
+  async listAllProjects(): Promise<Project[]> {
+    const rows = await this.db.project.findMany({
       orderBy: { createdAt: "desc" },
     });
     return rows.map(toProject);
@@ -1424,6 +1434,7 @@ export class PrismaStore implements Store {
         twoFactorEnabled: u.twoFactorEnabled,
         accountId: u.accountId,
         avatarUrl: u.avatarUrl,
+        platformRole: u.platformRole,
         createdAt: new Date(u.createdAt),
       },
     });
@@ -1450,6 +1461,24 @@ export class PrismaStore implements Store {
       data: { avatarUrl },
     });
     return toAuthUser(row);
+  }
+
+  async setUserPlatformRole(
+    userId: string,
+    role: PlatformRole | null,
+  ): Promise<AuthUser> {
+    const row = await this.db.user.update({
+      where: { id: userId },
+      data: { platformRole: role },
+    });
+    return toAuthUser(row);
+  }
+
+  async listAllUsers(): Promise<AuthUser[]> {
+    const rows = await this.db.user.findMany({
+      orderBy: { createdAt: "desc" },
+    });
+    return rows.map(toAuthUser);
   }
 
   async setUserEmailVerifiedAt(
@@ -2318,6 +2347,46 @@ export class PrismaStore implements Store {
     });
     return res.count;
   }
+
+  /* ----- platform audit log (super-user management, slice 1) ----- */
+
+  async recordAuditLog(e: AuditLog): Promise<AuditLog> {
+    const row = await this.db.auditLog.create({
+      data: {
+        id: e.id,
+        actorUserId: e.actorUserId,
+        actorEmail: e.actorEmail,
+        action: e.action,
+        targetType: e.targetType,
+        targetId: e.targetId,
+        accountId: e.accountId,
+        metadata: e.metadata as object,
+        ip: e.ip,
+        createdAt: new Date(e.createdAt),
+      },
+    });
+    return toAuditLog(row);
+  }
+
+  async listAuditLogs(query: {
+    actorUserId?: string;
+    action?: string;
+    targetType?: string;
+    targetId?: string;
+    limit?: number;
+  }): Promise<AuditLog[]> {
+    const rows = await this.db.auditLog.findMany({
+      where: {
+        actorUserId: query.actorUserId,
+        action: query.action,
+        targetType: query.targetType,
+        targetId: query.targetId,
+      },
+      orderBy: { createdAt: "desc" },
+      take: query.limit ?? 100,
+    });
+    return rows.map(toAuditLog);
+  }
 }
 
 function toConversation(r: DbConversation): Conversation {
@@ -2461,7 +2530,23 @@ function toAuthUser(r: DbUser): AuthUser {
     twoFactorEnabled: r.twoFactorEnabled,
     accountId: r.accountId ?? undefined,
     avatarUrl: r.avatarUrl ?? undefined,
+    platformRole: (r.platformRole ?? undefined) as AuthUser["platformRole"],
     emailVerifiedAt: r.emailVerifiedAt?.toISOString(),
+    createdAt: r.createdAt.toISOString(),
+  };
+}
+
+function toAuditLog(r: DbAuditLog): AuditLog {
+  return {
+    id: r.id,
+    actorUserId: r.actorUserId,
+    actorEmail: r.actorEmail,
+    action: r.action,
+    targetType: r.targetType,
+    targetId: r.targetId ?? undefined,
+    accountId: r.accountId ?? undefined,
+    metadata: (r.metadata ?? {}) as Record<string, unknown>,
+    ip: r.ip ?? undefined,
     createdAt: r.createdAt.toISOString(),
   };
 }

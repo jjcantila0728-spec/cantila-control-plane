@@ -119,6 +119,48 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "ProjectMessage [conversationId, createdAt] index — backs the scoped per-conversation history load.",
     sql: 'CREATE INDEX IF NOT EXISTS "ProjectMessage_conversationId_createdAt_idx" ON "ProjectMessage"("conversationId", "createdAt");',
   },
+  {
+    id: "20260601000000_add_user_platform_role",
+    description:
+      "User.platformRole — platform super-user role (super-user management, slice 1). Nullable TEXT; legacy rows read as ordinary tenant users.",
+    sql: 'ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "platformRole" TEXT;',
+  },
+  {
+    id: "20260601000001_create_audit_log_table",
+    description:
+      "AuditLog — append-only platform audit trail for /v1/admin/* actions (super-user management, slice 1).",
+    sql: `CREATE TABLE IF NOT EXISTS "AuditLog" (
+      "id" TEXT NOT NULL,
+      "actorUserId" TEXT NOT NULL,
+      "actorEmail" TEXT NOT NULL,
+      "action" TEXT NOT NULL,
+      "targetType" TEXT NOT NULL,
+      "targetId" TEXT,
+      "accountId" TEXT,
+      "metadata" JSONB NOT NULL DEFAULT '{}',
+      "ip" TEXT,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "AuditLog_pkey" PRIMARY KEY ("id")
+    );`,
+  },
+  {
+    id: "20260601000002_create_audit_log_actor_index",
+    description:
+      "AuditLog [actorUserId, createdAt] index — backs the per-actor audit view.",
+    sql: 'CREATE INDEX IF NOT EXISTS "AuditLog_actorUserId_createdAt_idx" ON "AuditLog"("actorUserId", "createdAt");',
+  },
+  {
+    id: "20260601000003_create_audit_log_target_index",
+    description:
+      "AuditLog [targetType, targetId] index — backs the per-target audit view.",
+    sql: 'CREATE INDEX IF NOT EXISTS "AuditLog_targetType_targetId_idx" ON "AuditLog"("targetType", "targetId");',
+  },
+  {
+    id: "20260601000004_create_audit_log_account_index",
+    description:
+      "AuditLog [accountId, createdAt] index — backs the per-tenant audit view.",
+    sql: 'CREATE INDEX IF NOT EXISTS "AuditLog_accountId_createdAt_idx" ON "AuditLog"("accountId", "createdAt");',
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.

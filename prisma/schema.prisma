@@ -271,6 +271,11 @@ model User {
   /// GitHub `avatar_url`) at first social sign-in. Nullable; password-only
   /// users have none and the Console falls back to initials.
   avatarUrl        String?
+  /// Platform super-user role (super-user management, slice 1). Null for
+  /// ordinary tenant users. Stored as a guarded string (validated in TS via
+  /// the PlatformRole union) — NOT a Prisma enum, to keep the boot-migration
+  /// a simple additive TEXT column (mirrors Project.repoHost).
+  platformRole     String?
   createdAt        DateTime  @default(now())
 
   memberships Membership[]
@@ -1931,4 +1936,27 @@ model CantilapayTaxCalculation {
   createdAt DateTime @default(now())
 
   @@index([cantilapayAccountId, mode, createdAt])
+}
+
+// ----- platform audit log (super-user management, slice 1) -----
+//
+// Append-only record of every privileged /v1/admin/* action. actorEmail is
+// denormalized so the trail survives user deletion. No FK to User — the log
+// must outlive the actor.
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  actorUserId String
+  actorEmail  String
+  action      String
+  targetType  String
+  targetId    String?
+  accountId   String?
+  metadata    Json     @default("{}")
+  ip          String?
+  createdAt   DateTime @default(now())
+
+  @@index([actorUserId, createdAt])
+  @@index([targetType, targetId])
+  @@index([accountId, createdAt])
 }
