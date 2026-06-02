@@ -31,6 +31,8 @@ import type {
   TeamMember,
   MemberRole,
   AuthUser,
+  AuditLog,
+  PlatformRole,
   Session,
   Invite,
   Membership,
@@ -132,6 +134,10 @@ export interface Store {
   getProject(id: string): Promise<Project | null>;
   updateProject(id: string, patch: Partial<Project>): Promise<Project>;
   listProjects(accountId: string): Promise<Project[]>;
+  /** Every project across every account (platform projects included),
+   *  newest first. Cross-tenant — only reachable behind
+   *  `authorizeSuperuser`. */
+  listAllProjects(): Promise<Project[]>;
   /** Delete a project and every FK-related row (database, mailbox,
    *  domains, env vars, deployments, phone number). Returns false when
    *  the project doesn't exist. */
@@ -280,6 +286,16 @@ export interface Store {
   /** Set a user's avatar URL (captured from a social IdP at sign-in).
    *  Idempotent. */
   setUserAvatarUrl(userId: string, avatarUrl: string): Promise<AuthUser>;
+  /** Set (or clear, with null) a user's platform super-user role
+   *  (super-user management, slice 1). Idempotent. */
+  setUserPlatformRole(
+    userId: string,
+    role: PlatformRole | null,
+  ): Promise<AuthUser>;
+  /** Every user across every tenant, newest first. Backs the super-user
+   *  back-office user search. Cross-tenant by design — only reachable
+   *  behind `authorizeSuperuser`. */
+  listAllUsers(): Promise<AuthUser[]>;
   createSession(s: Session): Promise<Session>;
   findSessionByTokenHash(tokenHash: string): Promise<Session | null>;
   deleteSession(id: string): Promise<boolean>;
@@ -495,6 +511,19 @@ export interface Store {
     projectId: string,
     conversationId: string,
   ): Promise<number>;
+
+  /* ----- platform audit log (super-user management, slice 1) ----- */
+
+  /** Append one audit record. Append-only. */
+  recordAuditLog(e: AuditLog): Promise<AuditLog>;
+  /** Audit records matching the filter, newest first. */
+  listAuditLogs(query: {
+    actorUserId?: string;
+    action?: string;
+    targetType?: string;
+    targetId?: string;
+    limit?: number;
+  }): Promise<AuditLog[]>;
 }
 
 export class InMemoryStore implements Store {
@@ -570,6 +599,12 @@ export class InMemoryStore implements Store {
   async listProjects(accountId: string): Promise<Project[]> {
     return [...this.projects.values()].filter(
       (p) => p.accountId === accountId && !p.platform,
+    );
+  }
+
+  async listAllProjects(): Promise<Project[]> {
+    return [...this.projects.values()].sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt),
     );
   }
 
@@ -1444,6 +1479,23 @@ export class InMemoryStore implements Store {
     return updated;
   }
 
+  async setUserPlatformRole(
+    userId: string,
+    role: PlatformRole | null,
+  ): Promise<AuthUser> {
+    const existing = this.users.get(userId);
+    if (!existing) throw new Error(`user ${userId} not found`);
+    const updated: AuthUser = { ...existing, platformRole: role ?? undefined };
+    this.users.set(userId, updated);
+    return updated;
+  }
+
+  async listAllUsers(): Promise<AuthUser[]> {
+    return [...this.users.values()].sort((a, b) =>
+      b.createdAt.localeCompare(a.createdAt),
+    );
+  }
+
   async createSession(s: Session): Promise<Session> {
     this.sessions.set(s.id, s);
     return s;
@@ -1783,5 +1835,38 @@ export class InMemoryStore implements Store {
       }
     }
     return updated;
+  }
+
+  /* ----- platform audit log (super-user management, slice 1) ----- */
+
+  private auditLog: AuditLog[] = [];
+
+  async recordAuditLog(e: AuditLog): Promise<AuditLog> {
+    this.auditLog.push(e);
+    if (this.auditLog.length > 5000) {
+      this.auditLog = this.auditLog.slice(-5000);
+    }
+    return e;
+  }
+
+  async listAuditLogs(query: {
+    actorUserId?: string;
+    action?: string;
+    targetType?: string;
+    targetId?: string;
+    limit?: number;
+  }): Promise<AuditLog[]> {
+    const limit = query.limit ?? 100;
+    return this.auditLog
+      .filter(
+        (e) =>
+          (query.actorUserId === undefined || e.actorUserId === query.actorUserId) &&
+          (query.action === undefined || e.action === query.action) &&
+          (query.targetType === undefined || e.targetType === query.targetType) &&
+          (query.targetId === undefined || e.targetId === query.targetId),
+      )
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, limit);
   }
 }
