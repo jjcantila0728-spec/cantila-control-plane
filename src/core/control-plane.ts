@@ -4318,6 +4318,71 @@ export class ControlPlane {
     return stripWebhookSecret(created);
   }
 
+  /** Change a project's subdomain slug. Rewrites the project's primary
+   *  `<slug>.cantila.app` domain row in place (no orphan rows, the old
+   *  URL is released) and keeps the global one-subdomain-per-project
+   *  invariant — a slug already owned by another project is rejected.
+   *
+   *  The live Coolify FQDN is derived from `project.slug` at deploy time
+   *  (see dataplane/coolify.ts), so the running container keeps serving
+   *  the old URL until the project is redeployed. Returns the updated
+   *  project or `{ error }`. */
+  async renameSlug(
+    projectId: string,
+    rawSlug: string,
+  ): Promise<Project | { error: string }> {
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+
+    // `slugify` falls back to "project" on empty input — reject input that
+    // carries no alphanumerics so "!!!" can't silently become "project".
+    if (!/[a-z0-9]/i.test(rawSlug)) {
+      return { error: "invalid subdomain" };
+    }
+    const slug = slugify(rawSlug);
+    if (!isValidHostname(`${slug}.cantila.app`)) {
+      return { error: "invalid subdomain" };
+    }
+    if (slug === project.slug) {
+      return { error: "subdomain unchanged" };
+    }
+
+    // Global uniqueness: the new `<slug>.cantila.app` must be free.
+    const hostname = `${slug}.cantila.app`;
+    const taken = await this.deps.store.findDomainByHostname(hostname);
+    if (taken) return { error: "subdomain already taken" };
+
+    // Rewrite the project's primary subdomain row in place. Fall back to
+    // creating one if the project somehow has none (defensive — every
+    // project is created with one).
+    const domains = await this.deps.store.listDomains(projectId);
+    const sub = domains.find((d) => d.kind === "subdomain" && d.primary)
+      ?? domains.find((d) => d.kind === "subdomain");
+    if (sub) {
+      await this.deps.store.updateDomain(sub.id, { hostname });
+    } else {
+      await this.deps.store.createDomain({
+        id: id("dom"),
+        projectId,
+        hostname,
+        kind: "subdomain",
+        sslActive: true,
+        primary: true,
+        createdAt: now(),
+      });
+    }
+
+    const updated = await this.deps.store.updateProject(projectId, { slug });
+    await this.recordEvent(
+      project.accountId,
+      "system",
+      `Project ${project.name} subdomain changed`,
+      `${project.slug}.cantila.app → ${hostname}`,
+      projectId,
+    );
+    return stripWebhookSecret(updated);
+  }
+
   /** All projects under an account. */
   async listProjects(accountId: string): Promise<Project[]> {
     return stripList(await this.deps.store.listProjects(accountId));

@@ -652,6 +652,10 @@ const addDomainSchema = z.object({
   hostname: z.string().min(1),
 });
 
+const renameSlugSchema = z.object({
+  slug: z.string().min(1).max(63),
+});
+
 // Conversations (multi-conversation chat history, conversations design 2026-05-30).
 const createConversationSchema = z.object({
   title: z.string().min(1).max(200).optional(),
@@ -1031,6 +1035,24 @@ app.post("/v1/projects/:id/scale", async (request, reply) => {
   const result = await cp.scale(id, parsed.data);
   if (!result) return reply.code(404).send({ error: "project not found" });
   if ("error" in result) return reply.code(400).send({ error: result.error });
+  return result;
+});
+
+// Change the project's subdomain slug (plan §7.4). The live URL flips on
+// the next deploy — the Coolify FQDN is derived from the slug at deploy
+// time. 400 on a taken/invalid/unchanged slug, 404 on unknown project.
+app.post("/v1/projects/:id/slug", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = renameSlugSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.renameSlug(id, parsed.data.slug);
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
   return result;
 });
 
