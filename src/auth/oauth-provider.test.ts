@@ -44,3 +44,133 @@ test("DCR rejects a registration with no redirect_uris", () => {
     /redirect_uris/,
   );
 });
+
+function registeredClient(provider: OAuthProvider) {
+  return provider.registerClient({
+    client_name: "c",
+    redirect_uris: ["https://app/cb"],
+  });
+}
+
+test("authorization-code → token exchange issues a session for the user", async () => {
+  const { provider, minted } = makeProvider();
+  const client = registeredClient(provider);
+  const { verifier, challenge } = pkce();
+  const code = provider.createAuthCode({
+    clientId: client.client_id,
+    redirectUri: "https://app/cb",
+    codeChallenge: challenge,
+    userId: "user_1",
+    scope: "mcp",
+  });
+  const token = await provider.exchangeCode({
+    code,
+    codeVerifier: verifier,
+    clientId: client.client_id,
+    redirectUri: "https://app/cb",
+  });
+  assert.equal(token.access_token, "cts_for_user_1");
+  assert.equal(token.token_type, "Bearer");
+  assert.equal(token.scope, "mcp");
+  assert.ok(token.expires_in > 0);
+  assert.deepEqual(minted, ["user_1"]);
+});
+
+test("token exchange rejects a wrong PKCE verifier", async () => {
+  const { provider } = makeProvider();
+  const client = registeredClient(provider);
+  const { challenge } = pkce();
+  const code = provider.createAuthCode({
+    clientId: client.client_id,
+    redirectUri: "https://app/cb",
+    codeChallenge: challenge,
+    userId: "user_1",
+    scope: "mcp",
+  });
+  await assert.rejects(
+    () =>
+      provider.exchangeCode({
+        code,
+        codeVerifier: "the-wrong-verifier",
+        clientId: client.client_id,
+        redirectUri: "https://app/cb",
+      }),
+    /invalid_grant/,
+  );
+});
+
+test("token exchange rejects a redirect_uri mismatch", async () => {
+  const { provider } = makeProvider();
+  const client = registeredClient(provider);
+  const { verifier, challenge } = pkce();
+  const code = provider.createAuthCode({
+    clientId: client.client_id,
+    redirectUri: "https://app/cb",
+    codeChallenge: challenge,
+    userId: "user_1",
+    scope: "mcp",
+  });
+  await assert.rejects(
+    () =>
+      provider.exchangeCode({
+        code,
+        codeVerifier: verifier,
+        clientId: client.client_id,
+        redirectUri: "https://evil/cb",
+      }),
+    /invalid_grant/,
+  );
+});
+
+test("an auth code is single-use", async () => {
+  const { provider } = makeProvider();
+  const client = registeredClient(provider);
+  const { verifier, challenge } = pkce();
+  const code = provider.createAuthCode({
+    clientId: client.client_id,
+    redirectUri: "https://app/cb",
+    codeChallenge: challenge,
+    userId: "user_1",
+    scope: "mcp",
+  });
+  await provider.exchangeCode({
+    code,
+    codeVerifier: verifier,
+    clientId: client.client_id,
+    redirectUri: "https://app/cb",
+  });
+  await assert.rejects(
+    () =>
+      provider.exchangeCode({
+        code,
+        codeVerifier: verifier,
+        clientId: client.client_id,
+        redirectUri: "https://app/cb",
+      }),
+    /invalid_grant/,
+  );
+});
+
+test("an expired auth code is rejected", async () => {
+  const { provider, advance } = makeProvider();
+  const client = registeredClient(provider);
+  const { verifier, challenge } = pkce();
+  const code = provider.createAuthCode({
+    clientId: client.client_id,
+    redirectUri: "https://app/cb",
+    codeChallenge: challenge,
+    userId: "user_1",
+    scope: "mcp",
+  });
+  advance(61_000);
+  await assert.rejects(
+    () =>
+      provider.exchangeCode({
+        code,
+        codeVerifier: verifier,
+        clientId: client.client_id,
+        redirectUri: "https://app/cb",
+      }),
+    /invalid_grant/,
+  );
+});
