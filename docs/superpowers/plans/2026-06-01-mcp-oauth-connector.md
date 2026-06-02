@@ -827,6 +827,39 @@ git add -A && git commit -m "docs(mcp): document OAuth Connect flow"
 
 ---
 
+## Execution log (2026-06-01)
+
+**Status: API side COMPLETE + live-verified. 180/180 tests pass; `tsc --noEmit` clean.**
+
+Tasks 1–5 implemented TDD on branch `feat/mcp-oauth-connector`:
+- `src/auth/pkce.ts` gained `verifyPkceS256` (reused, not duplicated).
+- `src/auth/oauth.ts` — metadata builders + types.
+- `src/auth/oauth-provider.ts` — DCR + single-use/expiring auth codes + PKCE exchange.
+- `src/core/control-plane.ts` — public `mintSessionForOAuth`.
+- `src/index.ts` — discovery docs, `/register`, `/authorize`, `/v1/oauth/grant`, `/token`, `WWW-Authenticate`, urlencoded body parser.
+
+**Design correction during execution (vs the original Task 5):** Cantila sessions
+are Bearer tokens, NOT cookies, so a browser navigation to the API `/authorize`
+can't identify the logged-in user. The flow was split: `GET /authorize` validates
+then **302s to the Console consent page** (`console.cantila.app/oauth/consent`),
+which calls the **session-gated `POST /v1/oauth/grant`** to mint the code. Only
+`/register`, `/authorize`, `/token`, and the two `.well-known` docs are anon-exempt.
+
+**Live smoke (local, `CANTILA_REQUIRE_AUTH=1`):** discovery anon-200 ✓; `/v1/mcp`
+401 carries the `WWW-Authenticate` resource_metadata pointer ✓; DCR ✓; full
+register-user → grant → token → **use token on `/v1/mcp` → `tools/list` = 28
+tools** ✓; single-use + bad-PKCE + redirect-mismatch all rejected ✓.
+
+**Remaining follow-ups (NOT done — require their own work):**
+1. **Console `/oauth/consent` page** (cantila-console repo) — the browser-facing
+   consent UI that calls `POST /v1/oauth/grant`. Without it the *button* isn't
+   end-to-end, though every API piece behind it is built + proven.
+2. **Persistence** — clients/codes are in-memory (v1). Move to the Store for
+   multi-instance / restart survival (needs a Prisma migration **and** a
+   `boot-migrations.ts` entry per the deploy gotcha).
+3. **Console "Connect (OAuth)" docs section** — add once (1) ships.
+4. Refresh tokens + per-scope narrowing + multi-account consent picker (deferred).
+
 ## Self-Review
 
 - **Spec coverage:** discovery metadata ✓ (T1/T5), WWW-Authenticate ✓ (T5), DCR ✓ (T2/T5), authorize+PKCE+consent ✓ (T3/T5), token ✓ (T3/T5), tenant isolation reuse ✓ (T4 mints `cts_`; existing `onRequest`/MCP threading untouched). Spec's refresh-token + scope-narrowing + persistence are explicitly deferred (documented above) — not gaps, scoped-out for v1.
