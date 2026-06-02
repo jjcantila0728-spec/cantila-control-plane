@@ -107,5 +107,11 @@ export async function seedOwnerAccount(
     created.membership = true;
   }
 
+  // 4. Platform role — make the owner a super-user (super-user management,
+  //    slice 1). Idempotent: only writes when not already superadmin.
+  if (user.platformRole !== "superadmin") {
+    user = await store.setUserPlatformRole(user.id, "superadmin");
+  }
+
   return { accountId: input.accountId, userId: user.id, created };
 }
