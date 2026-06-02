@@ -21,8 +21,11 @@ export function toSdkTools(tools: string[]): SdkToolName[] {
 const SECURITY_DIVISIONS = new Set(["security"]);
 
 /** All build agents as SDK subagent definitions, keyed by id.
- *  The orchestrator (00-orchestrator) is the session's MAIN agent, not a subagent. */
-export function agentDefinitions(): Record<string, AgentDefinition> {
+ *  The orchestrator (00-orchestrator) is the session's MAIN agent, not a subagent.
+ *  When `modelOverride` is set (FLEET_SUBAGENT_MODEL), every subagent runs on
+ *  that model instead of its per-role default — the lever to drop the ~21
+ *  Opus roles down to Sonnet for cheaper chat builds. */
+export function agentDefinitions(modelOverride?: string): Record<string, AgentDefinition> {
   const defs: Record<string, AgentDefinition> = {};
   for (const r of listRoles()) {
     if (r.id === "00-orchestrator") continue;
@@ -33,7 +36,7 @@ export function agentDefinitions(): Record<string, AgentDefinition> {
       description: r.description,
       prompt,
       tools: toSdkTools(r.tools),
-      model: r.model,
+      model: modelOverride ?? r.model,
     } as AgentDefinition;
   }
   return defs;

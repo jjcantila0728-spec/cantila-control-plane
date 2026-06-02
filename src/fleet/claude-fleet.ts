@@ -77,13 +77,13 @@ export class ClaudeFleet {
         prompt,
         options: {
           cwd,
-          agents: agentDefinitions(),
+          agents: agentDefinitions(cfg.subagentModel || undefined),
           allowedTools: ALLOWED_TOOLS,
           disallowedTools: DISALLOWED_BASH,
           permissionMode: "dontAsk",
           maxTurns: cfg.maxAgentSteps * cfg.maxRounds,
           maxBudgetUsd: cfg.maxBudgetUsd,
-          model: "opus",
+          model: cfg.orchestratorModel,
         } as any,
       });
       for await (const msg of stream) {
