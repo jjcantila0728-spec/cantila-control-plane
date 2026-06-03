@@ -1501,6 +1501,12 @@ export class ControlPlane {
       body: input.body,
       poolId,
       outcomeBias: input.outcomeBias,
+      auth: {
+        host: mailbox.smtpHost,
+        user: mailbox.smtpUser,
+        pass: decryptSecret(mailbox.smtpPassword),
+        port: 587,
+      },
     });
     if (!hand.accepted) {
       return { error: "MTA rejected the message" };
