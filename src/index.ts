@@ -44,6 +44,12 @@ import {
   resolveActorAccountId,
 } from "./auth/account";
 import type { SessionAuth } from "./auth/account";
+import {
+  buildProtectedResourceMetadata,
+  buildAuthServerMetadata,
+  MCP_RESOURCE_PATH,
+} from "./auth/oauth";
+import { OAuthProvider } from "./auth/oauth-provider";
 
 // 10 auth attempts per IP per minute, shared across login/register/sso.
 const authRateLimit = createRateLimiter({ windowMs: 60_000, max: 10 });
@@ -146,7 +152,50 @@ const projectOrchestrator = new ProjectOrchestrator({
 const mcpServer = new McpServer({ name: "cantila", version: "0.1.0" });
 for (const tool of cantilaTools(cp)) mcpServer.addTool(tool);
 
+/* ----- MCP OAuth connector (plan: 2026-06-01-mcp-oauth-connector).
+ *  Lets an MCP host (Claude Code "Connect via URL", claude.ai/Cowork)
+ *  sign in via OAuth + PKCE instead of pasting an API key. The access
+ *  token it issues is an ordinary `cts_` session, so downstream auth +
+ *  tenant isolation are unchanged. v1 keeps clients/codes in-memory.
+ *  ----- */
+const oauthProvider = new OAuthProvider({
+  now: () => Date.now(),
+  mintSession: (userId) => cp.mintSessionForOAuth(userId),
+});
+
+/** Public base URL for OAuth metadata + redirects. Prefer an explicit
+ *  override, else derive from the request's forwarded host/proto (we sit
+ *  behind Traefik/Coolify, which set `x-forwarded-*`). */
+function publicBaseUrl(req: FastifyRequest): string {
+  const override = process.env.CANTILA_PUBLIC_BASE_URL?.trim();
+  if (override) return override.replace(/\/$/, "");
+  const proto =
+    (req.headers["x-forwarded-proto"] as string | undefined)?.split(",")[0] ??
+    "https";
+  const host =
+    (req.headers["x-forwarded-host"] as string | undefined) ??
+    (req.headers["host"] as string | undefined) ??
+    "api.cantila.app";
+  return `${proto}://${host}`;
+}
+
 const app = Fastify({ logger: true });
+
+/* OAuth token requests are `application/x-www-form-urlencoded` (RFC 6749
+ * §4.1.3). Fastify only parses JSON by default, so register a urlencoded
+ * parser (no new dependency — URLSearchParams) for `/token` and friends. */
+app.addContentTypeParser(
+  "application/x-www-form-urlencoded",
+  { parseAs: "string" },
+  (_req, body, done) => {
+    try {
+      const text = typeof body === "string" ? body : body.toString("utf8");
+      done(null, Object.fromEntries(new URLSearchParams(text)));
+    } catch (err) {
+      done(err as Error, undefined);
+    }
+  },
+);
 
 /* ----- Raw-body capture for webhook HMAC verification.
  *
@@ -229,6 +278,16 @@ const EXEMPT_PATHS = new Set([
   // Cantilapay health probe — surfaces the adapter label so an operator
   // can confirm the live rail is wired. No sensitive data (plan §25).
   "/v1/cantilapay/health",
+  // MCP OAuth connector — the discovery + token-exchange surface is
+  // un-authed by definition (a host with no credential yet is exactly who
+  // calls these). `/authorize` is reachable anonymously so it can bounce
+  // the browser to the Console consent page; the actual code is minted by
+  // the session-gated `POST /v1/oauth/grant`, which is NOT exempt.
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-authorization-server",
+  "/register",
+  "/authorize",
+  "/token",
 ]);
 
 function scopeAllows(
@@ -485,6 +544,15 @@ if (config.requireAuth) {
         method: req.method,
         route: url,
       });
+      // RFC 9728 §5.1 — point an MCP host at the protected-resource
+      // metadata so it can discover the OAuth authorization server and
+      // run the Connect flow instead of failing blind.
+      if (url === MCP_RESOURCE_PATH) {
+        reply.header(
+          "www-authenticate",
+          `Bearer resource_metadata="${publicBaseUrl(req)}/.well-known/oauth-protected-resource"`,
+        );
+      }
       return reply.code(401).send({
         error:
           "authentication required — pass a Bearer API key or session token",
@@ -2935,6 +3003,122 @@ app.post("/v1/agents/_test/reload", async (request, reply) => {
  *  metadata (server info, protocol version, tool catalog) for operators
  *  inspecting the endpoint without speaking JSON-RPC.
  * ----- */
+
+/* ----- MCP OAuth connector endpoints (plan: 2026-06-01-mcp-oauth-connector).
+ *
+ *  Flow (Cantila sessions are Bearer tokens, not cookies, so the user is
+ *  identified at the Console, where the session lives — not by a browser
+ *  navigation to this API):
+ *    1. host GET  /.well-known/*          → discover the AS
+ *    2. host POST /register               → DCR, get a client_id
+ *    3. host →    GET /authorize          → we 302 to the Console consent page
+ *    4. Console   POST /v1/oauth/grant    → (session-authed) mint the code,
+ *                                           return the redirect_to callback
+ *    5. host POST /token                  → exchange code+PKCE for a cts_ token
+ * ----- */
+app.get("/.well-known/oauth-protected-resource", async (request) => {
+  return buildProtectedResourceMetadata(publicBaseUrl(request));
+});
+
+app.get("/.well-known/oauth-authorization-server", async (request) => {
+  return buildAuthServerMetadata(publicBaseUrl(request));
+});
+
+// Dynamic Client Registration (RFC 7591) — public clients only (PKCE).
+app.post("/register", async (request, reply) => {
+  const body = (request.body ?? {}) as {
+    client_name?: string;
+    redirect_uris?: string[];
+  };
+  try {
+    return reply.code(201).send(oauthProvider.registerClient(body));
+  } catch (err) {
+    return reply.code(400).send({
+      error: "invalid_client_metadata",
+      error_description: err instanceof Error ? err.message : "invalid",
+    });
+  }
+});
+
+// Authorization endpoint. Validates the request, then bounces the browser
+// to the Console consent page (which has the user's session). The Console
+// calls `POST /v1/oauth/grant` to actually mint the code.
+app.get("/authorize", async (request, reply) => {
+  const q = request.query as Record<string, string>;
+  const client = oauthProvider.getClient(q.client_id ?? "");
+  if (!client || !client.redirectUris.includes(q.redirect_uri ?? "")) {
+    return reply.code(400).send({ error: "invalid_request" });
+  }
+  if (q.response_type !== "code" || q.code_challenge_method !== "S256") {
+    return reply.code(400).send({ error: "unsupported_response_type" });
+  }
+  const consoleUrl = (
+    process.env.CANTILA_CONSOLE_URL ?? "https://console.cantila.app"
+  ).replace(/\/$/, "");
+  const params = new URLSearchParams({
+    client_id: q.client_id,
+    redirect_uri: q.redirect_uri,
+    code_challenge: q.code_challenge,
+    code_challenge_method: "S256",
+    response_type: "code",
+    scope: q.scope ?? "mcp",
+    client_name: client.clientName,
+  });
+  if (q.state) params.set("state", q.state);
+  return reply.redirect(`${consoleUrl}/oauth/consent?${params.toString()}`);
+});
+
+// Grant endpoint — the Console consent page POSTs here on "Allow". Session-
+// gated (the existing onRequest gate requires a `cts_` session or key), so
+// the consenting user is whoever owns the session. NOT in EXEMPT_PATHS.
+app.post("/v1/oauth/grant", async (request, reply) => {
+  const session = getSessionAuth(request);
+  if (!session) {
+    return reply.code(401).send({ error: "session required (Bearer cts_ token)" });
+  }
+  const b = (request.body ?? {}) as Record<string, string>;
+  const client = oauthProvider.getClient(b.client_id ?? "");
+  if (!client || !client.redirectUris.includes(b.redirect_uri ?? "")) {
+    return reply.code(400).send({ error: "invalid_request" });
+  }
+  if (!b.code_challenge) {
+    return reply.code(400).send({ error: "invalid_request: code_challenge" });
+  }
+  const code = oauthProvider.createAuthCode({
+    clientId: b.client_id,
+    redirectUri: b.redirect_uri,
+    codeChallenge: b.code_challenge,
+    userId: session.userId,
+    scope: b.scope ?? "mcp",
+  });
+  const sep = b.redirect_uri.includes("?") ? "&" : "?";
+  const state = b.state ? `&state=${encodeURIComponent(b.state)}` : "";
+  return reply.send({ redirect_to: `${b.redirect_uri}${sep}code=${code}${state}` });
+});
+
+// Token endpoint — authorization_code + PKCE. Public client, so client
+// auth IS the code + verifier (no client secret).
+app.post("/token", async (request, reply) => {
+  const b = (request.body ?? {}) as Record<string, string>;
+  if (b.grant_type !== "authorization_code") {
+    return reply.code(400).send({ error: "unsupported_grant_type" });
+  }
+  try {
+    const token = await oauthProvider.exchangeCode({
+      code: b.code,
+      codeVerifier: b.code_verifier,
+      clientId: b.client_id,
+      redirectUri: b.redirect_uri,
+    });
+    reply.header("cache-control", "no-store");
+    return reply.code(200).send(token);
+  } catch (err) {
+    return reply.code(400).send({
+      error: "invalid_grant",
+      error_description: err instanceof Error ? err.message : "invalid_grant",
+    });
+  }
+});
 
 app.get("/v1/mcp", async () => {
   return mcpServer.describe();
