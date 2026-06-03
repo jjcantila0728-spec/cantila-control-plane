@@ -12,6 +12,7 @@ import { InMemoryStore } from "../domain/store";
 import { stubProvisioner, stubDataPlane } from "../dataplane/stub";
 import { StubStripeAdapter } from "../billing/stripe";
 import { RuleBasedAiAnalyser } from "../ai/analyser";
+import { encryptSecret } from "../lib/secrets";
 
 test("cp.sendMail forwards the project mailbox's own SMTP auth", async () => {
   const store = new InMemoryStore();
@@ -69,7 +70,7 @@ test("cp.sendMail forwards the project mailbox's own SMTP auth", async () => {
   // Swap the bundled mailProvider singleton's sendMail for a spy.
   const mod = await import("../mail/provider");
   let seen: any;
-  const orig = mod.mailProvider.sendMail.bind(mod.mailProvider);
+  const orig = mod.mailProvider.sendMail;
   (mod.mailProvider as any).sendMail = async (input: any) => {
     seen = input;
     return { providerMessageId: "spy-msg-id", accepted: true };
@@ -90,5 +91,91 @@ test("cp.sendMail forwards the project mailbox's own SMTP auth", async () => {
     assert.equal(seen.from, "info@acme.cantila.app");
   } finally {
     (mod.mailProvider as any).sendMail = orig;
+  }
+});
+
+test("cp.sendMail decrypts an encrypted smtpPassword before forwarding", async () => {
+  process.env.CANTILA_SECRET_KEY = "test-master-key-please-32chars-x";
+  try {
+    const store = new InMemoryStore();
+    const cp = new ControlPlane({
+      store,
+      provisioner: stubProvisioner,
+      dataPlane: stubDataPlane,
+      stripe: new StubStripeAdapter(),
+      aiAnalyser: new RuleBasedAiAnalyser(),
+    });
+
+    // Seed an account directly in the store (required fields per Account interface).
+    await store.createAccount({
+      id: "acc_2",
+      name: "Test Account Enc",
+      handle: "testaccountenc",
+      plan: "starter",
+      createdAt: new Date().toISOString(),
+    });
+
+    // Seed a project directly in the store (required fields per Project interface).
+    await store.createProject({
+      id: "prj_2",
+      accountId: "acc_2",
+      name: "AcmeEnc",
+      slug: "acmeenc",
+      runtime: "node",
+      region: "eu",
+      status: "live",
+      vcpu: 1,
+      memoryMb: 512,
+      diskGb: 10,
+      alwaysOn: false,
+      autoSleep: true,
+      desiredInstances: 1,
+      minInstances: 1,
+      maxInstances: 1,
+      autoDeploy: false,
+      createdAt: new Date().toISOString(),
+    } as any);
+
+    // Seed a mailbox with an ENCRYPTED smtpPassword (production scenario).
+    await store.createMailbox({
+      id: "mbx_2",
+      projectId: "prj_2",
+      address: "info@acmeenc.cantila.app",
+      sendingDomain: "acmeenc.cantila.app",
+      smtpHost: "mail.cantila.app",
+      smtpUser: "info@acmeenc.cantila.app",
+      smtpPassword: encryptSecret("real-secret-pw"),
+      status: "active",
+      createdAt: new Date().toISOString(),
+    });
+
+    // Swap the bundled mailProvider singleton's sendMail for a spy.
+    const mod = await import("../mail/provider");
+    let seen: any;
+    const orig = mod.mailProvider.sendMail;
+    (mod.mailProvider as any).sendMail = async (input: any) => {
+      seen = input;
+      return { providerMessageId: "spy-msg-id-enc", accepted: true };
+    };
+    try {
+      const res = await cp.sendMail("prj_2", {
+        to: "z@ext.com",
+        subject: "S",
+        body: "B",
+      });
+      assert.ok(!("error" in res), `unexpected error: ${JSON.stringify(res)}`);
+      // The decrypted plaintext must reach the provider — not the enc.v1. envelope.
+      assert.deepEqual(seen.auth, {
+        host: "mail.cantila.app",
+        user: "info@acmeenc.cantila.app",
+        pass: "real-secret-pw",
+        port: 587,
+      });
+      assert.equal(seen.from, "info@acmeenc.cantila.app");
+    } finally {
+      (mod.mailProvider as any).sendMail = orig;
+    }
+  } finally {
+    delete process.env.CANTILA_SECRET_KEY;
   }
 });
