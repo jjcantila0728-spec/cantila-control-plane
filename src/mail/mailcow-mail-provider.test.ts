@@ -105,3 +105,63 @@ test("createMailcowMailProvider is env-gated", () => {
   assert.ok(p, "full env → instance");
   assert.equal(p!.live, true);
 });
+
+test("sendMail uses a per-mailbox transport when auth is provided", async () => {
+  const seen: Array<{ user: string; msgFrom: string }> = [];
+  const p = new MailcowMailProvider({
+    transport: { sendMail: async () => ({ messageId: "env" }) },
+    makeTransport: (auth) => ({
+      sendMail: async (m) => {
+        seen.push({ user: auth.user, msgFrom: m.from });
+        return { messageId: `per:${auth.user}` };
+      },
+    }),
+  });
+  const res = await p.sendMail({
+    from: "info@acme.cantila.app",
+    to: "x@y.com",
+    subject: "S",
+    body: "B",
+    auth: { host: "mail.cantila.app", user: "info@acme.cantila.app", pass: "pw" },
+  });
+  assert.equal(res.accepted, true);
+  assert.equal(res.providerMessageId, "per:info@acme.cantila.app");
+  assert.deepEqual(seen, [
+    { user: "info@acme.cantila.app", msgFrom: "info@acme.cantila.app" },
+  ]);
+});
+
+test("sendMail falls back to the env transport when no auth is given", async () => {
+  let used = "";
+  const p = new MailcowMailProvider({
+    transport: {
+      sendMail: async () => {
+        used = "env";
+        return { messageId: "env" };
+      },
+    },
+    makeTransport: () => ({
+      sendMail: async () => {
+        used = "per";
+        return { messageId: "per" };
+      },
+    }),
+  });
+  await p.sendMail({ from: "noreply@cantila.app", to: "x@y.com" });
+  assert.equal(used, "env");
+});
+
+test("per-mailbox transports are cached by user", async () => {
+  let builds = 0;
+  const p = new MailcowMailProvider({
+    transport: { sendMail: async () => ({ messageId: "env" }) },
+    makeTransport: () => {
+      builds++;
+      return { sendMail: async () => ({ messageId: "m" }) };
+    },
+  });
+  const auth = { host: "mail.cantila.app", user: "info@acme.cantila.app", pass: "pw" };
+  await p.sendMail({ from: "info@acme.cantila.app", to: "a@b.com", auth });
+  await p.sendMail({ from: "info@acme.cantila.app", to: "c@d.com", auth });
+  assert.equal(builds, 1);
+});

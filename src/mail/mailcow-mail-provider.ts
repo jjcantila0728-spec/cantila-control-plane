@@ -52,10 +52,28 @@ export class MailcowMailProvider implements MailProvider {
   readonly label = "Mailcow";
   readonly live = true;
   private readonly transport: MailcowSmtpTransport;
+  private readonly makeTransport?: (auth: {
+    host: string;
+    user: string;
+    pass: string;
+    port?: number;
+    secure?: boolean;
+  }) => MailcowSmtpTransport;
+  private readonly perMailbox = new Map<string, MailcowSmtpTransport>();
   private seq = 9000;
 
-  constructor(opts: { transport: MailcowSmtpTransport }) {
+  constructor(opts: {
+    transport: MailcowSmtpTransport;
+    makeTransport?: (auth: {
+      host: string;
+      user: string;
+      pass: string;
+      port?: number;
+      secure?: boolean;
+    }) => MailcowSmtpTransport;
+  }) {
     this.transport = opts.transport;
+    this.makeTransport = opts.makeTransport;
   }
 
   private nextId(): string {
@@ -63,9 +81,23 @@ export class MailcowMailProvider implements MailProvider {
     return `mmsg_${this.seq.toString(36)}`;
   }
 
+  /** Resolve the transport for a send: a cached/freshly-built per-mailbox
+   *  transport when `auth` is present and a factory is wired, else the
+   *  default (platform submission) transport. */
+  private transportFor(input: SendMailInput): MailcowSmtpTransport {
+    if (input.auth && this.makeTransport) {
+      const cached = this.perMailbox.get(input.auth.user);
+      if (cached) return cached;
+      const built = this.makeTransport(input.auth);
+      this.perMailbox.set(input.auth.user, built);
+      return built;
+    }
+    return this.transport;
+  }
+
   async sendMail(input: SendMailInput): Promise<SendResult> {
     try {
-      const info = await this.transport.sendMail({
+      const info = await this.transportFor(input).sendMail({
         from: input.from,
         to: input.to,
         subject: input.subject,
@@ -175,5 +207,13 @@ export function createMailcowMailProvider(
     (env.MAILCOW_SMTP_SECURE ?? (port === 465 ? "true" : "false")) === "true";
   return new MailcowMailProvider({
     transport: makeNodemailerTransport({ host, port, secure, user, pass }),
+    makeTransport: (auth) =>
+      makeNodemailerTransport({
+        host: auth.host,
+        port: auth.port ?? 587,
+        secure: auth.secure ?? (auth.port === 465),
+        user: auth.user,
+        pass: auth.pass,
+      }),
   });
 }

@@ -69,6 +69,18 @@ export interface SendMailInput {
     bounced?: number;
     complained?: number;
   };
+  /** Optional per-mailbox SMTP submission credentials. When set, a live
+   *  provider authenticates as THIS mailbox (so `from` matches the login
+   *  and passes the MTA's sender-check) instead of the shared platform
+   *  submission account. The control plane passes the tenant project's
+   *  own mailbox creds here (decrypted at call time). */
+  auth?: {
+    host: string;
+    user: string;
+    pass: string;
+    port?: number;
+    secure?: boolean;
+  };
 }
 
 /* ---------- inbound (normalized) ---------- */
