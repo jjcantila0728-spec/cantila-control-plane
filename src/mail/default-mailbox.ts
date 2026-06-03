@@ -26,7 +26,7 @@ export function defaultProjectMailbox(slug: string): DefaultMailbox {
   return {
     address,
     sendingDomain,
-    smtpHost: "smtp.cantila.app",
+    smtpHost: "mail.cantila.app",
     // SMTP submission authenticates with the full mailbox address —
     // the convention real MTAs (Mailcow) expect.
     smtpUser: address,
