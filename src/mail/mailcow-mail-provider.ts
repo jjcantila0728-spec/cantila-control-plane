@@ -26,6 +26,7 @@ import { createTransport } from "nodemailer";
 
 import type {
   InboundMailMessage,
+  MailboxSmtpAuth,
   MailProvider,
   OutboundMailResult,
   OutboundMailStatusUpdate,
@@ -52,25 +53,13 @@ export class MailcowMailProvider implements MailProvider {
   readonly label = "Mailcow";
   readonly live = true;
   private readonly transport: MailcowSmtpTransport;
-  private readonly makeTransport?: (auth: {
-    host: string;
-    user: string;
-    pass: string;
-    port?: number;
-    secure?: boolean;
-  }) => MailcowSmtpTransport;
+  private readonly makeTransport?: (auth: MailboxSmtpAuth) => MailcowSmtpTransport;
   private readonly perMailbox = new Map<string, MailcowSmtpTransport>();
   private seq = 9000;
 
   constructor(opts: {
     transport: MailcowSmtpTransport;
-    makeTransport?: (auth: {
-      host: string;
-      user: string;
-      pass: string;
-      port?: number;
-      secure?: boolean;
-    }) => MailcowSmtpTransport;
+    makeTransport?: (auth: MailboxSmtpAuth) => MailcowSmtpTransport;
   }) {
     this.transport = opts.transport;
     this.makeTransport = opts.makeTransport;

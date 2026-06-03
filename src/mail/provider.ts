@@ -34,6 +34,15 @@ import { createMailcowMailProvider } from "./mailcow-mail-provider";
 
 /* ---------- outbound ---------- */
 
+/** Per-mailbox SMTP submission credentials (see SendMailInput.auth). */
+export interface MailboxSmtpAuth {
+  host: string;
+  user: string;
+  pass: string;
+  port?: number;
+  secure?: boolean;
+}
+
 /** Carrier hand-off for an outbound message. `accepted` means the
  *  MTA queued it for delivery; the terminal outcome (delivered /
  *  bounced / complained / deferred) arrives later as an
@@ -74,13 +83,7 @@ export interface SendMailInput {
    *  and passes the MTA's sender-check) instead of the shared platform
    *  submission account. The control plane passes the tenant project's
    *  own mailbox creds here (decrypted at call time). */
-  auth?: {
-    host: string;
-    user: string;
-    pass: string;
-    port?: number;
-    secure?: boolean;
-  };
+  auth?: MailboxSmtpAuth;
 }
 
 /* ---------- inbound (normalized) ---------- */

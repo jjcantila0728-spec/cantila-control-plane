@@ -164,4 +164,7 @@ test("per-mailbox transports are cached by user", async () => {
   await p.sendMail({ from: "info@acme.cantila.app", to: "a@b.com", auth });
   await p.sendMail({ from: "info@acme.cantila.app", to: "c@d.com", auth });
   assert.equal(builds, 1);
+  const auth2 = { host: "mail.cantila.app", user: "other@acme.cantila.app", pass: "pw2" };
+  await p.sendMail({ from: "other@acme.cantila.app", to: "e@f.com", auth: auth2 });
+  assert.equal(builds, 2); // a different user triggers a fresh transport build
 });
