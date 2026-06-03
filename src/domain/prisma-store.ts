@@ -593,7 +593,12 @@ export class PrismaStore implements Store {
     patch: Partial<
       Pick<
         Mailbox,
-        "address" | "sendingDomain" | "smtpHost" | "smtpUser" | "status"
+        | "address"
+        | "sendingDomain"
+        | "smtpHost"
+        | "smtpUser"
+        | "smtpPassword"
+        | "status"
       >
     >,
   ): Promise<Mailbox | null> {

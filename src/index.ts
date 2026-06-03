@@ -10,6 +10,8 @@ import { createStore } from "./domain/create-store";
 import { seedOwnerAccount } from "./domain/seed-owner";
 import { seedPlatformProject } from "./domain/seed-platform";
 import { reconcileProjectMailboxes } from "./domain/reconcile-mailboxes";
+import { backfillTenantMailboxes } from "./domain/backfill-mailboxes";
+import { mailboxProvisioner } from "./mail/provisioner";
 import { selectDataPlane } from "./dataplane/factory";
 import { selectProvisioner } from "./dataplane/coolify-provisioner";
 import { ControlPlane } from "./core/control-plane";
@@ -4265,6 +4267,14 @@ app
     app.log.info(
       `platform seed: account=${platformSeed.accountId} created=${platformSeed.created}`,
     );
+    // Backfill legacy tenant mailboxes that were record-only (no real
+    // Mailcow mailbox provisioned): re-provision domain + mailbox, rotate
+    // password, fix smtpHost. Must run BEFORE reconcile which rewrites
+    // smtpHost and would erase the detection signal. (plan §5)
+    if (mailboxProvisioner.live) {
+      const bf = await backfillTenantMailboxes(store, mailboxProvisioner);
+      app.log.info(`mailbox backfill: repaired=${bf.repaired}/${bf.scanned}`);
+    }
     // Migrate any legacy auto-wired mailbox addresses to the canonical
     // info@<slug>.cantila.app scheme (plan §4.4). Idempotent.
     const mbxReco = await reconcileProjectMailboxes(store);

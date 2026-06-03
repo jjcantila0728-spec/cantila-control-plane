@@ -145,14 +145,20 @@ export interface Store {
   getMailboxByProject(projectId: string): Promise<Mailbox | null>;
   createMailbox(m: Mailbox): Promise<Mailbox>;
   /** Patch an auto-wired mailbox by id (used by the boot reconcile to
-   *  migrate legacy addresses to the canonical scheme). Returns null
-   *  when no mailbox has that id. */
+   *  migrate legacy addresses to the canonical scheme, and by the boot
+   *  backfill to rotate the SMTP password for legacy tenant mailboxes).
+   *  Returns null when no mailbox has that id. */
   updateMailbox(
     id: string,
     patch: Partial<
       Pick<
         Mailbox,
-        "address" | "sendingDomain" | "smtpHost" | "smtpUser" | "status"
+        | "address"
+        | "sendingDomain"
+        | "smtpHost"
+        | "smtpUser"
+        | "smtpPassword"
+        | "status"
       >
     >,
   ): Promise<Mailbox | null>;
@@ -646,7 +652,12 @@ export class InMemoryStore implements Store {
     patch: Partial<
       Pick<
         Mailbox,
-        "address" | "sendingDomain" | "smtpHost" | "smtpUser" | "status"
+        | "address"
+        | "sendingDomain"
+        | "smtpHost"
+        | "smtpUser"
+        | "smtpPassword"
+        | "status"
       >
     >,
   ): Promise<Mailbox | null> {
