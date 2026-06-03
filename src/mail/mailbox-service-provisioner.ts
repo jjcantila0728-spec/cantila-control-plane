@@ -41,7 +41,7 @@ export function createMailboxServiceProvisioner(
         address: base.address,
         password,
         quotaMb: DEFAULT_QUOTA_MB,
-        displayName: project.name || base.address.split("@")[0],
+        displayName: project.name || project.slug,
       });
       if ("error" in made) {
         throw new Error(`createMailbox(${base.address}): ${made.error}`);

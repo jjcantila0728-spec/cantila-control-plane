@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { createMailboxServiceProvisioner } from "./mailbox-service-provisioner";
+import { createMailboxServiceProvisioner, createLiveMailboxServiceProvisioner } from "./mailbox-service-provisioner";
 import type { MailboxProvisioner, ProvisionResult } from "./provisioner";
 
 function fakeProvisioner(over: Partial<MailboxProvisioner> = {}): {
@@ -53,4 +53,17 @@ test("createMailbox failure rejects (no ghost mailbox row)", async () => {
   });
   const svc = createMailboxServiceProvisioner(prov);
   await assert.rejects(() => svc.createMailbox(project), /createMailbox.*exists-bad/);
+});
+
+test("createLiveMailboxServiceProvisioner returns null when no live MTA is configured", () => {
+  // No MAILCOW_URL/MAILCOW_API_KEY in the test env -> bundled provisioner is the stub.
+  const saved = { url: process.env.MAILCOW_URL, key: process.env.MAILCOW_API_KEY };
+  try {
+    delete process.env.MAILCOW_URL;
+    delete process.env.MAILCOW_API_KEY;
+    assert.equal(createLiveMailboxServiceProvisioner(), null);
+  } finally {
+    if (saved.url !== undefined) process.env.MAILCOW_URL = saved.url;
+    if (saved.key !== undefined) process.env.MAILCOW_API_KEY = saved.key;
+  }
 });
