@@ -95,11 +95,12 @@ console.log(`[dataplane] ${dataPlaneSelection.label} (${dataPlaneSelection.live 
 
 // Service provisioner (plan §4.2 — auto-wired DB/mail). Goes live with a
 // real Coolify Postgres provisioner when the Coolify creds + server/project
-// pair are set; otherwise stays the stub. Mailbox creation stays on the
-// stub regardless (Cantila Mail is a separate backend).
+// pair are set; otherwise stays the stub. Mailbox creation independently
+// goes live via the Mailcow provisioner when MAILCOW_URL + MAILCOW_API_KEY
+// are set (see createLiveMailboxServiceProvisioner), else stays on the stub.
 const provisionerSelection = selectProvisioner(process.env);
 console.log(
-  `[provisioner] ${provisionerSelection.live ? "Coolify (real Postgres)" : "stub"} (${provisionerSelection.live ? "live" : "stub"})`,
+  `[provisioner] ${provisionerSelection.live ? "Coolify (real Postgres)" : "stub"} (${provisionerSelection.live ? "live" : "stub"}); mailbox ${mailboxProvisioner.live ? "live (Mailcow)" : "stub"}`,
 );
 
 // Cantila Automations (plan §4.10) — engine adapter registry. Phase A
