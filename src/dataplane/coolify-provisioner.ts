@@ -22,6 +22,7 @@
 import type { Project, DbEngine, Region } from "../domain/types";
 import type { ServiceProvisioner } from "../deploy/provisioning";
 import { stubProvisioner } from "./stub";
+import { createLiveMailboxServiceProvisioner } from "../mail/mailbox-service-provisioner";
 
 /** Per-region Coolify binding for database provisioning — the DB must
  *  land on the SAME server + project as the tenant app so they share a
@@ -213,6 +214,7 @@ export function selectProvisioner(
   const projectUuid = env.COOLIFY_PROJECT_UUID?.trim();
 
   if (apiUrl && apiToken && serverUuid && projectUuid) {
+    const liveMailbox = createLiveMailboxServiceProvisioner();
     return {
       provisioner: new CoolifyServiceProvisioner({
         apiUrl,
@@ -220,6 +222,11 @@ export function selectProvisioner(
         serverUuid,
         projectUuid,
         environmentName: env.COOLIFY_ENVIRONMENT_NAME?.trim() || undefined,
+        // Real Mailcow mailbox creation when MAILCOW_* is set; else the
+        // constructor default (stubProvisioner) keeps mail record-only.
+        mailbox: liveMailbox
+          ? ({ ...stubProvisioner, createMailbox: liveMailbox.createMailbox } as ServiceProvisioner)
+          : undefined,
       }),
       live: true,
     };

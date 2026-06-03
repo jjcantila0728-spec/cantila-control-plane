@@ -10,6 +10,7 @@
 import type { Store } from "../domain/store";
 import type { Project, DbEngine } from "../domain/types";
 import { id, now } from "../lib/ids";
+import { encryptSecret } from "../lib/secrets";
 
 /**
  * Data-plane contract — actually stands up the underlying services.
@@ -102,14 +103,16 @@ export async function provisionProjectServices(
       sendingDomain: m.sendingDomain,
       smtpHost: m.smtpHost,
       smtpUser: m.smtpUser,
-      smtpPassword: m.smtpPassword,
+      // Encrypt the credential at rest; the product still gets the raw
+      // value below so its own SMTP client can authenticate.
+      smtpPassword: encryptSecret(m.smtpPassword),
       status: "active",
       createdAt: now(),
     });
     await inject("SMTP_HOST", mailbox.smtpHost);
     await inject("SMTP_PORT", "587");
     await inject("SMTP_USER", mailbox.smtpUser);
-    await inject("SMTP_PASSWORD", mailbox.smtpPassword);
+    await inject("SMTP_PASSWORD", m.smtpPassword);
     await inject("MAIL_FROM", mailbox.address);
     mailboxCreated = true;
   }
