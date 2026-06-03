@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { backfillTenantMailboxes } from "./backfill-mailboxes";
 import { InMemoryStore } from "./store";
 import type { MailboxProvisioner, ProvisionResult } from "../mail/provisioner";
+import { isEncryptedSecret } from "../lib/secrets";
 
 function fakeProvisioner(): { prov: MailboxProvisioner; calls: string[] } {
   const calls: string[] = [];
@@ -62,19 +63,25 @@ async function seed(
 }
 
 test("backfill repairs legacy tenant mailboxes once and is idempotent", async () => {
-  const store = new InMemoryStore();
-  await seed(store, { slug: "legacy", smtpHost: "smtp.cantila.app" });
-  const { prov, calls } = fakeProvisioner();
+  process.env.CANTILA_SECRET_KEY = "test-master-key-please-32chars-x";
+  try {
+    const store = new InMemoryStore();
+    await seed(store, { slug: "legacy", smtpHost: "smtp.cantila.app" });
+    const { prov, calls } = fakeProvisioner();
 
-  const r1 = await backfillTenantMailboxes(store, prov);
-  assert.equal(r1.repaired, 1);
-  const mb = await store.getMailboxByProject("prj_legacy");
-  assert.equal(mb!.smtpHost, "mail.cantila.app");
-  assert.notEqual(mb!.smtpPassword, "old-fake-pw", "password rotated to the real one");
-  assert.deepEqual(calls, ["dom:legacy.cantila.app", "mbx:info@legacy.cantila.app"]);
+    const r1 = await backfillTenantMailboxes(store, prov);
+    assert.equal(r1.repaired, 1);
+    const mb = await store.getMailboxByProject("prj_legacy");
+    assert.equal(mb!.smtpHost, "mail.cantila.app");
+    assert.notEqual(mb!.smtpPassword, "old-fake-pw", "password rotated to the real one");
+    assert.ok(isEncryptedSecret(mb!.smtpPassword), "stored password is encrypted at rest");
+    assert.deepEqual(calls, ["dom:legacy.cantila.app", "mbx:info@legacy.cantila.app"]);
 
-  const r2 = await backfillTenantMailboxes(store, prov);
-  assert.equal(r2.repaired, 0, "second run is a no-op");
+    const r2 = await backfillTenantMailboxes(store, prov);
+    assert.equal(r2.repaired, 0, "second run is a no-op");
+  } finally {
+    delete process.env.CANTILA_SECRET_KEY;
+  }
 });
 
 test("backfill skips already-real and platform mailboxes", async () => {
