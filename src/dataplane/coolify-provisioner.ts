@@ -201,9 +201,10 @@ export function coolifyDbUuidFromUri(uri: string): string | null {
 /**
  * Select the service provisioner the same way `selectDataPlane` picks a
  * data plane: a real Coolify provisioner when the API creds + the
- * single-region server/project pair are present, else the stub. Mailbox
- * creation always delegates to the stub for now (Cantila Mail is a
- * separate backend), so only `createDatabase` goes live.
+ * single-region server/project pair are present, else the stub.
+ * `createDatabase` goes live via Coolify; mailbox creation goes live via
+ * the Mailcow provisioner when MAILCOW_URL + MAILCOW_API_KEY are set
+ * (see `createLiveMailboxServiceProvisioner`), else it stays on the stub.
  */
 export function selectProvisioner(
   env: NodeJS.ProcessEnv = process.env,
