@@ -497,6 +497,39 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
       },
     },
 
+    /* ---------- cantila_change_subdomain ---------- */
+    {
+      name: "cantila_change_subdomain",
+      description:
+        "Change a Cantila project's subdomain. Rewrites the project's free <slug>.cantila.app address (the slug is normalised and must be globally unique). The DNS/routing record updates immediately; the live URL switches on the project's next deploy. The old <slug>.cantila.app stops working, and the existing mailbox keeps its old address.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          projectId: {
+            type: "string",
+            description: "The Cantila project id.",
+          },
+          slug: {
+            type: "string",
+            description:
+              "The new subdomain, without the .cantila.app suffix (e.g. \"homes-prod\"). Normalised server-side: lowercased, non-alphanumerics become hyphens.",
+          },
+        },
+        required: ["projectId", "slug"],
+      },
+      handler: async (args) => {
+        const projectId = String(args.projectId ?? "");
+        if (!projectId) return errorText("projectId is required.");
+        const slug = String(args.slug ?? "");
+        if (!slug) return errorText("slug is required.");
+        const result = await cp.renameSlug(projectId, slug);
+        if ("error" in result) return errorText(result.error);
+        return text(
+          `Subdomain changed → ${result.slug}.cantila.app (live on the next deploy). The old URL no longer resolves.`,
+        );
+      },
+    },
+
     /* ---------- cantila_list_instances ---------- */
     {
       name: "cantila_list_instances",
