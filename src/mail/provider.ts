@@ -20,13 +20,13 @@
    feedback loop and the per-pool deliverability view are all
    exercisable offline against deterministic numbers.
 
-   STATUS — interfaces + stub only. A real MTA (Mailcow over
-   Postfix+Dovecot, or any RFC-5321 SMTP outbound + RFC-5322
-   inbound receiver behind this port) is INFRASTRUCTURE-BLOCKED:
-   it needs DNS + reverse DNS + dedicated IP pools + reputation
-   warmup. The port boundary keeps the architectural seam open so
-   a future `MailcowMailProvider` is a one-file swap with no call
-   sites moving.
+   STATUS — LIVE. The real `MailcowMailProvider` (mailcow-mail-provider.ts)
+   ships and auto-selects when the SMTP-submission env is set; this stub is
+   the offline fallback. Outbound submission to Mailcow (Postfix) is wired;
+   the inbound receive path still needs a Mailcow→CP bridge (IMAP poll or
+   Mailcow forward) to POST normalized messages to `/mail/inbound`. Full
+   external deliverability also wants per-domain DKIM + DNS warmup. The port
+   boundary kept the swap to one file with no call sites moving.
    ============================================================ */
 
 import type { MailEventKind } from "../core/control-plane";
@@ -257,13 +257,12 @@ function parseJson(rawBody: string): Record<string, unknown> {
 /** The mail provider the control plane uses. Auto-selects on env
  *  var presence — the same pattern Stripe / AI / SSO use:
  *
- *    - Today: always the stub (the real Mailcow adapter is
- *      infra-blocked).
- *    - Future: `MAILCOW_URL` + `MAILCOW_API_KEY` set →
- *      `MailcowMailProvider` (a thin REST + IMAP wrapper); the
- *      stub falls through otherwise. Same one-file swap pattern
+ *    - `MAILCOW_SMTP_HOST` + `MAILCOW_SMTP_USER` + `MAILCOW_SMTP_PASS`
+ *      set → `MailcowMailProvider` (SMTP submission via nodemailer);
+ *      the stub falls through otherwise. Same one-file swap pattern
  *      `StripeRealAdapter` / `ClaudeAiAnalyser` / `OidcSsoProvider`
- *      use today.
+ *      use today. (Mailbox provisioning is a separate env gate —
+ *      `MAILCOW_URL` + `MAILCOW_API_KEY` — see `createMailboxProvisioner`.)
  *
  *  Exported as a callable factory so tests can construct a fresh
  *  stub instance per case (preserves the seq counter's

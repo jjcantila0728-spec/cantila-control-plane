@@ -2011,9 +2011,9 @@ export class ControlPlane {
     return { ok: true, kind: ev.kind };
   }
 
-  /** Handle an inbound mail webhook (plan §4.4 — two-way mail). The real
-   *  MTA does not exist yet (§15.2); a future MTA / aggregator will POST
-   *  here when mail lands on one of the project's sending domains. We
+  /** Handle an inbound mail webhook (plan §4.4 — two-way mail). The live
+   *  Mailcow MTA receives the mail; a Mailcow→CP bridge (IMAP poll or
+   *  forward) POSTs here when mail lands on one of the project's domains. We
    *  resolve routing against the project's `MailAlias` rules + hosted
    *  mailboxes, persist the message, and record a `received` event into
    *  the in-memory mail ring so `MailAgent` and the deliverability

@@ -30,6 +30,13 @@ export const config = {
    *  in-process demo flow needs no setup. Recommended for any deployment
    *  that is reachable from the public internet. */
   requireAuth: flag(process.env.CANTILA_REQUIRE_AUTH),
+  /** Shared secret the Mailcow→CP inbound-mail bridge presents in the
+   *  `x-cantila-mail-secret` header on `POST /v1/projects/:id/mail/inbound`.
+   *  That route is exempt from API-key auth (a mail bridge can't hold a
+   *  Cantila admin key), so this secret is its credential. When unset the
+   *  route stays open (dev/test); set it on any internet-reachable
+   *  deployment so forged inbound mail can't be injected. */
+  mailInboundWebhookSecret: process.env.MAIL_INBOUND_WEBHOOK_SECRET ?? "",
   /** Public-face origin the SeoAgent crawls and emits canonical URLs for.
    *  Defaults to https://cantila.app; override in dev/staging. */
   seoOrigin:

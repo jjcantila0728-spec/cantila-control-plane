@@ -12,6 +12,7 @@ import { seedPlatformProject } from "./domain/seed-platform";
 import { reconcileProjectMailboxes } from "./domain/reconcile-mailboxes";
 import { backfillTenantMailboxes } from "./domain/backfill-mailboxes";
 import { mailboxProvisioner } from "./mail/provisioner";
+import { verifyMailInboundSecret } from "./mail/inbound-webhook-auth";
 import { selectDataPlane } from "./dataplane/factory";
 import { selectProvisioner } from "./dataplane/coolify-provisioner";
 import { ControlPlane } from "./core/control-plane";
@@ -1447,11 +1448,14 @@ app.post("/v1/projects/:id/mail/send", async (request, reply) => {
   return reply.code(202).send(result);
 });
 
-/** Inbound mail webhook — the MTA / aggregator POSTs here when a
+/** Inbound mail webhook — the Mailcow→CP bridge POSTs here when a
  *  message lands on one of the project's sending domains. Carrier-called,
- *  so it carries no API key (exempt from the auth hook). Mirrors the
- *  SMS inbound shape — the real MTA verifies the carrier's own webhook
- *  signature before forwarding. */
+ *  so it carries no API key (exempt from the auth hook). The credential is
+ *  instead a shared secret in the `x-cantila-mail-secret` header, checked
+ *  by `verifyMailInboundSecret` against `config.mailInboundWebhookSecret`
+ *  (the same posture as the Stripe / Adyen webhooks verifying their own
+ *  signature). Without it anyone who knows a project id could inject forged
+ *  inbound mail. Open when the secret is unset (dev/test). */
 const inboundMailSchema = z.object({
   to: z.string().email(),
   from: z.string().email(),
@@ -1462,6 +1466,15 @@ const inboundMailSchema = z.object({
 
 app.post("/v1/projects/:id/mail/inbound", async (request, reply) => {
   const { id } = request.params as { id: string };
+  const presented = request.headers["x-cantila-mail-secret"];
+  if (
+    !verifyMailInboundSecret(
+      Array.isArray(presented) ? presented[0] : presented,
+      config.mailInboundWebhookSecret,
+    )
+  ) {
+    return reply.code(401).send({ error: "invalid mail webhook secret" });
+  }
   const parsed = inboundMailSchema.safeParse(request.body);
   if (!parsed.success) {
     return reply.code(400).send({ error: parsed.error.flatten() });
