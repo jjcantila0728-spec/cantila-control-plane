@@ -82,6 +82,26 @@ export class CantilaGitProvider implements GitProvider {
     return mapContent(data);
   }
 
+  async archive(repo: RepoRef, ref?: string): Promise<{ data: Uint8Array; filename: string }> {
+    const branch = ref || (await this.getDefaultBranch(repo));
+    const res = await fetch(
+      `${this.base}/repos/${repo.owner}/${repo.repo}/archive/${encodeURIComponent(branch)}.zip`,
+      { headers: this.headers() },
+    );
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      let msg = `gitea ${res.status}`;
+      try {
+        const j = JSON.parse(text) as { message?: string };
+        if (j.message) msg = j.message;
+      } catch {
+        /* ignore */
+      }
+      throw new GitError(res.status, msg);
+    }
+    return { data: new Uint8Array(await res.arrayBuffer()), filename: `${repo.repo}.zip` };
+  }
+
   async writeFile(repo: RepoRef, input: WriteInput): Promise<{ commitSha: string; sha: string }> {
     const body = {
       content: Buffer.from(input.content, "utf-8").toString("base64"),

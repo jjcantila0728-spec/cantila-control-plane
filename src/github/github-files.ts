@@ -108,6 +108,31 @@ export async function readFile(
   return { content, sha: data.sha, encoding: "utf-8" };
 }
 
+/** Whole-repo zip via GitHub's zipball endpoint. fetch follows the 302 to
+ *  codeload automatically; we return the raw bytes (binary-faithful). */
+export async function archive(
+  ref: RepoRef,
+  branch: string,
+  token: string,
+): Promise<Uint8Array> {
+  const res = await fetch(
+    `${API}/repos/${ref.owner}/${ref.repo}/zipball/${encodeURIComponent(branch)}`,
+    { headers: headers(token) },
+  );
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let msg = `github ${res.status}`;
+    try {
+      const j = JSON.parse(text) as { message?: string };
+      if (j.message) msg = j.message;
+    } catch {
+      /* ignore */
+    }
+    throw new GithubError(res.status, msg);
+  }
+  return new Uint8Array(await res.arrayBuffer());
+}
+
 function encPath(path: string): string {
   return path.split("/").map(encodeURIComponent).join("/");
 }

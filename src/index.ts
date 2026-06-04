@@ -1032,6 +1032,23 @@ app.get("/v1/projects/:id/files", async (request, reply) => {
   }
 });
 
+app.get("/v1/projects/:id/files/archive", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const { ref } = request.query as { ref?: string };
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  try {
+    const result = await cp.archiveProject(id, ref);
+    if (result === null) return reply.code(404).send({ error: "project not found" });
+    if ("error" in result) return reply.code(409).send({ error: result.error });
+    reply.header("content-type", "application/zip");
+    reply.header("content-disposition", `attachment; filename="${result.filename}"`);
+    return reply.send(Buffer.from(result.data));
+  } catch (err) {
+    const status = (err as { status?: number }).status ?? 502;
+    return reply.code(status).send({ error: (err as Error).message });
+  }
+});
+
 app.get("/v1/projects/:id/files/content", async (request, reply) => {
   const { id } = request.params as { id: string };
   const { path, ref } = request.query as { path?: string; ref?: string };

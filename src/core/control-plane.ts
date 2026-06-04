@@ -6493,6 +6493,30 @@ export class ControlPlane {
     return provider.readFile(repo, path, ref);
   }
 
+  /** Whole-project archive as a real .zip from the connected repo. */
+  async archiveProject(
+    projectId: string,
+    ref?: string,
+  ): Promise<{ data: Uint8Array; filename: string } | { error: "no-repo" } | null> {
+    let project = await this.deps.store.getProject(projectId);
+    if (!project) return null;
+    if (!project.repoUrl) {
+      const ensured = await this.ensureProjectRepo(projectId);
+      if (!ensured) return null;
+      project = ensured;
+    }
+    const account = await this.deps.store.getAccount(project.accountId);
+    if (!account) return null;
+    let repo;
+    try {
+      repo = repoRefFor(project, account);
+    } catch {
+      return { error: "no-repo" };
+    }
+    const provider = gitProviderFor(project);
+    return provider.archive(repo, ref);
+  }
+
   /** Create or update a file in the connected repo's default branch. */
   async writeProjectFile(
     projectId: string,

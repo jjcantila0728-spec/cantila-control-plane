@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { strToU8, zipSync } from "fflate";
 import type { GitProvider } from "./provider";
 import type { RepoRef, FileNode, FileContent, WriteInput, DeleteInput } from "./types";
 import { GitError } from "./types";
@@ -52,6 +53,13 @@ export class StubGitProvider implements GitProvider {
     const files = this.files(r);
     if (!files.has(path)) throw new GitError(404, "file not found");
     return { content: files.get(path)!, sha: sha(files.get(path)!), encoding: "utf-8" };
+  }
+
+  async archive(r: RepoRef, _ref?: string): Promise<{ data: Uint8Array; filename: string }> {
+    const files = this.files(r);
+    const entries: Record<string, Uint8Array> = {};
+    for (const [path, content] of files) entries[path] = strToU8(content);
+    return { data: zipSync(entries), filename: `${r.repo}.zip` };
   }
 
   async writeFile(

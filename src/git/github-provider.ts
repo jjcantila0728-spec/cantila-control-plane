@@ -27,6 +27,14 @@ export class GitHubGitProvider implements GitProvider {
       (async () => gh.readFile(repo, path, ref || (await gh.getDefaultBranch(repo, this.token)), this.token))(),
     );
   }
+  archive(repo: RepoRef, ref?: string): Promise<{ data: Uint8Array; filename: string }> {
+    return this.wrap(
+      (async () => {
+        const branch = ref || (await gh.getDefaultBranch(repo, this.token));
+        return { data: await gh.archive(repo, branch, this.token), filename: `${repo.repo}.zip` };
+      })(),
+    );
+  }
   writeFile(repo: RepoRef, input: WriteInput) {
     return this.wrap(gh.writeFile(repo, input, this.token));
   }
