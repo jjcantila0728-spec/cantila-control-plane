@@ -110,6 +110,54 @@ test("local stdio caller (no context) keeps the legacy owner default", async () 
   assert.equal(scopedTo, ownerAccountId());
 });
 
+test("cantila_change_subdomain renames the slug for the project's owner", async () => {
+  let renamedWith: { id: string; slug: string } | null = null;
+  const cp = {
+    getProject: async (id: string) =>
+      id === "proj_A" ? { id, accountId: "acc_A" } : null,
+    canActOnAccount: async () => false,
+    renameSlug: async (id: string, slug: string) => {
+      renamedWith = { id, slug };
+      return { id, accountId: "acc_A", slug: "homes-prod" };
+    },
+  } as unknown as ControlPlane;
+
+  const result = await callTool(
+    buildServer(cp),
+    "cantila_change_subdomain",
+    { projectId: "proj_A", slug: "Homes Prod" },
+    { accountId: "acc_A" },
+  );
+
+  assert.deepEqual(renamedWith, { id: "proj_A", slug: "Homes Prod" });
+  assert.notEqual(result.isError, true);
+  assert.match(result.content[0].text, /homes-prod\.cantila\.app/);
+});
+
+test("remote caller cannot change another account's project subdomain", async () => {
+  let renameCalled = false;
+  const cp = {
+    getProject: async (id: string) =>
+      id === "proj_B" ? { id, accountId: "acc_B" } : null,
+    canActOnAccount: async () => false,
+    renameSlug: async () => {
+      renameCalled = true;
+      return { error: "should not reach here" };
+    },
+  } as unknown as ControlPlane;
+
+  const result = await callTool(
+    buildServer(cp),
+    "cantila_change_subdomain",
+    { projectId: "proj_B", slug: "steal" },
+    { accountId: "acc_A" },
+  );
+
+  assert.equal(renameCalled, false, "must not reach the mutation");
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /different account/i);
+});
+
 test("remote non-owner cannot read the global agents brain", async () => {
   let ticked = false;
   const cp = {
