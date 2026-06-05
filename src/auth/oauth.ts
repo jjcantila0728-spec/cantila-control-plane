@@ -12,6 +12,19 @@
 /** The MCP resource a token is valid for (RFC 9728). */
 export const MCP_RESOURCE_PATH = "/v1/mcp";
 
+/** Bare protected-resource metadata path (RFC 9728 §3, no resource path). */
+export const WELL_KNOWN_PROTECTED_RESOURCE =
+  "/.well-known/oauth-protected-resource";
+
+/** RFC 9728 §3.1 path-insertion form: for a resource whose identifier has a
+ *  path (`…/v1/mcp`), the well-known segment is inserted *before* that path.
+ *  MCP hosts (claude.ai, the SDK) derive this URL straight from the resource
+ *  identifier and request it FIRST, so it must resolve to the same metadata
+ *  as the bare path — and, like the bare path, be reachable un-authenticated.
+ *  When this 401s, discovery fails and the OAuth/Connect flow never starts. */
+export const WELL_KNOWN_PROTECTED_RESOURCE_MCP =
+  `${WELL_KNOWN_PROTECTED_RESOURCE}${MCP_RESOURCE_PATH}`;
+
 export interface ProtectedResourceMetadata {
   resource: string;
   authorization_servers: string[];

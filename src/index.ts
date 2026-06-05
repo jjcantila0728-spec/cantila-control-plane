@@ -51,6 +51,7 @@ import {
   buildProtectedResourceMetadata,
   buildAuthServerMetadata,
   MCP_RESOURCE_PATH,
+  WELL_KNOWN_PROTECTED_RESOURCE_MCP,
 } from "./auth/oauth";
 import { OAuthProvider } from "./auth/oauth-provider";
 
@@ -288,6 +289,11 @@ const EXEMPT_PATHS = new Set([
   // the browser to the Console consent page; the actual code is minted by
   // the session-gated `POST /v1/oauth/grant`, which is NOT exempt.
   "/.well-known/oauth-protected-resource",
+  // RFC 9728 §3.1 path-insertion form — claude.ai derives this straight from
+  // the resource id `…/v1/mcp` and requests it FIRST. Without this exemption
+  // it hit the auth gate and 401'd, so discovery (and the whole Connect flow)
+  // never started and the connector stayed stuck on `authenticate`.
+  WELL_KNOWN_PROTECTED_RESOURCE_MCP,
   "/.well-known/oauth-authorization-server",
   "/register",
   "/authorize",
@@ -3050,6 +3056,13 @@ app.post("/v1/agents/_test/reload", async (request, reply) => {
  *    5. host POST /token                  → exchange code+PKCE for a cts_ token
  * ----- */
 app.get("/.well-known/oauth-protected-resource", async (request) => {
+  return buildProtectedResourceMetadata(publicBaseUrl(request));
+});
+
+// Same metadata at the RFC 9728 §3.1 path-insertion URL
+// (`/.well-known/oauth-protected-resource/v1/mcp`). MCP hosts derive this
+// from the resource identifier and request it before the bare path.
+app.get(WELL_KNOWN_PROTECTED_RESOURCE_MCP, async (request) => {
   return buildProtectedResourceMetadata(publicBaseUrl(request));
 });
 
