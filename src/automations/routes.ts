@@ -18,6 +18,7 @@ import type { ControlPlane } from "../core/control-plane";
 import type { Store } from "../domain/store";
 import type { AutomationKind, Project } from "../domain/types";
 import type { WorkflowGraph } from "./engine";
+import { parseN8nWorkflowExport } from "./engines/n8n";
 import type { DefaultEngineRegistry } from "./registry";
 
 const automationKindSchema = z.enum(["n8n", "openclaw"]);
@@ -35,6 +36,15 @@ const saveWorkflowSchema = z.object({
   edges: z.array(z.unknown()),
   triggers: z.array(z.unknown()),
   meta: z.record(z.unknown()).optional(),
+});
+
+const importWorkflowSchema = z.object({
+  /** Raw n8n workflow export JSON (n8n's *Download* / *Copy* output). The
+   *  deep shape is validated by `parseN8nWorkflowExport`; here we only
+   *  assert it's an object so a clearly-bad body 400s early. */
+  workflow: z.record(z.unknown()),
+  /** Optional name override — defaults to the export's own name. */
+  name: z.string().min(1).max(120).optional(),
 });
 
 const runWorkflowSchema = z
@@ -256,6 +266,42 @@ export function registerAutomationRoutes(
       triggers: parsed.data.triggers as WorkflowGraph["triggers"],
       meta: parsed.data.meta,
     });
+    return reply.code(201).send({ workflow: saved });
+  });
+
+  /* ----- import an existing n8n workflow (n8n "Download" JSON) ----- */
+
+  app.post("/v1/automations/:id/workflows/import", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const project = await cp.getProject(id);
+    if (!project?.automationKind) {
+      return reply.code(404).send({ error: "automation not found" });
+    }
+    if (project.accountId !== resolveAccountId(request)) {
+      return reply.code(404).send({ error: "automation not found" });
+    }
+    // The export format is n8n-specific — OpenClaw has no equivalent, so
+    // refuse rather than mangle a graph the engine can't run.
+    if (project.automationKind !== "n8n") {
+      return reply
+        .code(400)
+        .send({ error: "import is only supported for n8n automations" });
+    }
+    const parsed = importWorkflowSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.flatten() });
+    }
+    let graph: WorkflowGraph;
+    try {
+      graph = parseN8nWorkflowExport(parsed.data.workflow);
+    } catch (err) {
+      return reply.code(400).send({
+        error: err instanceof Error ? err.message : "invalid workflow export",
+      });
+    }
+    if (parsed.data.name) graph = { ...graph, name: parsed.data.name };
+    const adapter = registry.get(project.automationKind);
+    const saved = await adapter.saveWorkflow(id, graph);
     return reply.code(201).send({ workflow: saved });
   });
 

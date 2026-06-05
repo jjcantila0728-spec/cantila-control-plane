@@ -34,6 +34,7 @@ import type {
   GraphEdge,
   GraphTrigger,
   NodeTypeDescriptor,
+  TriggerKind,
   WorkflowGraph,
   WorkflowSummary,
 } from "../engine";
@@ -396,6 +397,37 @@ export class N8nEngineAdapter implements AutomationEngineAdapter {
   }
 }
 
+/* ---------- import: n8n "Download" JSON → canonical graph ----- */
+
+/** Convert a raw n8n workflow export (the JSON you get from n8n's
+ *  *Download* / *Copy to clipboard*) into Cantila's canonical
+ *  `WorkflowGraph`. Reuses the same `n8nToCantila` translation the live
+ *  adapter uses on load, so an imported workflow is indistinguishable
+ *  from one authored on the canvas.
+ *
+ *  The incoming `id` is intentionally dropped — import always creates a
+ *  *new* workflow, so the returned graph carries `id: ""` and the engine
+ *  assigns a fresh id on save. Throws a descriptive `Error` on input that
+ *  isn't a workflow export (so the route can return a clean 400). */
+export function parseN8nWorkflowExport(input: unknown): WorkflowGraph {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    throw new Error("invalid workflow export: expected a JSON object");
+  }
+  const obj = input as Record<string, unknown>;
+  if (!Array.isArray(obj.nodes)) {
+    throw new Error("invalid workflow export: `nodes` array is required");
+  }
+  const row: N8nWorkflowRow = {
+    // Drop `id` — import mints a fresh workflow.
+    name: typeof obj.name === "string" && obj.name ? obj.name : "Imported workflow",
+    nodes: obj.nodes as N8nWorkflowRow["nodes"],
+    connections: (obj.connections as N8nWorkflowRow["connections"]) ?? {},
+    meta: (obj.meta as Record<string, unknown> | undefined),
+  };
+  const graph = n8nToCantila(row);
+  return { ...graph, id: "" };
+}
+
 /* ---------- canonical-graph ↔ n8n translation ----- */
 
 function n8nToCantila(row: N8nWorkflowRow): WorkflowGraph {
@@ -422,17 +454,11 @@ function n8nToCantila(row: N8nWorkflowRow): WorkflowGraph {
     }
   }
 
-  const triggers: GraphTrigger[] = nodes
-    .filter((n) => n.type.endsWith(":webhook") || n.type.endsWith(":schedule") || n.type.endsWith(":manualTrigger"))
-    .map((n) => ({
-      id: `trg_${n.id}`,
-      kind: n.type.endsWith(":webhook")
-        ? "webhook"
-        : n.type.endsWith(":schedule")
-          ? "schedule"
-          : "manual",
-      config: n.parameters,
-    }));
+  const triggers: GraphTrigger[] = [];
+  for (const n of nodes) {
+    const kind = classifyTrigger(n.type);
+    if (kind) triggers.push({ id: `trg_${n.id}`, kind, config: n.parameters });
+  }
 
   return {
     id: row.id ?? "",
@@ -504,6 +530,20 @@ function n8nExecToCantila(row: N8nExecutionRow): ExecutionState {
 }
 
 /* ---------- helpers ----- */
+
+/** Classify a canonical node type (`n8n:<n8nType>`) as a trigger kind, or
+ *  null when it isn't a trigger. Tolerant of both stub-style type ids
+ *  (`n8n:webhook`, `n8n:schedule`) and real n8n type names
+ *  (`n8n-nodes-base.webhook`, `…manualTrigger`, `…scheduleTrigger`,
+ *  legacy `…cron` / `…interval`). */
+function classifyTrigger(type: string): TriggerKind | null {
+  const t = type.toLowerCase();
+  if (t.includes("webhook")) return "webhook";
+  if (t.includes("schedule") || t.includes("cron") || t.includes("interval"))
+    return "schedule";
+  if (t.includes("manualtrigger") || t.endsWith(":manual")) return "manual";
+  return null;
+}
 
 function pickConnectionId(
   credentials?: Record<string, { id: string; name: string }>,

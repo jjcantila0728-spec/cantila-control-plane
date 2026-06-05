@@ -64,6 +64,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "OpenAI",
     blurb: "GPT-4, embeddings, image generation.",
     glyph: "AI",
+    iconUrl: "https://cdn.simpleicons.org/openai",
     authKinds: ["api_key"],
     apiKey: {
       fields: [
@@ -82,6 +83,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "Anthropic",
     blurb: "Claude — sonnet, opus, haiku.",
     glyph: "Λ",
+    iconUrl: "https://cdn.simpleicons.org/anthropic",
     authKinds: ["api_key"],
     apiKey: {
       fields: [
@@ -100,6 +102,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "Stripe",
     blurb: "Payments, subscriptions, billing.",
     glyph: "S",
+    iconUrl: "https://cdn.simpleicons.org/stripe",
     authKinds: ["api_key"],
     apiKey: {
       fields: [
@@ -120,6 +123,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "Gmail",
     blurb: "Send mail, parse incoming threads, label messages.",
     glyph: "G",
+    iconUrl: "https://cdn.simpleicons.org/gmail",
     authKinds: ["oauth"],
     oauth: {
       authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -137,6 +141,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "Slack",
     blurb: "Post messages, react, listen to events.",
     glyph: "#",
+    iconUrl: "https://cdn.simpleicons.org/slack",
     authKinds: ["oauth"],
     oauth: {
       authUrl: "https://slack.com/oauth/v2/authorize",
@@ -151,6 +156,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "Notion",
     blurb: "Read/write pages, databases, comments.",
     glyph: "N",
+    iconUrl: "https://cdn.simpleicons.org/notion",
     authKinds: ["oauth"],
     oauth: {
       authUrl: "https://api.notion.com/v1/oauth/authorize",
@@ -165,6 +171,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "GitHub",
     blurb: "Repos, PRs, issues, releases.",
     glyph: "GH",
+    iconUrl: "https://cdn.simpleicons.org/github",
     authKinds: ["oauth"],
     oauth: {
       authUrl: "https://github.com/login/oauth/authorize",
@@ -179,6 +186,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "Airtable",
     blurb: "Read/write base records and views.",
     glyph: "A",
+    iconUrl: "https://cdn.simpleicons.org/airtable",
     authKinds: ["oauth"],
     oauth: {
       authUrl: "https://airtable.com/oauth2/v1/authorize",
@@ -195,6 +203,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "SendGrid",
     blurb: "Transactional email API.",
     glyph: "✉",
+    iconUrl: "https://cdn.simpleicons.org/sendgrid",
     authKinds: ["api_key"],
     apiKey: {
       fields: [
@@ -213,6 +222,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "Twilio",
     blurb: "SMS, voice, programmable messaging.",
     glyph: "T",
+    iconUrl: "https://cdn.simpleicons.org/twilio",
     authKinds: ["basic"],
     apiKey: {
       fields: [
@@ -233,6 +243,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "PostgreSQL",
     blurb: "Connection string for any Postgres server.",
     glyph: "Pg",
+    iconUrl: "https://cdn.simpleicons.org/postgresql",
     authKinds: ["api_key"],
     apiKey: {
       fields: [
@@ -250,6 +261,7 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
     name: "MySQL",
     blurb: "Connection string for any MySQL server.",
     glyph: "My",
+    iconUrl: "https://cdn.simpleicons.org/mysql",
     authKinds: ["api_key"],
     apiKey: {
       fields: [
@@ -259,6 +271,27 @@ export const PROVIDER_CATALOG: ProviderDescriptor[] = [
           secret: true,
           hint: "`mysql://user:pass@host:3306/db`",
         },
+      ],
+    },
+  },
+
+  /* ----- connect any website with a login ----- */
+  {
+    id: "website",
+    name: "Website login",
+    blurb: "Connect any site with your username and password.",
+    glyph: "🌐",
+    authKinds: ["basic"],
+    apiKey: {
+      fields: [
+        {
+          key: "site_url",
+          label: "Site URL",
+          secret: false,
+          hint: "e.g. `https://app.example.com` — the site you sign in to.",
+        },
+        { key: "username", label: "Username or email", secret: false },
+        { key: "password", label: "Password", secret: true },
       ],
     },
   },
