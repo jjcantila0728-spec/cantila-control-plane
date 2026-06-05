@@ -54,6 +54,7 @@ import {
   WELL_KNOWN_PROTECTED_RESOURCE_MCP,
 } from "./auth/oauth";
 import { OAuthProvider } from "./auth/oauth-provider";
+import { installPs1, installSh } from "./install/script";
 
 // 10 auth attempts per IP per minute, shared across login/register/sso.
 const authRateLimit = createRateLimiter({ windowMs: 60_000, max: 10 });
@@ -298,6 +299,11 @@ const EXEMPT_PATHS = new Set([
   "/register",
   "/authorize",
   "/token",
+  // One-line MCP installers — piped to `iex`/`sh` with no credential, by
+  // definition. They ship only the public MCP URL (no secrets); auth
+  // happens later when the registered server is first used.
+  "/install.ps1",
+  "/install.sh",
 ]);
 
 function scopeAllows(
@@ -997,8 +1003,9 @@ app.get("/v1/projects/:id/logs", async (request, reply) => {
 // Environment variables — including the injected service credentials.
 app.get("/v1/projects/:id/env", async (request, reply) => {
   const { id } = request.params as { id: string };
+  const { reveal } = request.query as { reveal?: string };
   if (!(await assertProjectAccess(request, reply, id))) return;
-  const env = await cp.getEnv(id);
+  const env = await cp.getEnv(id, { reveal: reveal === "1" || reveal === "true" });
   if (!env) return reply.code(404).send({ error: "project not found" });
   return { env };
 });
@@ -3164,6 +3171,31 @@ app.post("/token", async (request, reply) => {
       error_description: err instanceof Error ? err.message : "invalid_grant",
     });
   }
+});
+
+/* One-line MCP installers (plan §7.6). `iwr -useb <host>/install.ps1 | iex`
+ * (Windows) or `curl -fsSL <host>/install.sh | sh` (macOS/Linux) registers
+ * this host's MCP endpoint with the Claude Code CLI. Domain-agnostic: the
+ * script targets whatever host served it (publicBaseUrl), so the same route
+ * powers api.cantila.app and a branded gritcode.cantila.app. `?name=` lets a
+ * branded host register under its own server name (defaults to "cantila").
+ * Unauthenticated by design — it ships no secrets, only the public URL. */
+function installServerName(request: FastifyRequest): string | undefined {
+  const raw = (request.query as { name?: string } | undefined)?.name?.trim();
+  // Only accept a CLI-safe identifier; ignore anything exotic.
+  return raw && /^[a-z0-9][a-z0-9_-]{0,31}$/i.test(raw) ? raw : undefined;
+}
+
+app.get("/install.ps1", async (request, reply) => {
+  reply.header("content-type", "text/plain; charset=utf-8");
+  reply.header("cache-control", "no-store");
+  return reply.send(installPs1(publicBaseUrl(request), installServerName(request)));
+});
+
+app.get("/install.sh", async (request, reply) => {
+  reply.header("content-type", "text/plain; charset=utf-8");
+  reply.header("cache-control", "no-store");
+  return reply.send(installSh(publicBaseUrl(request), installServerName(request)));
 });
 
 app.get("/v1/mcp", async () => {
