@@ -13,7 +13,11 @@
    (see createMailboxProvisioner). Uses the global `fetch` (Node 20).
    ============================================================ */
 
-import type { MailboxProvisioner, ProvisionResult } from "./provisioner";
+import type {
+  MailboxProvisioner,
+  ProvisionResult,
+  ProvisionedMailbox,
+} from "./provisioner";
 
 export class MailcowMailboxProvisioner implements MailboxProvisioner {
   readonly label = "Mailcow";
@@ -140,5 +144,39 @@ export class MailcowMailboxProvisioner implements MailboxProvisioner {
     return res.ok
       ? { ok: true }
       : { error: `deleteMailbox failed: ${res.detail}` };
+  }
+
+  /** List every mailbox on a domain. Mailcow's `/get/mailbox/all`
+   *  returns all mailboxes; we filter to the requested domain and map
+   *  bytes → MB. Returns [] on any failure — the boot reconcile must
+   *  never block startup. */
+  async listMailboxes(domain: string): Promise<ProvisionedMailbox[]> {
+    const got = await this.call("GET", "/get/mailbox/all");
+    if (!got.ok) return [];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(got.detail);
+    } catch {
+      return [];
+    }
+    if (!Array.isArray(parsed)) return [];
+    const wanted = domain.trim().toLowerCase();
+    const out: ProvisionedMailbox[] = [];
+    for (const row of parsed) {
+      if (typeof row !== "object" || row === null) continue;
+      const r = row as Record<string, unknown>;
+      const address = String(r.username ?? "").trim().toLowerCase();
+      if (!address.endsWith(`@${wanted}`)) continue;
+      const quotaBytes = Number(r.quota ?? 0);
+      const usedBytes = Number(r.quota_used ?? 0);
+      out.push({
+        address,
+        displayName:
+          typeof r.name === "string" && r.name.trim() ? r.name : undefined,
+        quotaMb: quotaBytes > 0 ? Math.round(quotaBytes / (1024 * 1024)) : 0,
+        usedMb: usedBytes > 0 ? Math.round(usedBytes / (1024 * 1024)) : 0,
+      });
+    }
+    return out;
   }
 }
