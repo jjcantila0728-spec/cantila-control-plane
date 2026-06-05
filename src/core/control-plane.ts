@@ -6106,14 +6106,19 @@ export class ControlPlane {
     }
   }
 
-  /** Environment variables, secret values masked. */
-  async getEnv(projectId: string): Promise<EnvView[] | null> {
+  /** Environment variables; secret values masked unless `reveal` is set. */
+  async getEnv(
+    projectId: string,
+    opts: { reveal?: boolean } = {},
+  ): Promise<EnvView[] | null> {
     const project = await this.deps.store.getProject(projectId);
     if (!project) return null;
     const vars = await this.deps.store.listEnvVars(projectId);
     return vars.map((v) => ({
       key: v.key,
-      value: v.secret ? mask(v.value) : v.value,
+      // Secrets are masked by default; the owner can reveal the plaintext
+      // (e.g. to copy a value) via an explicit reveal request.
+      value: v.secret && !opts.reveal ? mask(v.value) : v.value,
       secret: v.secret,
       scope: v.scope,
     }));
