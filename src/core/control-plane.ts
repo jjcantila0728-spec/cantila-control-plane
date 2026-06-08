@@ -205,6 +205,12 @@ export interface ControlPlaneDeps {
    *  `adapter.bindConnection` with no context — same shape as the
    *  Phase B placeholder path. */
   resolveSecret?: (ref: string) => Promise<Record<string, string> | null>;
+  /** Optional — reachability probe for the custom-domain verify sweep
+   *  (plan §22.6). Given a hostname, resolves `true` once the host
+   *  answers over HTTPS (DNS points at the platform AND the data plane's
+   *  Traefik has issued its Let's Encrypt cert). Defaults to a real
+   *  HTTPS HEAD/GET probe; tests inject a deterministic stub. */
+  domainProbe?: (hostname: string) => Promise<boolean>;
 }
 
 export interface CreateProjectInput {
@@ -972,6 +978,26 @@ function isValidHostname(host: string): boolean {
   return host.split(".").every((label) => labelRe.test(label));
 }
 
+/** Default custom-domain reachability probe (plan §22.6). An HTTPS GET to
+ *  the host: any HTTP response — even 4xx/5xx — means the TLS handshake
+ *  completed, i.e. DNS resolves to the platform and the data plane's
+ *  Traefik issued the cert. A network / TLS error (cert not yet issued,
+ *  DNS not propagated) rejects, which the verify sweep reads as "still
+ *  pending". `redirect: "manual"` so a tenant 30x doesn't fan out into a
+ *  follow request; the status alone proves reachability. */
+async function probeHttpsReachable(hostname: string): Promise<boolean> {
+  try {
+    const res = await fetch(`https://${hostname}/`, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(5_000),
+    });
+    return res.status > 0;
+  } catch {
+    return false;
+  }
+}
+
 /* ----- the service ----- */
 
 export type AuthFailureReason =
@@ -1116,6 +1142,13 @@ const DUNNING_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
  *  is minutes, not seconds. */
 const NODE_HEARTBEAT_SWEEP_INTERVAL_MS = 60 * 1000;
 
+/** How often the custom-domain verify sweep probes pending hostnames for
+ *  HTTPS reachability (plan §22.6). 60 s balances "domain goes live
+ *  quickly after the customer's DNS propagates" against not hammering
+ *  third-party hosts. DNS + ACME issuance takes minutes, so this isn't
+ *  a hot path. */
+const DOMAIN_VERIFY_SWEEP_INTERVAL_MS = 60 * 1000;
+
 /** A BYO node with no heartbeat in this window is flipped to `offline`.
  *  The next heartbeat walks it back to `active`. */
 const NODE_OFFLINE_THRESHOLD_MS = 5 * 60 * 1000;
@@ -1184,6 +1217,8 @@ export class ControlPlane {
   /** Handle for the periodic dunning grace-expiry sweep. */
   private dunningTimer: ReturnType<typeof setInterval> | null = null;
   private nodeHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Handle for the custom-domain TLS verify sweep (plan §22.6). */
+  private domainVerifyTimer: ReturnType<typeof setInterval> | null = null;
   /** Live OTP challenges (plan §4.5 / §15.2), keyed by challenge id.
    *  In-memory + TTL-pruned — OTP codes are ephemeral, so a process
    *  restart just means a customer re-requests. Production would use
@@ -1244,6 +1279,16 @@ export class ControlPlane {
       }, NODE_HEARTBEAT_SWEEP_INTERVAL_MS);
       this.nodeHeartbeatTimer.unref?.();
     }
+    // Custom-domain TLS verify sweep (plan §22.6) — flips a pending
+    // custom domain to `sslActive` once its host answers over HTTPS
+    // (customer DNS propagated + Let's Encrypt cert issued). `unref()`
+    // so the timer never holds the process open.
+    if (!this.domainVerifyTimer) {
+      this.domainVerifyTimer = setInterval(() => {
+        void this.runDomainVerifySweep();
+      }, DOMAIN_VERIFY_SWEEP_INTERVAL_MS);
+      this.domainVerifyTimer.unref?.();
+    }
   }
 
   stopBackgroundJobs(): void {
@@ -1256,6 +1301,10 @@ export class ControlPlane {
     if (this.nodeHeartbeatTimer) {
       clearInterval(this.nodeHeartbeatTimer);
       this.nodeHeartbeatTimer = null;
+    }
+    if (this.domainVerifyTimer) {
+      clearInterval(this.domainVerifyTimer);
+      this.domainVerifyTimer = null;
     }
   }
 
@@ -6201,11 +6250,67 @@ export class ControlPlane {
       isCantilaSub ? "SSL active" : "SSL issuing — DNS record pending",
       projectId,
     );
+    // For a custom host, ask the data plane to wire it onto the running
+    // app so its Traefik starts routing the host and requests a cert
+    // (plan §22.6). The free *.cantila.app subdomain is wildcard-covered
+    // and needs no per-host attach. Best-effort: a data-plane failure
+    // (Coolify unreachable, app not yet provisioned) must not fail the
+    // user's request — the domain stays `sslActive: false` and the
+    // verify sweep keeps retrying, so attaching converges later.
+    if (!isCantilaSub && this.deps.dataPlane.attachDomain) {
+      try {
+        await this.deps.dataPlane.attachDomain(project, host);
+      } catch (err) {
+        console.warn(
+          `[domains] attachDomain ${host} on ${project.id} failed (will retry via verify sweep): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
     return {
       domain,
       dns: { type: "CNAME", name: host, value: `${project.slug}.cantila.app` },
       ssl: isCantilaSub ? "active" : "issuing",
     };
+  }
+
+  /** Sweep every custom domain whose TLS isn't confirmed live yet
+   *  (plan §22.6 — bring-your-own-domain) and flip the ones whose host
+   *  now answers over HTTPS. A successful probe means the customer's DNS
+   *  resolves to the platform AND the data plane's Traefik has issued the
+   *  Let's Encrypt cert — the two halves that were missing for the flag to
+   *  ever leave `false`. Runs on a timer from `startBackgroundJobs` and on
+   *  demand from the dev seam route. Idempotent: a domain already
+   *  `sslActive` is excluded by `listPendingCustomDomains`, so re-running
+   *  is cheap. Per-domain probe failures are swallowed — the domain just
+   *  stays pending and is retried next sweep. */
+  async runDomainVerifySweep(): Promise<{ checked: number; verified: number }> {
+    const pending = await this.deps.store.listPendingCustomDomains();
+    const probe = this.deps.domainProbe ?? probeHttpsReachable;
+    let verified = 0;
+    for (const d of pending) {
+      let live = false;
+      try {
+        live = await probe(d.hostname);
+      } catch {
+        live = false;
+      }
+      if (!live) continue;
+      await this.deps.store.updateDomain(d.id, { sslActive: true });
+      const project = await this.deps.store.getProject(d.projectId);
+      if (project) {
+        await this.recordEvent(
+          project.accountId,
+          "domain",
+          `Domain ${d.hostname} is live`,
+          "SSL active — HTTPS verified",
+          project.id,
+        );
+      }
+      verified++;
+    }
+    return { checked: pending.length, verified };
   }
 
   /** Vertical + horizontal resize. Horizontal fields (plan §5.2):
@@ -6627,11 +6732,28 @@ export class ControlPlane {
     }
     const project = await this.deps.store.getProject(projectId);
     if (!project) return { error: "project not found" };
+    // A repo on our self-hosted Gitea must be marked repoHost:"cantila" so the
+    // data plane uses the token-authenticated HTTPS clone flow. Without this
+    // the project keeps the default repoHost:"github", and Coolify's
+    // `/applications/public` mangles the self-hosted URL into an unclonable
+    // `owner/repo` path → the deploy can't clone → the app crashes.
+    let repoHost = project.repoHost ?? "github";
+    if (config.giteaUrl) {
+      try {
+        if (new URL(url).host === new URL(config.giteaUrl).host) {
+          repoHost = "cantila";
+        }
+      } catch {
+        // unparseable URL — leave repoHost untouched; the https:// guard above
+        // already rejects non-URL input, so this is defensive only.
+      }
+    }
     // 32 random bytes hex-encoded → 64 chars, the same shape GitHub
     // recommends for repository webhook secrets.
     const webhookSecret = randomBytes(32).toString("hex");
     const updated = await this.deps.store.updateProject(projectId, {
       repoUrl: url,
+      repoHost,
       branch: opts.branch ?? "main",
       autoDeploy: opts.autoDeploy ?? true,
       webhookSecret,

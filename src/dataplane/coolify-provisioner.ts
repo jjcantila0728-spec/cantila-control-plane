@@ -14,15 +14,14 @@
    the value the app needs as `DATABASE_URL`; no external port, no
    public exposure.
 
-   Mailbox provisioning stays delegated to the stub for now — Cantila
-   Mail is wired separately (dedicated Mailcow box) and is not part of
-   this Coolify path.
+   Email provisioning is separate — tenants connect their mailbox from
+   the Cantila console (Mail tab). This provisioner handles only
+   the database.
    ============================================================ */
 
 import type { Project, DbEngine, Region } from "../domain/types";
 import type { ServiceProvisioner } from "../deploy/provisioning";
 import { stubProvisioner } from "./stub";
-import { createLiveMailboxServiceProvisioner } from "../mail/mailbox-service-provisioner";
 
 /** Per-region Coolify binding for database provisioning — the DB must
  *  land on the SAME server + project as the tenant app so they share a
@@ -48,9 +47,6 @@ export interface CoolifyProvisionerOptions {
    *  entry, the DB is created against that server/project instead of
    *  the default pair. */
   regions?: Partial<Record<Region, CoolifyProvisionerRegion>>;
-  /** Provisioner that handles mailbox creation — defaults to the stub
-   *  (Cantila Mail is a separate backend). */
-  mailbox?: ServiceProvisioner;
 }
 
 interface ResolvedBinding {
@@ -72,7 +68,6 @@ export class CoolifyServiceProvisioner implements ServiceProvisioner {
   private readonly serverUuid: string;
   private readonly projectUuid: string;
   private readonly regions?: Partial<Record<Region, CoolifyProvisionerRegion>>;
-  private readonly mailbox: ServiceProvisioner;
 
   constructor(opts: CoolifyProvisionerOptions) {
     this.defaultApiUrl = opts.apiUrl.replace(/\/+$/, "");
@@ -81,7 +76,6 @@ export class CoolifyServiceProvisioner implements ServiceProvisioner {
     this.serverUuid = opts.serverUuid;
     this.projectUuid = opts.projectUuid;
     this.regions = opts.regions;
-    this.mailbox = opts.mailbox ?? stubProvisioner;
   }
 
   private bindingFor(project: Project): ResolvedBinding {
@@ -130,12 +124,6 @@ export class CoolifyServiceProvisioner implements ServiceProvisioner {
       // shared `coolify` network, reachable by the tenant app.
       connectionUri: res.internal_db_url,
     };
-  }
-
-  async createMailbox(project: Project): ReturnType<
-    ServiceProvisioner["createMailbox"]
-  > {
-    return this.mailbox.createMailbox(project);
   }
 
   async destroyDatabase(connectionUri: string): Promise<void> {
@@ -202,9 +190,6 @@ export function coolifyDbUuidFromUri(uri: string): string | null {
  * Select the service provisioner the same way `selectDataPlane` picks a
  * data plane: a real Coolify provisioner when the API creds + the
  * single-region server/project pair are present, else the stub.
- * `createDatabase` goes live via Coolify; mailbox creation goes live via
- * the Mailcow provisioner when MAILCOW_URL + MAILCOW_API_KEY are set
- * (see `createLiveMailboxServiceProvisioner`), else it stays on the stub.
  */
 export function selectProvisioner(
   env: NodeJS.ProcessEnv = process.env,
@@ -215,7 +200,6 @@ export function selectProvisioner(
   const projectUuid = env.COOLIFY_PROJECT_UUID?.trim();
 
   if (apiUrl && apiToken && serverUuid && projectUuid) {
-    const liveMailbox = createLiveMailboxServiceProvisioner();
     return {
       provisioner: new CoolifyServiceProvisioner({
         apiUrl,
@@ -223,11 +207,6 @@ export function selectProvisioner(
         serverUuid,
         projectUuid,
         environmentName: env.COOLIFY_ENVIRONMENT_NAME?.trim() || undefined,
-        // Real Mailcow mailbox creation when MAILCOW_* is set; else the
-        // constructor default (stubProvisioner) keeps mail record-only.
-        mailbox: liveMailbox
-          ? ({ ...stubProvisioner, createMailbox: liveMailbox.createMailbox } as ServiceProvisioner)
-          : undefined,
       }),
       live: true,
     };

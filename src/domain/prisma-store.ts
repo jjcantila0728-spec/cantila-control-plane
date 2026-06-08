@@ -1207,6 +1207,13 @@ export class PrismaStore implements Store {
     return row ? toDomain(row) : null;
   }
 
+  async listPendingCustomDomains(): Promise<Domain[]> {
+    const rows = await this.db.domain.findMany({
+      where: { kind: "custom", sslActive: false },
+    });
+    return rows.map(toDomain);
+  }
+
   async updateDomain(id: string, patch: Partial<Domain>): Promise<Domain> {
     const row = await this.db.domain.update({
       where: { id },

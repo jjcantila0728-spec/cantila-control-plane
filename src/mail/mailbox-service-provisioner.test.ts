@@ -15,6 +15,7 @@ function fakeProvisioner(over: Partial<MailboxProvisioner> = {}): {
     async ensureDomain(d) { calls.push(`ensureDomain:${d}`); return { ok: true } as ProvisionResult; },
     async createMailbox(i) { calls.push(`createMailbox:${i.address}`); return { ok: true } as ProvisionResult; },
     async deleteMailbox() { return { ok: true } as ProvisionResult; },
+    async listMailboxes() { return []; },
     ...over,
   };
   return { prov, calls };

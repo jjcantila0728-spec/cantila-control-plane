@@ -13,6 +13,7 @@ function fakeProvisioner(): { prov: MailboxProvisioner; calls: string[] } {
     async ensureDomain(d) { calls.push(`dom:${d}`); return { ok: true } as ProvisionResult; },
     async createMailbox(i) { calls.push(`mbx:${i.address}`); return { ok: true } as ProvisionResult; },
     async deleteMailbox() { return { ok: true } as ProvisionResult; },
+    async listMailboxes() { return []; },
   };
   return { prov, calls };
 }

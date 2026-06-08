@@ -132,20 +132,6 @@ test("createDatabase routes to a region's server/project when configured", async
   }
 });
 
-test("createMailbox delegates to the mailbox provisioner (stub by default)", async () => {
-  const prov = new CoolifyServiceProvisioner({
-    apiUrl: "http://coolify.test/api/v1",
-    apiToken: "tok",
-    serverUuid: "srv1",
-    projectUuid: "proj1",
-  });
-  const mailbox = await prov.createMailbox(makeProject());
-  const stubbed = await stubProvisioner.createMailbox(makeProject());
-  // Same shape/host as the stub — proves delegation rather than a real call.
-  assert.equal(mailbox.smtpHost, stubbed.smtpHost);
-  assert.ok(mailbox.address.includes("demo"));
-});
-
 test("selectProvisioner returns stub without Coolify env, live with it", () => {
   assert.equal(selectProvisioner({}).live, false);
   assert.equal(selectProvisioner({}).provisioner, stubProvisioner);

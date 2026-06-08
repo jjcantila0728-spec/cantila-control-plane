@@ -57,7 +57,7 @@ test("deploy no longer auto-provisions an SMS number", async () => {
   );
 
   assert.equal(result.databaseCreated, true);
-  assert.equal(result.mailboxCreated, true);
+  assert.equal(result.workspaceCreated, false);
   // No phone number, and no CANTILA_SMS_* env injected.
   assert.equal(await store.getPhoneNumberByProject(project.id), null);
   const env = await store.listEnvVars(project.id);

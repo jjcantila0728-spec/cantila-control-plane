@@ -16,6 +16,16 @@ import { MailcowMailboxProvisioner } from "./mailcow-provisioner";
 
 export type ProvisionResult = { ok: true } | { error: string };
 
+/** A mailbox that already exists in the MTA — returned by
+ *  `listMailboxes` so boot can adopt manually-created inboxes
+ *  (e.g. info@cantila.app) into `HostedMailbox` rows. */
+export interface ProvisionedMailbox {
+  address: string;
+  displayName?: string;
+  quotaMb: number;
+  usedMb: number;
+}
+
 export interface MailboxProvisioner {
   /** Display label — surfaced so an operator knows whether the
    *  control plane is talking to the stub or a real Mailcow. */
@@ -33,6 +43,10 @@ export interface MailboxProvisioner {
   }): Promise<ProvisionResult>;
   /** Remove a mailbox (used when a hosted mailbox is deleted). */
   deleteMailbox(address: string): Promise<ProvisionResult>;
+  /** List existing mailboxes on a domain. Used by the boot reconcile
+   *  to adopt mailboxes created directly in the MTA (never through the
+   *  control plane) into DB rows so they surface in the console. */
+  listMailboxes(domain: string): Promise<ProvisionedMailbox[]>;
 }
 
 /** Deterministic no-op. Keeps offline smoke + tests deterministic —
@@ -48,6 +62,9 @@ export class StubMailboxProvisioner implements MailboxProvisioner {
   }
   async deleteMailbox(): Promise<ProvisionResult> {
     return { ok: true };
+  }
+  async listMailboxes(): Promise<ProvisionedMailbox[]> {
+    return [];
   }
 }
 

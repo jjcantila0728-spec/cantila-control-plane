@@ -9,6 +9,7 @@ import { config } from "./config";
 import { createStore } from "./domain/create-store";
 import { seedOwnerAccount } from "./domain/seed-owner";
 import { seedPlatformProject } from "./domain/seed-platform";
+import { seedPlatformMailboxes } from "./domain/seed-platform-mailboxes";
 import { reconcileProjectMailboxes } from "./domain/reconcile-mailboxes";
 import { backfillTenantMailboxes } from "./domain/backfill-mailboxes";
 import { mailboxProvisioner } from "./mail/provisioner";
@@ -2065,6 +2066,14 @@ app.get("/v1/nodes/summary", async (request) => {
  *  route exists so tests and ops can poke it without waiting. */
 app.post("/v1/nodes/sweep", async () => {
   return cp.runNodeHeartbeatSweep();
+});
+
+/** Dev/ops seam — force one custom-domain TLS verify sweep (plan §22.6).
+ *  Probes every pending custom domain over HTTPS and flips the ones whose
+ *  cert is now live. Runs on a timer too; this lets the Console's
+ *  "verify now" action and ops trigger it without waiting a minute. */
+app.post("/v1/domains/verify-sweep", async () => {
+  return cp.runDomainVerifySweep();
 });
 
 app.get("/v1/nodes/:id", async (request, reply) => {
@@ -4343,6 +4352,15 @@ app
     app.log.info(
       `platform seed: account=${platformSeed.accountId} created=${platformSeed.created}`,
     );
+    // Adopt cantila.app mailboxes that were created directly in Mailcow
+    // (info@, noreply@) into HostedMailbox rows so the owner sees and
+    // manages them in the console. Live-only; idempotent. (plan §4.4)
+    if (mailboxProvisioner.live) {
+      const pmbx = await seedPlatformMailboxes(store, mailboxProvisioner);
+      app.log.info(
+        `platform mailbox adopt: adopted=${pmbx.adopted}/${pmbx.scanned}`,
+      );
+    }
     // Backfill legacy tenant mailboxes that were record-only (no real
     // Mailcow mailbox provisioned): re-provision domain + mailbox, rotate
     // password, fix smtpHost. Must run BEFORE reconcile which rewrites
