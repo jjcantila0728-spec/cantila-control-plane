@@ -16,9 +16,20 @@
 import { randomBytes } from "node:crypto";
 
 import type { Project } from "../domain/types";
-import type { ServiceProvisioner } from "../deploy/provisioning";
 import { defaultProjectMailbox } from "./default-mailbox";
 import { mailboxProvisioner, type MailboxProvisioner } from "./provisioner";
+
+export interface MailboxServiceResult {
+  address: string;
+  sendingDomain: string;
+  smtpHost: string;
+  smtpUser: string;
+  smtpPassword: string;
+}
+
+export interface MailboxService {
+  createMailbox(project: Project): Promise<MailboxServiceResult>;
+}
 
 /** Default mailbox quota for an auto-wired tenant mailbox (10 GB). */
 const DEFAULT_QUOTA_MB = 10240;
@@ -27,7 +38,7 @@ const DEFAULT_QUOTA_MB = 10240;
  *  actually provisions a Mailcow mailbox via `provisioner`. */
 export function createMailboxServiceProvisioner(
   provisioner: MailboxProvisioner,
-): Pick<ServiceProvisioner, "createMailbox"> {
+): MailboxService {
   return {
     async createMailbox(project: Project) {
       const base = defaultProjectMailbox(project.slug);
@@ -60,9 +71,7 @@ export function createMailboxServiceProvisioner(
 /** Env-gated factory — returns the live mailbox createMailbox only when
  *  the bundled Mailcow provisioner is live, else null (caller keeps the
  *  stub). */
-export function createLiveMailboxServiceProvisioner():
-  | Pick<ServiceProvisioner, "createMailbox">
-  | null {
+export function createLiveMailboxServiceProvisioner(): MailboxService | null {
   if (!mailboxProvisioner.live) return null;
   return createMailboxServiceProvisioner(mailboxProvisioner);
 }
