@@ -809,14 +809,17 @@ function maskMailbox(m: Mailbox | null): Mailbox | null {
  *  on subsequent reads, the same one-time-reveal contract API keys use. */
 function maskAccount(a: Account | null): Account | null {
   if (!a) return null;
-  if (!a.anthropicApiKey) return a;
-  // The stored key may be an `enc.v1.` envelope (encrypted at rest) —
-  // never slice a prefix off ciphertext. Per-account keys are always
-  // Anthropic keys, so an encrypted value masks to the standard prefix.
-  const prefix = isEncryptedSecret(a.anthropicApiKey)
-    ? "sk-ant-api"
-    : a.anthropicApiKey.slice(0, 10);
-  return { ...a, anthropicApiKey: `${prefix}••••••••` };
+  let out = { ...a };
+  if (a.anthropicApiKey) {
+    const prefix = isEncryptedSecret(a.anthropicApiKey)
+      ? "sk-ant-api"
+      : a.anthropicApiKey.slice(0, 10);
+    out = { ...out, anthropicApiKey: `${prefix}••••••••` };
+  }
+  if (a.claudeSubscriptionToken) {
+    out = { ...out, claudeSubscriptionToken: "oauth••••••••" };
+  }
+  return out;
 }
 
 function maskNumber(n: PhoneNumber | null): PhoneNumber | null {
@@ -5199,6 +5202,62 @@ export class ControlPlane {
       `tenant now uses the platform-default AI analyser`,
     );
     return maskAccount(updated) as Account;
+  }
+
+  /* ----- Per-account claude.ai subscription token (§BYO-subscription) ----- */
+
+  /** Store / rotate the per-tenant claude.ai subscription OAuth token.
+   *  When set, fleet builds for this account run on the tenant's subscription
+   *  quota — AI build spend comes off the tenant's claude.ai bill, not Cantila's.
+   *  Returns the masked account (raw token is never echoed). */
+  async setClaudeSubscriptionToken(
+    accountId: string,
+    rawToken: string,
+  ): Promise<Account | { error: string }> {
+    const account = await this.deps.store.getAccount(accountId);
+    if (!account) return { error: "account not found" };
+    const updated = await this.deps.store.updateAccount(accountId, {
+      claudeSubscriptionToken: encryptSecret(rawToken),
+    });
+    await this.recordEvent(
+      accountId,
+      "system",
+      `claude.ai subscription token connected`,
+      `fleet builds for this account now run on the tenant's subscription`,
+    );
+    return maskAccount(updated) as Account;
+  }
+
+  /** Remove the per-account claude.ai subscription token — fleet reverts to
+   *  the platform-level Anthropic credentials. */
+  async clearClaudeSubscriptionToken(
+    accountId: string,
+  ): Promise<Account | { error: string }> {
+    const account = await this.deps.store.getAccount(accountId);
+    if (!account) return { error: "account not found" };
+    const updated = await this.deps.store.updateAccount(accountId, {
+      claudeSubscriptionToken: undefined,
+    });
+    await this.recordEvent(
+      accountId,
+      "system",
+      `claude.ai subscription token disconnected`,
+      `fleet builds now use the platform-default Anthropic credentials`,
+    );
+    return maskAccount(updated) as Account;
+  }
+
+  /** Resolve the plaintext claude.ai subscription token for a fleet run.
+   *  Returns undefined when the account has no token or decryption fails
+   *  (callers fall back to platform credentials). */
+  async resolveFleetToken(accountId: string): Promise<string | undefined> {
+    const account = await this.deps.store.getAccount(accountId);
+    if (!account?.claudeSubscriptionToken) return undefined;
+    try {
+      return decryptSecret(account.claudeSubscriptionToken);
+    } catch {
+      return undefined;
+    }
   }
 
   /* ============================================================

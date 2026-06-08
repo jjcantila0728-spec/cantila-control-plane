@@ -227,9 +227,17 @@ export class ProjectOrchestrator {
     onEvent: OrchestratorEventHandler;
     /** Conversation the build's streamed rows attach to (default "Main"). */
     conversationId?: string;
+    /** Account that owns this project — used to resolve a per-tenant
+     *  claude.ai subscription token for the fleet run. When set and the
+     *  account has a token stored, that token is used instead of the
+     *  platform-level credentials (§BYO-subscription). */
+    accountId?: string;
   }): Promise<void> {
-    const { projectId, plan, onEvent, conversationId } = input;
-    const res = await this.claudeFleet.build({ projectId, plan, onEvent: (e) => this.persistAndForward(projectId, e, onEvent, conversationId) });
+    const { projectId, plan, onEvent, conversationId, accountId } = input;
+    const tenantToken = accountId
+      ? await this.resolveTenantToken(accountId)
+      : undefined;
+    const res = await this.claudeFleet.build({ projectId, plan, tenantToken, onEvent: (e) => this.persistAndForward(projectId, e, onEvent, conversationId) });
     if (!res?.buildOk || !fleetConfig().autodeploy) return;
     const project = await this.deps.cp.getProject(projectId);
     if (!project || project.accountId !== ownerAccountId()) return; // owner-account only in v1
@@ -255,12 +263,29 @@ export class ProjectOrchestrator {
     message: string;
     onEvent: OrchestratorEventHandler;
     conversationId?: string;
+    /** Account that owns this project — resolves per-tenant subscription
+     *  token for the fleet run (§BYO-subscription). */
+    accountId?: string;
   }): Promise<void> {
+    const tenantToken = input.accountId
+      ? await this.resolveTenantToken(input.accountId)
+      : undefined;
     this.appendMessage(input.projectId, { role: "user", kind: "message", content: input.message }, input.onEvent, input.conversationId);
-    await this.claudeFleet.chat({ projectId: input.projectId, message: input.message, onEvent: (e) => this.persistAndForward(input.projectId, e, input.onEvent, input.conversationId) });
+    await this.claudeFleet.chat({ projectId: input.projectId, message: input.message, tenantToken, onEvent: (e) => this.persistAndForward(input.projectId, e, input.onEvent, input.conversationId) });
   }
 
   /* ----- internals ----- */
+
+  /** Resolve the per-tenant claude.ai subscription token for a fleet run.
+   *  Returns the plaintext token when the account has one stored, or
+   *  undefined to fall back to platform-level credentials. */
+  private async resolveTenantToken(accountId: string): Promise<string | undefined> {
+    try {
+      return await this.deps.cp.resolveFleetToken(accountId);
+    } catch {
+      return undefined;
+    }
+  }
 
   /** Mirror streamed fleet events into the existing in-memory state, then
    *  forward. Also persists each row into the conversation-scoped store so

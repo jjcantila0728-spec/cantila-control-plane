@@ -119,6 +119,12 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "ProjectMessage [conversationId, createdAt] index — backs the scoped per-conversation history load.",
     sql: 'CREATE INDEX IF NOT EXISTS "ProjectMessage_conversationId_createdAt_idx" ON "ProjectMessage"("conversationId", "createdAt");',
   },
+  {
+    id: "20260608000000_add_account_claude_subscription_token",
+    description:
+      "Account.claudeSubscriptionToken — per-tenant claude.ai subscription OAuth token for the build fleet (§BYO-subscription). Nullable; absent rows fall back to the platform API key.",
+    sql: 'ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "claudeSubscriptionToken" TEXT;',
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.

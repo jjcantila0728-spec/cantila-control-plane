@@ -1336,6 +1336,7 @@ app.post("/v1/projects/:id/build", async (request, reply) => {
     plan,
     onEvent: (e) => send(e.kind, e),
     conversationId: body.conversationId,
+    accountId: resolveAccountId(request),
   });
   res.end();
 });
@@ -1373,6 +1374,7 @@ app.post("/v1/projects/:id/chat", async (request, reply) => {
     message: body.message,
     onEvent: (e) => send(e.kind, e),
     conversationId: body.conversationId,
+    accountId: resolveAccountId(request),
   });
   res.end();
 });
@@ -3750,6 +3752,35 @@ app.post("/v1/accounts/me/anthropic-key", async (request, reply) => {
 app.delete("/v1/accounts/me/anthropic-key", async (request, reply) => {
   const accountId = resolveAccountId(request);
   const result = await cp.clearAnthropicApiKey(accountId);
+  if (result && "error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+/* ----- Per-account claude.ai subscription token (§BYO-subscription) ----- */
+
+const setClaudeSubscriptionSchema = z.object({
+  token: z.string().min(20),
+});
+
+/** Connect / rotate the per-tenant claude.ai subscription token.
+ *  When set, the build fleet for this account runs on the tenant's
+ *  own subscription — AI build spend comes off the tenant's claude.ai
+ *  bill, not Cantila's. The token is stored encrypted at rest. */
+app.post("/v1/accounts/me/claude-subscription", async (request, reply) => {
+  const accountId = resolveAccountId(request);
+  const parsed = setClaudeSubscriptionSchema.safeParse(request.body ?? {});
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.message });
+  }
+  const result = await cp.setClaudeSubscriptionToken(accountId, parsed.data.token);
+  if (result && "error" in result) return reply.code(404).send(result);
+  return reply.code(200).send(result);
+});
+
+/** Disconnect the claude.ai subscription — fleet reverts to platform credentials. */
+app.delete("/v1/accounts/me/claude-subscription", async (request, reply) => {
+  const accountId = resolveAccountId(request);
+  const result = await cp.clearClaudeSubscriptionToken(accountId);
   if (result && "error" in result) return reply.code(404).send(result);
   return reply.code(200).send(result);
 });

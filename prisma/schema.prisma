@@ -209,6 +209,9 @@ model Account {
   /// before writing. Never echoed in standard API responses — masked at
   /// the ControlPlane boundary.
   anthropicApiKey      String?
+  /// claude.ai subscription OAuth token for the build fleet (§BYO-subscription).
+  /// Stored encrypted-at-rest (same envelope as anthropicApiKey). Masked on reads.
+  claudeSubscriptionToken String?
   /// Billing health driven by the dunning state machine (plan §8 /
   /// §15.2). Defaults to `active` so existing rows backfill cleanly when
   /// this migration runs — no account is ever silently put in dunning.

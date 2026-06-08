@@ -54,6 +54,25 @@ function resolveAuthSource(): FleetAuthSource {
   return "none";
 }
 
+/** Build the subprocess env for a fleet run, optionally injecting a
+ *  per-tenant claude.ai subscription token. When a tenant token is
+ *  provided it replaces platform-level Anthropic credentials so the
+ *  SDK subprocess uses the TENANT's subscription quota, not Cantila's.
+ *
+ *  The SDK's `options.env` REPLACES the subprocess env entirely, so
+ *  we spread process.env first to preserve PATH, HOME, etc. */
+export function resolveFleetEnv(
+  tenantToken?: string,
+): NodeJS.ProcessEnv {
+  if (!tenantToken) return process.env;
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  // Strip platform credentials so the SDK doesn't pick them up.
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  env.CLAUDE_CODE_OAUTH_TOKEN = tenantToken;
+  return env;
+}
+
 export function fleetConfig(): FleetConfig {
   const authSource = resolveAuthSource();
   return {

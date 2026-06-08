@@ -117,6 +117,11 @@ export interface Account {
    *  Cantila's. Masked on standard reads; the raw value is never echoed
    *  after the initial `set` call. */
   anthropicApiKey?: string;
+  /** claude.ai subscription OAuth token for the build fleet (§BYO-subscription).
+   *  When set, the fleet runs on THIS tenant's subscription quota instead of
+   *  the platform's API key — AI build spend is off Cantila's bill.
+   *  Stored encrypted via secrets.ts; masked on standard reads. */
+  claudeSubscriptionToken?: string;
   /** Billing health — driven entirely by the dunning state machine on
    *  Stripe `invoice.*` webhooks and the dunning sweep. `undefined` on
    *  legacy rows; read as `active`. */

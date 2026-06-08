@@ -6,7 +6,7 @@ import { workspaceDir } from "./workspace";
 import { agentDefinitions } from "./roster/agent-defs";
 import { mapSdkMessage, type MapCtx } from "./event-map";
 import { FleetSessionRegistry } from "./session-registry";
-import { fleetConfig } from "./config";
+import { fleetConfig, resolveFleetEnv } from "./config";
 import { ALLOWED_TOOLS, DISALLOWED_BASH } from "./tool-policy";
 import { getBudgetGovernor, type BudgetGovernor } from "./budget";
 
@@ -21,7 +21,7 @@ export class ClaudeFleet {
   private inFlight = 0;
   constructor(private deps: ClaudeFleetDeps) {}
 
-  async build(input: { projectId: string; plan: DeployPlan; onEvent: OrchestratorEventHandler }): Promise<{ buildOk: boolean }> {
+  async build(input: { projectId: string; plan: DeployPlan; onEvent: OrchestratorEventHandler; tenantToken?: string }): Promise<{ buildOk: boolean }> {
     const prompt =
       `You are 00-orchestrator, driver + approval gate of Cantila's build fleet. Build a shippable MVP for this request, ` +
       `delegating to specialist subagents (use the Agent tool). Write real files into the working directory — no mock data. ` +
@@ -30,16 +30,16 @@ export class ClaudeFleet {
       `When finished, output a final line EXACTLY one of: FLEET_BUILD_RESULT: ok (you built it AND an in-session build/typecheck passes) or FLEET_BUILD_RESULT: failed (otherwise).`;
     return this.run(input.projectId, prompt, input.onEvent, {
       name: input.plan.name, url: `${input.plan.name}.cantila.app`, stack: input.plan.stack,
-    });
+    }, input.tenantToken);
   }
 
-  async chat(input: { projectId: string; message: string; onEvent: OrchestratorEventHandler }): Promise<{ buildOk: boolean }> {
+  async chat(input: { projectId: string; message: string; onEvent: OrchestratorEventHandler; tenantToken?: string }): Promise<{ buildOk: boolean }> {
     return this.run(input.projectId, input.message, input.onEvent, {
       name: input.projectId, url: `${input.projectId}.cantila.app`, stack: "",
-    });
+    }, input.tenantToken);
   }
 
-  private async run(projectId: string, prompt: string, onEvent: OrchestratorEventHandler, result: { name: string; url: string; stack: string }): Promise<{ buildOk: boolean }> {
+  private async run(projectId: string, prompt: string, onEvent: OrchestratorEventHandler, result: { name: string; url: string; stack: string }, tenantToken?: string): Promise<{ buildOk: boolean }> {
     const cfg = fleetConfig();
     const governor = this.deps.governor ?? getBudgetGovernor();
     let doneSent = false;
@@ -77,6 +77,7 @@ export class ClaudeFleet {
         prompt,
         options: {
           cwd,
+          env: resolveFleetEnv(tenantToken),
           agents: agentDefinitions(cfg.subagentModel || undefined),
           allowedTools: ALLOWED_TOOLS,
           disallowedTools: DISALLOWED_BASH,

@@ -405,6 +405,8 @@ export class PrismaStore implements Store {
       data.stripeSubscriptionId = patch.stripeSubscriptionId;
     if (patch.anthropicApiKey !== undefined)
       data.anthropicApiKey = patch.anthropicApiKey;
+    if (patch.claudeSubscriptionToken !== undefined)
+      data.claudeSubscriptionToken = patch.claudeSubscriptionToken;
     if (patch.billingStatus !== undefined)
       data.billingStatus = patch.billingStatus;
     if (patch.dunningAttempts !== undefined)
@@ -2542,6 +2544,7 @@ function toAccount(r: DbAccount): Account {
     stripeCustomerId: r.stripeCustomerId ?? undefined,
     stripeSubscriptionId: r.stripeSubscriptionId ?? undefined,
     anthropicApiKey: r.anthropicApiKey ?? undefined,
+    claudeSubscriptionToken: r.claudeSubscriptionToken ?? undefined,
     billingStatus: r.billingStatus,
     dunningAttempts: r.dunningAttempts,
     dunningFailedAt: r.dunningFailedAt?.toISOString(),
