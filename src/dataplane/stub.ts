@@ -7,10 +7,9 @@
    ============================================================ */
 
 import type { Project, ProjectMetricSample, Runtime } from "../domain/types";
-import type { ServiceProvisioner } from "../deploy/provisioning";
+import type { ServiceProvisioner, WorkspaceProvisioner } from "../deploy/provisioning";
 import type { DataPlane, DeploySource } from "../deploy/pipeline";
 import { id, secret } from "../lib/ids";
-import { defaultProjectMailbox } from "../mail/default-mailbox";
 
 export const stubProvisioner: ServiceProvisioner = {
   async createDatabase(project: Project) {
@@ -20,12 +19,16 @@ export const stubProvisioner: ServiceProvisioner = {
       connectionUri: `postgres://app:${secret().slice(0, 24)}@db-${project.slug}.int.cantila.cloud:5432/${project.slug}`,
     };
   },
+};
 
-  async createMailbox(project: Project) {
-    // Canonical default: info@<slug>.cantila.app (plan §4.4 / §7.4).
+/** Simulated workspace provisioner for n8n / OpenClaw automation projects.
+ *  Returns plausible values without standing up real containers. */
+export const stubWorkspaceProvisioner: WorkspaceProvisioner = {
+  async createWorkspace(project: Project, kind) {
     return {
-      ...defaultProjectMailbox(project.slug),
-      smtpPassword: secret().slice(0, 32),
+      workspaceUrl: `https://${kind}-${project.slug}.cantila.app`,
+      adminUser: "admin",
+      adminPassword: secret().slice(0, 24),
     };
   },
 };

@@ -243,6 +243,11 @@ export interface Store {
   createDomain(d: Domain): Promise<Domain>;
   findDomainByHostname(hostname: string): Promise<Domain | null>;
   updateDomain(id: string, patch: Partial<Domain>): Promise<Domain>;
+  /** Custom hostnames (kind === "custom") whose TLS cert isn't confirmed
+   *  live yet (sslActive === false), across every project. Drives the
+   *  domain verify sweep (plan §22.6 — BYO domain). Subdomains are
+   *  wildcard-covered and never pending, so they're excluded. */
+  listPendingCustomDomains(): Promise<Domain[]>;
 
   createApiKey(k: ApiKey): Promise<ApiKey>;
   listApiKeys(accountId: string): Promise<ApiKey[]>;
@@ -1031,6 +1036,12 @@ export class InMemoryStore implements Store {
     const updated = { ...existing, ...patch };
     this.domains.set(id, updated);
     return updated;
+  }
+
+  async listPendingCustomDomains(): Promise<Domain[]> {
+    return [...this.domains.values()].filter(
+      (d) => d.kind === "custom" && !d.sslActive,
+    );
   }
 
   private apiKeys = new Map<string, ApiKey>();

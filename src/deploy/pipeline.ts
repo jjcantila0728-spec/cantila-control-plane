@@ -1,6 +1,8 @@
 /* ============================================================
    The deploy pipeline — eight steps (plan §7.3).
-   Step 3 auto-wires the project's database, email and SMS.
+   Step 3 auto-wires the project's database (and workflow workspace
+   for automation projects). Email, SMS, and payment are NOT
+   auto-wired — tenants configure those from the Cantila console.
    ============================================================ */
 
 import type { Store } from "../domain/store";
@@ -15,6 +17,7 @@ import {
   provisionProjectServices,
   type ProvisionResult,
   type ServiceProvisioner,
+  type WorkspaceProvisioner,
 } from "./provisioning";
 import { id, now } from "../lib/ids";
 
@@ -53,6 +56,15 @@ export interface DataPlane {
    *  treat a failure as non-fatal so a stale Coolify app never blocks
    *  removing the Cantila project. */
   destroyApp?(project: Project): Promise<void>;
+  /** Wire a custom hostname onto the project's running app so the data
+   *  plane starts routing it and issues a TLS cert for it (plan §22.6 —
+   *  bring-your-own-domain). Optional — the stub omits it (nothing real
+   *  to route); the Coolify data plane appends the host to the
+   *  Application's domain list and redeploys so its bundled Traefik
+   *  learns the new router and requests a Let's Encrypt cert via HTTP-01.
+   *  Best-effort by contract: a failure here leaves the Domain row in its
+   *  `sslActive: false` state and the verify sweep retries / reports. */
+  attachDomain?(project: Project, hostname: string): Promise<void>;
 }
 
 /** Emitted once for each pipeline step as it completes. The HTTP SSE
@@ -101,6 +113,10 @@ export interface PipelineDeps {
   store: Store;
   provisioner: ServiceProvisioner;
   dataPlane: DataPlane;
+  /** Optional — required only for automation projects (n8n / OpenClaw).
+   *  When present and the project has an automationKind, the pipeline
+   *  provisions a dedicated workflow workspace on first deploy. */
+  workspaceProvisioner?: WorkspaceProvisioner;
 }
 
 /** Flatten env vars into a map for the container. Production deploys
@@ -199,11 +215,12 @@ export async function runDeploy(
   const runtime = await dataPlane.detectStack(input.source);
   await emit(`stack-detected:${runtime}`);
 
-  // 3 — provision project services (the auto-wiring)
+  // 3 — provision project services (database + automation workspace)
   const provisioned = await provisionProjectServices(
     store,
     provisioner,
     project,
+    deps.workspaceProvisioner,
   );
   await emit(`services-provisioned:${provisioned.injectedEnv.length}-env-injected`);
 

@@ -329,6 +329,50 @@ export class CoolifyDataPlane implements DataPlane {
     this.appUuids.delete(project.id);
   }
 
+  /** Attach a custom hostname to the tenant's Coolify Application so its
+   *  bundled Traefik routes the host and requests a Let's Encrypt cert
+   *  (plan §22.6). Reads the app's current `fqdn`, appends the new host
+   *  (idempotent — a host already present is a no-op merge), PATCHes the
+   *  domain list, then redeploys so Traefik regenerates its routers with
+   *  the new SNI and triggers the HTTP-01 challenge. The cert only issues
+   *  once the customer's DNS (CNAME → `<slug>.cantila.app`) resolves to
+   *  this server; the verify sweep flips `Domain.sslActive` when that
+   *  round-trip succeeds. */
+  async attachDomain(project: Project, hostname: string): Promise<void> {
+    const host = hostname.trim().toLowerCase();
+    const region = this.regionFor(project);
+    const uuid = await this.findAppUuid(project);
+    if (!uuid) {
+      throw new Error(
+        `attachDomain: no Coolify app provisioned for project ${project.id}`,
+      );
+    }
+    // Read the current domain list so we don't clobber the free
+    // *.cantila.app fqdn (or any previously-attached custom host).
+    const app = await this.request<CoolifyApp>(
+      "GET",
+      `/applications/${encodeURIComponent(uuid)}`,
+      undefined,
+      region,
+    );
+    const domains = mergeFqdn(app.fqdn, `https://${host}`);
+    await this.request(
+      "PATCH",
+      `/applications/${encodeURIComponent(uuid)}`,
+      { domains },
+      region,
+    );
+    // Redeploy so Coolify regenerates the Traefik labels — the new
+    // router (and its on-demand ACME cert request) only exists after the
+    // proxy config is rewritten with the updated domain set.
+    await this.request(
+      "POST",
+      `/deploy?uuid=${encodeURIComponent(uuid)}`,
+      undefined,
+      region,
+    );
+  }
+
   async route(project: Project): Promise<{ url: string }> {
     // Match the Cantila URL convention (plan §4.2 / §7.4) — the same shape
     // the Console and CLI assume everywhere. The user must wire
@@ -798,6 +842,18 @@ const MIGRATE_PREDEPLOY_COMMAND =
   "sh -c 'if [ -f prisma/schema.prisma ]; then " +
   "if [ -d prisma/migrations ]; then npx --yes prisma migrate deploy; " +
   "else npx --yes prisma db push --accept-data-loss --skip-generate; fi; fi'";
+
+/** Merge a hostname URL into a Coolify comma-separated `fqdn` list,
+ *  trimming trailing slashes and de-duplicating so attach is idempotent.
+ *  Coolify stores domains as `https://a.com,https://b.com`. */
+function mergeFqdn(existing: string | undefined, add: string): string {
+  const norm = (s: string) => s.trim().replace(/\/+$/, "");
+  const set = new Set(
+    (existing ?? "").split(",").map(norm).filter(Boolean),
+  );
+  set.add(norm(add));
+  return [...set].join(",");
+}
 
 function appNameFor(project: Project): string {
   // Deterministic + reversible: lets us look the app back up from the
