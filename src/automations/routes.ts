@@ -17,9 +17,11 @@ import { z } from "zod";
 import type { ControlPlane } from "../core/control-plane";
 import type { Store } from "../domain/store";
 import type { AutomationKind, Project } from "../domain/types";
-import type { WorkflowGraph } from "./engine";
-import { parseN8nWorkflowExport } from "./engines/n8n";
+import type { WorkflowGraph, AutomationEngineAdapter } from "./engine";
+import { parseN8nWorkflowExport, N8nEngineAdapter } from "./engines/n8n";
+import { OpenClawEngineAdapter } from "./engines/openclaw";
 import type { DefaultEngineRegistry } from "./registry";
+import type { WorkspaceProvisioner } from "../deploy/provisioning";
 
 const automationKindSchema = z.enum(["n8n", "openclaw"]);
 
@@ -58,6 +60,9 @@ interface RouteDeps {
   store: Store;
   registry: DefaultEngineRegistry;
   resolveAccountId: (req: FastifyRequest) => string;
+  /** When present, new automation instances are provisioned eagerly
+   *  (a real container is created) instead of waiting for a deploy. */
+  workspaceProvisioner?: WorkspaceProvisioner;
 }
 
 /** Spawn a background "capture" task that re-iterates the adapter's
@@ -116,10 +121,17 @@ interface AutomationSummary {
   alwaysOn: boolean;
   createdAt: string;
   adminUrl: string;
+  /** The workspace's native UI URL — set once the container is
+   *  provisioned. Absent until provisioning completes. */
+  workspaceUrl?: string;
+  /** Admin username for the native workspace UI. */
+  workspaceAdminUser?: string;
 }
 
 function toSummary(p: Project): AutomationSummary | null {
   if (!p.automationKind) return null;
+  const cfg = p.automationConfig as Record<string, unknown> | undefined;
+  const workspaceUrl = cfg?.workspaceUrl as string | undefined;
   return {
     id: p.id,
     kind: p.automationKind,
@@ -129,15 +141,40 @@ function toSummary(p: Project): AutomationSummary | null {
     region: p.region,
     alwaysOn: p.alwaysOn,
     createdAt: p.createdAt,
-    adminUrl: `https://${p.slug}.cantila.app`,
+    // adminUrl uses the real workspace URL when provisioned; falls back
+    // to the project subdomain for legacy rows without automationConfig.
+    adminUrl: workspaceUrl ?? `https://${p.slug}.cantila.app`,
+    workspaceUrl,
+    workspaceAdminUser: cfg?.workspaceAdminUser as string | undefined,
   };
+}
+
+/** Build a per-project adapter using the workspace URL + API key stored
+ *  in `automationConfig`. Falls back to the global registry adapter
+ *  (which may be a stub) when no workspace has been provisioned yet. */
+function adapterForProject(
+  project: Project,
+  registry: DefaultEngineRegistry,
+): AutomationEngineAdapter {
+  const cfg = project.automationConfig as Record<string, unknown> | undefined;
+  const workspaceUrl = cfg?.workspaceUrl as string | undefined;
+  const apiKey = cfg?.workspaceApiKey as string | undefined;
+  if (workspaceUrl && apiKey && project.automationKind) {
+    if (project.automationKind === "n8n") {
+      return new N8nEngineAdapter({ baseUrl: workspaceUrl, apiKey });
+    }
+    if (project.automationKind === "openclaw") {
+      return new OpenClawEngineAdapter({ baseUrl: workspaceUrl, apiKey });
+    }
+  }
+  return registry.get(project.automationKind!);
 }
 
 export function registerAutomationRoutes(
   app: FastifyInstance,
   deps: RouteDeps,
 ): void {
-  const { cp, store, registry, resolveAccountId } = deps;
+  const { cp, store, registry, resolveAccountId, workspaceProvisioner } = deps;
 
   /* ----- info — which engine adapter is wired per kind ----- */
 
@@ -176,13 +213,34 @@ export function registerAutomationRoutes(
       runtime: "docker",
       region: parsed.data.region ?? "fsn1",
     });
-    // Tag the project as an automation instance. The deploy pipeline
-    // reads `automationKind` to drop the right engine container in;
-    // Phase A stops before that step and the stub adapter handles all
-    // workflow / run calls against the row.
+    // Tag the project as an automation instance, then eagerly provision
+    // its workspace (real container) if a provisioner is wired. The
+    // workspace URL + credentials land in automationConfig so the
+    // per-instance adapter and the Console iframe can use them
+    // immediately — no deploy step required.
+    let automationConfig: Record<string, unknown> = {};
+    if (workspaceProvisioner) {
+      try {
+        const ws = await workspaceProvisioner.createWorkspace(
+          project,
+          parsed.data.kind,
+        );
+        automationConfig = {
+          workspaceUrl: ws.workspaceUrl,
+          workspaceAdminUser: ws.adminUser,
+          // The API key (= CANTILA_API_KEY injected into the container)
+          // drives the per-instance engine adapter; not exposed to the
+          // client summary.
+          workspaceApiKey: ws.adminPassword,
+        };
+      } catch {
+        // Provisioning failed (e.g. no Coolify creds in dev). Fall
+        // through with empty config — the stub adapter handles it.
+      }
+    }
     const tagged = await store.updateProject(project.id, {
       automationKind: parsed.data.kind,
-      automationConfig: {},
+      automationConfig,
     });
     return reply.code(201).send({ automation: toSummary(tagged) });
   });
@@ -225,7 +283,7 @@ export function registerAutomationRoutes(
     if (project.accountId !== resolveAccountId(request)) {
       return reply.code(404).send({ error: "automation not found" });
     }
-    const adapter = registry.get(project.automationKind);
+    const adapter = adapterForProject(project, registry);
     return { nodeTypes: await adapter.listNodeTypes() };
   });
 
@@ -240,7 +298,7 @@ export function registerAutomationRoutes(
     if (project.accountId !== resolveAccountId(request)) {
       return reply.code(404).send({ error: "automation not found" });
     }
-    const adapter = registry.get(project.automationKind);
+    const adapter = adapterForProject(project, registry);
     return { workflows: await adapter.listWorkflows(id) };
   });
 
@@ -257,7 +315,7 @@ export function registerAutomationRoutes(
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.flatten() });
     }
-    const adapter = registry.get(project.automationKind);
+    const adapter = adapterForProject(project, registry);
     const saved = await adapter.saveWorkflow(id, {
       id: parsed.data.id ?? "",
       name: parsed.data.name,
@@ -300,7 +358,7 @@ export function registerAutomationRoutes(
       });
     }
     if (parsed.data.name) graph = { ...graph, name: parsed.data.name };
-    const adapter = registry.get(project.automationKind);
+    const adapter = adapterForProject(project, registry);
     const saved = await adapter.saveWorkflow(id, graph);
     return reply.code(201).send({ workflow: saved });
   });
@@ -319,7 +377,7 @@ export function registerAutomationRoutes(
       if (project.accountId !== resolveAccountId(request)) {
         return reply.code(404).send({ error: "automation not found" });
       }
-      const adapter = registry.get(project.automationKind);
+      const adapter = adapterForProject(project, registry);
       try {
         const wf = await adapter.loadWorkflow(id, workflowId);
         return { workflow: wf };
@@ -347,7 +405,7 @@ export function registerAutomationRoutes(
       if (!parsed.success) {
         return reply.code(400).send({ error: parsed.error.flatten() });
       }
-      const adapter = registry.get(project.automationKind);
+      const adapter = adapterForProject(project, registry);
       try {
         const result = await adapter.runWorkflow(
           id,
@@ -463,7 +521,7 @@ export function registerAutomationRoutes(
       if (!source || source.automationId !== id) {
         return reply.code(404).send({ error: "execution not found" });
       }
-      const adapter = registry.get(project.automationKind);
+      const adapter = adapterForProject(project, registry);
       try {
         const result = await adapter.runWorkflow(id, source.workflowId);
         await cp.recordWorkflowExecution({
@@ -569,7 +627,7 @@ export function registerAutomationRoutes(
       if (project.accountId !== resolveAccountId(request)) {
         return reply.code(404).send({ error: "automation not found" });
       }
-      const adapter = registry.get(project.automationKind);
+      const adapter = adapterForProject(project, registry);
       const exec = await adapter.getExecution(id, executionId);
       if (!exec) return reply.code(404).send({ error: "execution not found" });
       return { execution: exec };
@@ -592,7 +650,7 @@ export function registerAutomationRoutes(
       if (project.accountId !== resolveAccountId(request)) {
         return reply.code(404).send({ error: "automation not found" });
       }
-      const adapter = registry.get(project.automationKind);
+      const adapter = adapterForProject(project, registry);
       reply.raw.writeHead(200, {
         "content-type": "text/event-stream",
         "cache-control": "no-cache",

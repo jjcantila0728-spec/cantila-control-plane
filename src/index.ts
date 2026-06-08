@@ -30,6 +30,7 @@ import { buildImageProvider } from "./skills/image-provider";
 import { ProjectOrchestrator } from "./agents/project-orchestrator";
 import { buildDefaultRegistry } from "./automations/registry";
 import { registerAutomationRoutes } from "./automations/routes";
+import { selectWorkspaceProvisioner } from "./dataplane/coolify-workspace-provisioner";
 import { registerConnectionRoutes } from "./connections/routes";
 import {
   registerCantilapayRoutes,
@@ -2867,6 +2868,7 @@ registerAutomationRoutes(app, {
   store,
   registry: engineRegistry,
   resolveAccountId,
+  workspaceProvisioner: selectWorkspaceProvisioner().provisioner,
 });
 
 registerConnectionRoutes(app, {
