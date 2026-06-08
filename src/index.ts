@@ -56,6 +56,7 @@ import {
 } from "./auth/oauth";
 import { OAuthProvider } from "./auth/oauth-provider";
 import { installPs1, installSh } from "./install/script";
+import { fleetConfig } from "./fleet/config";
 
 // 10 auth attempts per IP per minute, shared across login/register/sso.
 const authRateLimit = createRateLimiter({ windowMs: 60_000, max: 10 });
@@ -96,6 +97,7 @@ const store = createStore();
 const dataPlaneSelection = selectDataPlane(process.env, { store });
 const dataPlane = dataPlaneSelection.dataPlane;
 console.log(`[dataplane] ${dataPlaneSelection.label} (${dataPlaneSelection.live ? "live" : "stub"})`);
+{ const fc = fleetConfig(); console.log(`[fleet] auth: ${fc.authSource === "subscription" ? "claude.ai subscription (all agents)" : fc.authSource === "api-key" ? "Anthropic API key" : "none — set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY"}`); }
 
 // Service provisioner (plan §4.2 — auto-wired DB/mail). Goes live with a
 // real Coolify Postgres provisioner when the Coolify creds + server/project

@@ -73,3 +73,26 @@ test("autodeploy ON + buildOk + NON-owner account: bridge NOT invoked", async ()
   assert.equal(bridgeCalls, 0);
   if (prev === undefined) delete process.env.FLEET_AUTODEPLOY; else process.env.FLEET_AUTODEPLOY = prev;
 });
+
+test("sandbox FAIL blocks deploy even when buildOk + autodeploy + owner", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "po-"));
+  const prev = process.env.FLEET_AUTODEPLOY; process.env.FLEET_AUTODEPLOY = "on";
+  const { ownerAccountId } = await import("../lib/owner-account");
+  let bridgeCalls = 0;
+  const orch = new ProjectOrchestrator({ cp: { getProject: async () => ({ id: "p1", accountId: ownerAccountId() }) } as any, planner: planner as any, images: images as any, fleet: { query: fakeQueryOk() as any, workspaceRoot: root }, deployBridge: { publish: async () => { bridgeCalls++; return { deployed: true, detail: "x" }; } }, sandbox: { run: async () => ({ passed: false, detail: "did not boot", logs: "", durationMs: 1 }) } } as any);
+  const events: OrchestratorEvent[] = [];
+  await orch.runBuild({ projectId: "p1", plan: await planner.plan() as any, onEvent: (e) => events.push(e) });
+  assert.equal(bridgeCalls, 0, "broken build must not deploy");
+  if (prev === undefined) delete process.env.FLEET_AUTODEPLOY; else process.env.FLEET_AUTODEPLOY = prev;
+});
+
+test("sandbox PASS allows deploy (buildOk + autodeploy + owner)", async () => {
+  const root = mkdtempSync(path.join(tmpdir(), "po-"));
+  const prev = process.env.FLEET_AUTODEPLOY; process.env.FLEET_AUTODEPLOY = "on";
+  const { ownerAccountId } = await import("../lib/owner-account");
+  let bridgeCalls = 0;
+  const orch = new ProjectOrchestrator({ cp: { getProject: async () => ({ id: "p1", accountId: ownerAccountId() }) } as any, planner: planner as any, images: images as any, fleet: { query: fakeQueryOk() as any, workspaceRoot: root }, deployBridge: { publish: async () => { bridgeCalls++; return { deployed: true, detail: "x", liveUrl: "https://x.cantila.app" }; } }, sandbox: { run: async () => ({ passed: true, detail: "booted; HTTP 200", logs: "", durationMs: 1 }) } } as any);
+  await orch.runBuild({ projectId: "p1", plan: await planner.plan() as any, onEvent: () => {} });
+  assert.equal(bridgeCalls, 1);
+  if (prev === undefined) delete process.env.FLEET_AUTODEPLOY; else process.env.FLEET_AUTODEPLOY = prev;
+});

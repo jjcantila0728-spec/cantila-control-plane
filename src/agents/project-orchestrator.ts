@@ -31,6 +31,7 @@ import { ClaudeFleet } from "../fleet/claude-fleet";
 import { FleetSessionRegistry } from "../fleet/session-registry";
 import { loadQuery, type QueryFn } from "../fleet/sdk";
 import { DeployBridge } from "../fleet/deploy-bridge";
+import { getSandboxRunner, type SandboxRunner } from "../fleet/sandbox";
 import { fleetConfig } from "../fleet/config";
 import { workspaceDir } from "../fleet/workspace";
 import { ownerAccountId } from "../lib/owner-account";
@@ -114,6 +115,8 @@ export interface ProjectOrchestratorDeps {
   fleet?: { query?: QueryFn | null; workspaceRoot?: string; registry?: FleetSessionRegistry };
   /** Optional deploy bridge override — injected by tests, defaults to real DeployBridge. */
   deployBridge?: { publish(input: { projectId: string; workspaceDir: string; onEvent: OrchestratorEventHandler }): Promise<{ deployed: boolean; detail: string; liveUrl?: string }> };
+  /** Optional sandbox runner override — injected by tests, defaults to getSandboxRunner(). */
+  sandbox?: SandboxRunner;
 }
 
 interface ProjectState {
@@ -126,6 +129,7 @@ export class ProjectOrchestrator {
   private state: Map<string, ProjectState> = new Map();
   private claudeFleet: ClaudeFleet;
   private deployBridge: { publish(input: { projectId: string; workspaceDir: string; onEvent: OrchestratorEventHandler }): Promise<{ deployed: boolean; detail: string; liveUrl?: string }> };
+  private sandbox: SandboxRunner;
   readonly sessionRegistry: FleetSessionRegistry;
 
   constructor(private deps: ProjectOrchestratorDeps) {
@@ -140,6 +144,7 @@ export class ProjectOrchestrator {
         deploy: (id: string, opts: any) => this.deps.cp.deploy(id, opts),
       },
     });
+    this.sandbox = this.deps.sandbox ?? getSandboxRunner();
   }
 
   /* ----- state accessors (the HTTP layer reads these) ----- */
@@ -229,7 +234,16 @@ export class ProjectOrchestrator {
     const project = await this.deps.cp.getProject(projectId);
     if (!project || project.accountId !== ownerAccountId()) return; // owner-account only in v1
     const root = this.deps.fleet?.workspaceRoot ?? process.env.FLEET_WORKSPACE_ROOT ?? "runtime/projects";
-    await this.deployBridge.publish({ projectId, workspaceDir: workspaceDir(root, projectId), onEvent: (e) => this.persistAndForward(projectId, e, onEvent, conversationId) });
+    const ws = workspaceDir(root, projectId);
+
+    // Independent pre-deploy smoke test: boot the built product in a sandbox and
+    // gate publish on sandbox.passed. Noop by default (FLEET_SANDBOX=noop).
+    const sbKey = `sandbox:${projectId}`;
+    const sb = await this.sandbox.run({ workspaceDir: ws, stack: plan.stack, projectId, timeoutMs: fleetConfig().sandboxTimeoutMs });
+    this.persistAndForward(projectId, { kind: "op_finished", opKey: sbKey, agent: "sandbox", title: sb.passed ? `sandbox: ${sb.detail}` : `sandbox failed: ${sb.detail}`, status: sb.passed ? "ok" : "failed" }, onEvent, conversationId);
+    if (!sb.passed) return;
+
+    await this.deployBridge.publish({ projectId, workspaceDir: ws, onEvent: (e) => this.persistAndForward(projectId, e, onEvent, conversationId) });
   }
 
   /** Continue the conversation on an existing project. Persists the user
