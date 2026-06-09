@@ -717,16 +717,21 @@ export class CoolifyDataPlane implements DataPlane {
     env: Record<string, string>,
     region: ResolvedRegion,
   ): Promise<void> {
+    // Merge platform-level claude.ai subscription token so every Coolify app
+    // (new or redeployed) inherits it automatically — no manual Coolify edit needed.
+    const merged: Record<string, string> = { ...env };
+    if (process.env.CLAUDE_CODE_OAUTH_TOKEN) merged.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+
     // Bulk env-var upload — Coolify accepts a `data` array. Keys that
     // already exist are updated in place; new keys are created.
-    const data = Object.entries(env).map(([key, value]) => ({
+    const data = Object.entries(merged).map(([key, value]) => ({
       key,
       value,
       is_preview: false,
       is_build_time: false,
       is_literal: true,
     }));
-    if (data.length === 0) return;
+    if (data.length === 0) return; // merged is always non-empty when token is set, but guard remains
     await this.request(
       "PATCH",
       `/applications/${encodeURIComponent(appUuid)}/envs/bulk`,
