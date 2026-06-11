@@ -401,15 +401,24 @@ export class CoolifyDataPlane implements DataPlane {
   }
 
   async healthCheck(url: string): Promise<boolean> {
-    try {
-      const res = await fetch(url, {
-        method: "GET",
-        signal: AbortSignal.timeout(5_000),
-      });
-      return res.ok;
-    } catch {
-      return false;
+    // Retry with backoff: a container that just rolled can take seconds to
+    // accept connections (cold runtime boot, Traefik router refresh), and a
+    // single 5s probe was marking legitimately-healthy deploys "crashed".
+    // ~22s worst case across 4 attempts; first success returns immediately.
+    const waitsMs = [0, 2_000, 5_000, 10_000];
+    for (const wait of waitsMs) {
+      if (wait > 0) await new Promise<void>((r) => setTimeout(r, wait));
+      try {
+        const res = await fetch(url, {
+          method: "GET",
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (res.ok) return true;
+      } catch {
+        /* transient — retry */
+      }
     }
+    return false;
   }
 
   async sampleMetrics(project: Project): Promise<ProjectMetricSample[]> {

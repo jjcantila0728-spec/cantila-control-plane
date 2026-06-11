@@ -178,6 +178,30 @@ export async function runDeploy(
   }
 
   const isPreview = Boolean(input.previewBranch);
+
+  // Orphan sweep: a deployment stuck in "queued"/"building" means a prior
+  // pipeline run died mid-flight (process crash, data-plane hang). Left
+  // alone the row rots forever and the console shows an eternal spinner.
+  // Anything older than 30 minutes can't still be building — mark it
+  // failed with a note so this deploy starts from a clean slate.
+  const ORPHAN_MS = 30 * 60 * 1000;
+  try {
+    const prior = await store.listDeployments(project.id);
+    for (const d of prior) {
+      if (
+        (d.status === "queued" || d.status === "building") &&
+        Date.now() - new Date(d.createdAt).getTime() > ORPHAN_MS
+      ) {
+        await store.updateDeployment(d.id, {
+          status: "failed",
+          logs: [...d.logs, "orphaned:pipeline-died-mid-build (swept by next deploy)"],
+        });
+      }
+    }
+  } catch {
+    // Sweep is hygiene, never a reason to block a fresh deploy.
+  }
+
   const deployment = await store.createDeployment({
     id: id("dpl"),
     projectId: project.id,
