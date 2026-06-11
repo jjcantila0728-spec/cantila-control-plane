@@ -299,17 +299,37 @@ export class CoolifyDataPlane implements DataPlane {
     // schema-less DB and every query throws P2021 ("table does not exist").
     await this.ensureMigrateHook(uuid, region);
 
+    // Converge the Coolify build pack with the project's declared runtime.
+    // Without this, an app created before the project was switched to
+    // `runtime: docker` (or created by an older control plane that always
+    // chose nixpacks) keeps building with Nixpacks forever — which turns a
+    // Vite repo into a static Caddy site whose SPA fallback shadows /api/*.
+    await this.ensureBuildPack(uuid, project, region);
+
     // Push env vars (best-effort — Coolify returns 200 even for already-set keys).
     await this.syncEnv(uuid, env, region);
 
     // Trigger a fresh deploy. For an existing app this is a redeploy that
     // rebuilds the image from source and rolls the container.
-    await this.request(
+    const started = await this.request<CoolifyDeployStart>(
       "POST",
       `/deploy?uuid=${encodeURIComponent(uuid)}`,
       undefined,
       region,
     );
+
+    // Coolify's /deploy is asynchronous — it queues a build and returns
+    // immediately. Returning here made the pipeline's verify step probe
+    // whatever container was ALREADY serving (the previous build), so a
+    // failed build reported "verified"/live while the site silently kept
+    // running old code. Await the real outcome: poll the deployment until
+    // it finishes, fail loudly (with the build-log tail) when Coolify
+    // reports failure, and only fall through on poll timeout — where the
+    // old behaviour (health-check whatever is live) is the honest fallback.
+    const coolifyDeployUuid = deployUuidFrom(started);
+    if (coolifyDeployUuid) {
+      await this.awaitDeployment(coolifyDeployUuid, region);
+    }
   }
 
   async destroyApp(project: Project): Promise<void> {
@@ -546,7 +566,11 @@ export class CoolifyDataPlane implements DataPlane {
     }
 
     if (project.repoUrl) {
-      // Public git deploy via Nixpacks (GitHub etc.).
+      // Public git deploy (GitHub etc.). `runtime: docker` projects build
+      // their repo-root Dockerfile verbatim; everything else goes through
+      // Nixpacks. Nixpacks must never see a docker-runtime project — it
+      // ignores Dockerfiles and turns SPA repos into static Caddy sites
+      // whose fallback shadows the app's own /api/* routes.
       const body = {
         project_uuid: region.projectUuid,
         server_uuid: region.serverUuid,
@@ -554,7 +578,7 @@ export class CoolifyDataPlane implements DataPlane {
         name,
         git_repository: project.repoUrl,
         git_branch: project.branch ?? "main",
-        build_pack: "nixpacks",
+        ...buildPackFor(project),
         ports_exposes: "3000",
         domains: fqdn,
         instant_deploy: false,
@@ -643,7 +667,7 @@ export class CoolifyDataPlane implements DataPlane {
         private_key_uuid: key.uuid,
         git_repository: httpsUrl,
         git_branch: project.branch ?? "main",
-        build_pack: "nixpacks",
+        ...buildPackFor(project),
         ports_exposes: "3000",
         domains: fqdn,
         instant_deploy: false,
@@ -710,6 +734,84 @@ export class CoolifyDataPlane implements DataPlane {
         }`,
       );
     }
+  }
+
+  /** Make the Coolify app's build pack reflect `project.runtime`.
+   *  `runtime: docker` → Coolify's `dockerfile` build pack (builds the
+   *  repo-root Dockerfile exactly as written); anything else keeps
+   *  Nixpacks. Idempotent — PATCHed on every deploy so existing apps
+   *  converge after a runtime change. Best-effort like the migrate hook:
+   *  a bookkeeping failure must not abort an otherwise-valid deploy. */
+  private async ensureBuildPack(
+    appUuid: string,
+    project: Project,
+    region: ResolvedRegion,
+  ): Promise<void> {
+    if (project.runtime !== "docker") return;
+    try {
+      await this.request(
+        "PATCH",
+        `/applications/${encodeURIComponent(appUuid)}`,
+        { build_pack: "dockerfile", dockerfile_location: "/Dockerfile" },
+        region,
+      );
+    } catch (err) {
+      console.warn(
+        `[coolify] failed to set dockerfile build_pack on ${appUuid}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /** Poll a Coolify deployment until it reaches a terminal state.
+   *  Throws on `failed`/`cancelled` with the build-log tail so the
+   *  pipeline (and ultimately the operator) sees WHY the build broke
+   *  instead of a misleading "live" pointing at the previous container.
+   *  On poll timeout (Coolify still building) it returns silently — the
+   *  pipeline's verify step then reports against whatever is serving,
+   *  which is the pre-existing behaviour and the honest fallback while
+   *  the build finishes in the background. */
+  private async awaitDeployment(
+    deploymentUuid: string,
+    region: ResolvedRegion,
+    timeoutMs = 240_000,
+    pollMs = 5_000,
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      let dep: CoolifyDeployment;
+      try {
+        dep = await this.request<CoolifyDeployment>(
+          "GET",
+          `/deployments/${encodeURIComponent(deploymentUuid)}`,
+          undefined,
+          region,
+        );
+      } catch (err) {
+        // Endpoint missing / transient error — don't block the deploy on
+        // observability. Fall back to fire-and-forget semantics.
+        console.warn(
+          `[coolify] cannot poll deployment ${deploymentUuid}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        return;
+      }
+      const status = (dep.status ?? "").toLowerCase();
+      if (status === "finished") return;
+      if (status === "failed" || status === "cancelled") {
+        throw new Error(
+          `Coolify build ${status}: ${tailOfBuildLogs(dep.logs)}`,
+        );
+      }
+      await new Promise<void>((r) => setTimeout(r, pollMs));
+    }
+    console.warn(
+      `[coolify] deployment ${deploymentUuid} still running after ${
+        timeoutMs / 1000
+      }s — verify will probe the currently-serving container`,
+    );
   }
 
   private async syncEnv(
@@ -779,6 +881,55 @@ interface CoolifyApp {
   name: string;
   fqdn?: string;
   status?: string;
+}
+
+/** Coolify's POST /deploy response. Two shapes exist in the wild:
+ *  v4 ≥4.0.0-beta returns `{ deployments: [{ resource_uuid,
+ *  deployment_uuid, message }] }`; some builds return a flat
+ *  `{ deployment_uuid }`. */
+interface CoolifyDeployStart {
+  deployment_uuid?: string;
+  deployments?: { deployment_uuid?: string }[];
+}
+
+interface CoolifyDeployment {
+  /** "queued" | "in_progress" | "finished" | "failed" | "cancelled" */
+  status?: string;
+  /** JSON-encoded array of { output, type, hidden } lines. */
+  logs?: string;
+}
+
+/** Pull the deployment uuid out of either /deploy response shape. */
+function deployUuidFrom(started: CoolifyDeployStart): string | undefined {
+  return (
+    started.deployment_uuid ??
+    started.deployments?.find((d) => d.deployment_uuid)?.deployment_uuid
+  );
+}
+
+/** Coolify build pack fields derived from the project's runtime.
+ *  Spread into app-create bodies and mirrored by `ensureBuildPack`. */
+function buildPackFor(project: Project): {
+  build_pack: string;
+  dockerfile_location?: string;
+} {
+  return project.runtime === "docker"
+    ? { build_pack: "dockerfile", dockerfile_location: "/Dockerfile" }
+    : { build_pack: "nixpacks" };
+}
+
+/** Last ~20 visible lines of a Coolify deployment's JSON-encoded logs,
+ *  flattened for an error message. Tolerates unparseable input. */
+function tailOfBuildLogs(logs: string | undefined): string {
+  if (!logs) return "(no build logs)";
+  try {
+    const lines = (JSON.parse(logs) as { output?: string; hidden?: boolean }[])
+      .filter((l) => l && !l.hidden && l.output)
+      .map((l) => String(l.output).trimEnd());
+    return lines.slice(-20).join(" | ").slice(0, 1500) || "(empty build logs)";
+  } catch {
+    return logs.slice(-1500);
+  }
 }
 
 interface CoolifyResource {

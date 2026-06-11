@@ -211,8 +211,16 @@ export async function runDeploy(
   // 1 — source arrives
   await emit("source-received");
 
-  // 2 — stack detection
-  const runtime = await dataPlane.detectStack(input.source);
+  // 2 — stack detection. A git project's runtime is whatever the operator
+  // declared on the project (that's also what drives the data plane's
+  // build-pack choice) — only sourceless kinds fall back to the data
+  // plane's heuristic. Before this, the step always logged the heuristic
+  // ("node") even for `runtime: docker` projects, which made the activity
+  // trace contradict the project settings.
+  const runtime =
+    input.source.kind === "git"
+      ? project.runtime
+      : await dataPlane.detectStack(input.source);
   await emit(`stack-detected:${runtime}`);
 
   // 3 — provision project services (database + automation workspace)
@@ -238,9 +246,34 @@ export async function runDeploy(
   const { nodeId } = await dataPlane.schedule(project);
   await emit(`scheduled:${nodeId}`);
 
-  // 6 — deploy
+  // 6 — deploy. The data plane may now surface a real build failure here
+  // (the Coolify plane awaits its deployment and throws with the build-log
+  // tail). Record it as a failed deployment instead of letting the row
+  // rot in "building" — and keep the error text in the step trace so
+  // `cantila logs` / troubleshoot show WHY.
   const env = toEnvMap(await store.listEnvVars(project.id), isPreview);
-  await dataPlane.startContainer(project, imageRef, nodeId, env);
+  try {
+    await dataPlane.startContainer(project, imageRef, nodeId, env);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await emit(`build-failed:${reason.slice(0, 600)}`);
+    await store.updateDeployment(deployment.id, {
+      status: "failed",
+      imageRef,
+      nodeId,
+      logs: steps,
+    });
+    if (!isPreview) {
+      await store.updateProject(project.id, { status: "crashed" });
+    }
+    return {
+      deploymentId: deployment.id,
+      status: "failed",
+      url: "",
+      steps,
+      provisioned,
+    };
+  }
   await emit("container-started");
 
   // 7 — route. For previews we override the URL produced by the data
