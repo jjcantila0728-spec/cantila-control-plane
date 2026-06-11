@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises";
 import type { QueryFn } from "./sdk";
 import { workspaceDir } from "./workspace";
 import { agentDefinitions } from "./roster/agent-defs";
-import { fleetConfig } from "./config";
+import { fleetConfig, resolveFleetEnv } from "./config";
 import type { OrchestratorEvent } from "../agents/project-orchestrator";
 import { ALLOWED_TOOLS, DISALLOWED_BASH } from "./tool-policy";
 import { getBudgetGovernor, type BudgetGovernor } from "./budget";
@@ -63,6 +63,7 @@ export class ClaudeRemediator {
         prompt,
         options: {
           cwd,
+          env: resolveFleetEnv(),
           agents: agentDefinitions(),
           allowedTools: ALLOWED_TOOLS,
           disallowedTools: DISALLOWED_BASH,

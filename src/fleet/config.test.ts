@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { fleetConfig } from "./config";
+import { fleetConfig, resolveFleetEnv } from "./config";
 
 test("fleetConfig exposes positive caps and a boolean live flag", () => {
   const c = fleetConfig();
@@ -51,6 +51,55 @@ test("authSource is 'subscription' when ANTHROPIC_AUTH_TOKEN is set", () => {
   if (prevAuth === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN; else process.env.ANTHROPIC_AUTH_TOKEN = prevAuth;
   if (prevOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = prevOAuth;
   if (prevKey !== undefined) process.env.ANTHROPIC_API_KEY = prevKey;
+});
+
+test("resolveFleetEnv strips ANTHROPIC_API_KEY when a platform subscription token is set", () => {
+  // Claude Code prefers ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN when both
+  // reach the subprocess, which silently bills metered API credit instead of the
+  // subscription ("Credit balance is too low" in prod, 2026-06-11). The fleet env
+  // must enforce the documented subscription-first precedence itself.
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  const prevOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const prevAuth = process.env.ANTHROPIC_AUTH_TOKEN;
+  process.env.ANTHROPIC_API_KEY = "sk-platform";
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = "sub-tok";
+  delete process.env.ANTHROPIC_AUTH_TOKEN;
+  const env = resolveFleetEnv();
+  assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "sub-tok");
+  if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
+  if (prevOAuth === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = prevOAuth;
+  if (prevAuth !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = prevAuth;
+});
+
+test("resolveFleetEnv keeps ANTHROPIC_API_KEY when no subscription token is set", () => {
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  const prevOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const prevAuth = process.env.ANTHROPIC_AUTH_TOKEN;
+  process.env.ANTHROPIC_API_KEY = "sk-platform";
+  delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete process.env.ANTHROPIC_AUTH_TOKEN;
+  const env = resolveFleetEnv();
+  assert.equal(env.ANTHROPIC_API_KEY, "sk-platform");
+  if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
+  if (prevOAuth !== undefined) process.env.CLAUDE_CODE_OAUTH_TOKEN = prevOAuth;
+  if (prevAuth !== undefined) process.env.ANTHROPIC_AUTH_TOKEN = prevAuth;
+});
+
+test("resolveFleetEnv with a tenant token strips platform creds and injects the tenant token", () => {
+  const prevKey = process.env.ANTHROPIC_API_KEY;
+  const prevOAuth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const prevAuth = process.env.ANTHROPIC_AUTH_TOKEN;
+  process.env.ANTHROPIC_API_KEY = "sk-platform";
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = "platform-sub";
+  process.env.ANTHROPIC_AUTH_TOKEN = "platform-auth";
+  const env = resolveFleetEnv("tenant-tok");
+  assert.equal(env.ANTHROPIC_API_KEY, undefined);
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, "tenant-tok");
+  if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
+  if (prevOAuth === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = prevOAuth;
+  if (prevAuth === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN; else process.env.ANTHROPIC_AUTH_TOKEN = prevAuth;
 });
 
 test("fleetConfig exposes budget + concurrency caps", () => {

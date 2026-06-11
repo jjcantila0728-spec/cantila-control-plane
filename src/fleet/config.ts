@@ -59,18 +59,31 @@ function resolveAuthSource(): FleetAuthSource {
  *  provided it replaces platform-level Anthropic credentials so the
  *  SDK subprocess uses the TENANT's subscription quota, not Cantila's.
  *
+ *  Platform runs enforce the subscription-first precedence here too:
+ *  Claude Code itself prefers ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN
+ *  when both reach the subprocess, which silently bills metered API credit
+ *  instead of the subscription, so the API key must not be forwarded when a
+ *  subscription token is configured.
+ *
  *  The SDK's `options.env` REPLACES the subprocess env entirely, so
  *  we spread process.env first to preserve PATH, HOME, etc. */
 export function resolveFleetEnv(
   tenantToken?: string,
 ): NodeJS.ProcessEnv {
-  if (!tenantToken) return process.env;
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  // Strip platform credentials so the SDK doesn't pick them up.
-  delete env.ANTHROPIC_API_KEY;
-  delete env.ANTHROPIC_AUTH_TOKEN;
-  env.CLAUDE_CODE_OAUTH_TOKEN = tenantToken;
-  return env;
+  if (tenantToken) {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    // Strip platform credentials so the SDK doesn't pick them up.
+    delete env.ANTHROPIC_API_KEY;
+    delete env.ANTHROPIC_AUTH_TOKEN;
+    env.CLAUDE_CODE_OAUTH_TOKEN = tenantToken;
+    return env;
+  }
+  if (resolveAuthSource() === "subscription") {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    delete env.ANTHROPIC_API_KEY;
+    return env;
+  }
+  return process.env;
 }
 
 export function fleetConfig(): FleetConfig {
