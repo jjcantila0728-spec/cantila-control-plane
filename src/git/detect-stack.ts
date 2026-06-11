@@ -115,3 +115,73 @@ export async function detectStack(
 
   return { buildPack: "nixpacks", port: 3000, stack: "App" };
 }
+
+/* ============================================================
+   detectMobileStack — recognise repos that build into a mobile
+   app (Android/iOS) on top of — not instead of — the web stack
+   above. A project can have both: the backend deploys through
+   detectStack as usual while the mobile pipeline reads this.
+   ============================================================ */
+
+export type MobileStack =
+  | "expo"
+  | "react-native"
+  | "flutter"
+  | "capacitor"
+  | "android-native";
+
+export interface MobileStackInfo {
+  mobileStack: MobileStack;
+  /** Human-readable label for events/UI ("Expo (React Native)", …). */
+  label: string;
+}
+
+/** Detect a mobile app stack from a repo file listing. Returns null for
+ *  web-only repos. Precedence: Expo before bare React Native (an Expo app
+ *  also depends on react-native), JS frameworks before native Gradle (an
+ *  RN/Flutter repo also contains an android/ project). */
+export async function detectMobileStack(
+  paths: string[],
+  read?: FileReader,
+): Promise<MobileStackInfo | null> {
+  const root = new Set(paths.filter((p) => !p.includes("/")));
+  const all = paths;
+
+  if (root.has("package.json") && read) {
+    const raw = await read("package.json").catch(() => null);
+    try {
+      const pkg = raw
+        ? (JSON.parse(raw) as {
+            dependencies?: Record<string, string>;
+            devDependencies?: Record<string, string>;
+          })
+        : null;
+      const deps = { ...pkg?.dependencies, ...pkg?.devDependencies };
+      if (deps["expo"]) return { mobileStack: "expo", label: "Expo (React Native)" };
+      if (deps["react-native"]) return { mobileStack: "react-native", label: "React Native" };
+      if (deps["@capacitor/core"]) return { mobileStack: "capacitor", label: "Capacitor" };
+    } catch {
+      /* malformed package.json — fall through to file-name signals */
+    }
+  }
+
+  if (root.has("pubspec.yaml")) {
+    const raw = read ? await read("pubspec.yaml").catch(() => null) : null;
+    if (raw && /^\s*flutter\s*:/m.test(raw)) {
+      return { mobileStack: "flutter", label: "Flutter" };
+    }
+  }
+
+  if (has(root, "capacitor.config.ts", "capacitor.config.json", "capacitor.config.js")) {
+    return { mobileStack: "capacitor", label: "Capacitor" };
+  }
+
+  const hasGradle =
+    has(root, "build.gradle", "build.gradle.kts") ||
+    all.some((p) => p === "android/build.gradle" || p === "android/build.gradle.kts");
+  if (hasGradle && all.some((p) => p.endsWith("AndroidManifest.xml"))) {
+    return { mobileStack: "android-native", label: "Native Android" };
+  }
+
+  return null;
+}
