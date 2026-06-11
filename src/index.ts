@@ -6,7 +6,7 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import { config } from "./config";
-import { createStore } from "./domain/create-store";
+import { createStore, bootMigrationsReady } from "./domain/create-store";
 import { seedOwnerAccount } from "./domain/seed-owner";
 import { seedPlatformProject } from "./domain/seed-platform";
 import { seedPlatformMailboxes } from "./domain/seed-platform-mailboxes";
@@ -4389,6 +4389,10 @@ app
     app.log.info(
       `cantila-control-plane listening on :${config.port} · store=${config.store}`,
     );
+    // Wait for the additive boot migrations to finish before any seed
+    // queries a column they add (e.g. Project.buildPack/appPort). Without
+    // this the seeds race the ALTERs and crash-loop on Prisma P2022.
+    await bootMigrationsReady;
     // Owner-account seed (plan §18). When CANTILA_OWNER_PASSWORD is set,
     // ensure the owner email is a real OWNER of a real account so the
     // Console scopes to it instead of falling back to the demo account.

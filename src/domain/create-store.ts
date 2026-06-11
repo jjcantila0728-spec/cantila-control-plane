@@ -19,6 +19,14 @@ import { InMemoryStore } from "./store";
 import { PrismaStore } from "./prisma-store";
 import { applyBootMigrations } from "./boot-migrations";
 
+/** Resolves when the additive boot migrations have finished. Boot code that
+ *  queries columns those migrations add (e.g. the platform/owner seeds) MUST
+ *  `await` this first — otherwise it races the ALTERs and a still-missing
+ *  column surfaces as Prisma P2022. Defaults to resolved for the in-memory
+ *  store (no migrations to run). */
+export let bootMigrationsReady: Promise<{ applied: number; failed: number }> =
+  Promise.resolve({ applied: 0, failed: 0 });
+
 export function createStore(): Store {
   if (config.store === "prisma") {
     if (!config.databaseUrl) {
@@ -26,11 +34,12 @@ export function createStore(): Store {
     }
     // Apply additive nullable-column migrations before the rest of the
     // process opens a Prisma session — see `boot-migrations.ts` for the
-    // why. Fire-and-log: a permissions failure on one ALTER mustn't
-    // take the whole control plane down. Boot continues either way;
-    // if the column is genuinely missing the next query will surface
-    // the original Prisma error with full context.
-    void applyBootMigrations(getPrisma()).then(({ applied, failed }) => {
+    // why. `applyBootMigrations` never throws (it logs per-statement
+    // failures and continues), so awaiting `bootMigrationsReady` is safe:
+    // a permissions failure on one ALTER won't take the control plane down,
+    // but seeds still wait for the ALTERs to finish before querying.
+    bootMigrationsReady = applyBootMigrations(getPrisma());
+    void bootMigrationsReady.then(({ applied, failed }) => {
       if (failed > 0) {
         console.warn(`[boot-migrate] completed with ${failed} failure(s); ${applied} succeeded`);
       } else if (applied > 0) {
