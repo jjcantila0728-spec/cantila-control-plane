@@ -358,6 +358,14 @@ export interface Project {
   repoHost?: string | null;
   /** Branch that auto-deploys when a push arrives — default "main". */
   branch?: string;
+  /** Coolify build pack for the repo ("nixpacks" | "dockerfile" |
+   *  "dockercompose" | "static"). Unset = legacy default (nixpacks).
+   *  Written by `bootstrapGit`/`connectGit` stack detection so backend
+   *  apps and non-Node stacks build with the right strategy. */
+  buildPack?: string;
+  /** Container port the app listens on (Coolify `ports_exposes`).
+   *  Unset = legacy default (3000, or 80 for static). */
+  appPort?: number;
   /** When true, an incoming push webhook triggers a deploy. */
   autoDeploy: boolean;
   /** Per-project HMAC secret. Set when `connectGit` is called and used to

@@ -125,6 +125,18 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "Account.claudeSubscriptionToken — per-tenant claude.ai subscription OAuth token for the build fleet (§BYO-subscription). Nullable; absent rows fall back to the platform API key.",
     sql: 'ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "claudeSubscriptionToken" TEXT;',
   },
+  {
+    id: "20260610000000_add_project_build_pack",
+    description:
+      'Project.buildPack — Coolify build pack for the repo ("nixpacks" | "dockerfile" | "dockercompose" | "static"), written by bootstrapGit/connectGit stack detection. Null = legacy nixpacks default.',
+    sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "buildPack" TEXT;',
+  },
+  {
+    id: "20260610000001_add_project_app_port",
+    description:
+      "Project.appPort — container port the app listens on (Coolify ports_exposes). Null = legacy default (3000, or 80 for static).",
+    sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "appPort" INTEGER;',
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.

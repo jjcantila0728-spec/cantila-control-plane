@@ -44,4 +44,7 @@ export class GitHubGitProvider implements GitProvider {
   async createRepo(): Promise<{ cloneUrl: string; defaultBranch: string }> {
     throw new GitError(400, "createRepo is not supported for GitHub-connected projects");
   }
+  async migrateRepo(): Promise<{ cloneUrl: string; defaultBranch: string }> {
+    throw new GitError(400, "migrateRepo is not supported for GitHub-connected projects");
+  }
 }

@@ -538,7 +538,7 @@ export class CoolifyDataPlane implements DataPlane {
         name,
         docker_registry_image_name: image,
         docker_registry_image_tag: tag,
-        ports_exposes: "3000",
+        ports_exposes: String(project.appPort ?? 3000),
         domains: fqdn,
         instant_deploy: false,
       };
@@ -579,7 +579,7 @@ export class CoolifyDataPlane implements DataPlane {
         git_repository: project.repoUrl,
         git_branch: project.branch ?? "main",
         ...buildPackFor(project),
-        ports_exposes: "3000",
+        ports_exposes: portsExposesFor(project),
         domains: fqdn,
         instant_deploy: false,
       };
@@ -668,7 +668,7 @@ export class CoolifyDataPlane implements DataPlane {
         git_repository: httpsUrl,
         git_branch: project.branch ?? "main",
         ...buildPackFor(project),
-        ports_exposes: "3000",
+        ports_exposes: portsExposesFor(project),
         domains: fqdn,
         instant_deploy: false,
       },
@@ -747,17 +747,20 @@ export class CoolifyDataPlane implements DataPlane {
     project: Project,
     region: ResolvedRegion,
   ): Promise<void> {
-    if (project.runtime !== "docker") return;
+    // Only PATCH when we know better than the created default: a stack
+    // detection result persisted on the project, or the legacy
+    // runtime:docker rule. Plain legacy projects stay untouched.
+    if (!project.buildPack && project.runtime !== "docker") return;
     try {
       await this.request(
         "PATCH",
         `/applications/${encodeURIComponent(appUuid)}`,
-        { build_pack: "dockerfile", dockerfile_location: "/Dockerfile" },
+        { ...buildPackFor(project), ports_exposes: portsExposesFor(project) },
         region,
       );
     } catch (err) {
       console.warn(
-        `[coolify] failed to set dockerfile build_pack on ${appUuid}: ${
+        `[coolify] failed to set build_pack on ${appUuid}: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -907,15 +910,29 @@ function deployUuidFrom(started: CoolifyDeployStart): string | undefined {
   );
 }
 
-/** Coolify build pack fields derived from the project's runtime.
+/** Coolify build pack fields for a project. The stack detection result
+ *  persisted by `bootstrapGit`/`connectGit` (`project.buildPack`) wins —
+ *  it saw the actual repo tree. The legacy `runtime:docker` rule covers
+ *  rows from before detection existed; everything else is Nixpacks.
  *  Spread into app-create bodies and mirrored by `ensureBuildPack`. */
 function buildPackFor(project: Project): {
   build_pack: string;
   dockerfile_location?: string;
 } {
-  return project.runtime === "docker"
+  const pack =
+    project.buildPack ??
+    (project.runtime === "docker" ? "dockerfile" : "nixpacks");
+  return pack === "dockerfile"
     ? { build_pack: "dockerfile", dockerfile_location: "/Dockerfile" }
-    : { build_pack: "nixpacks" };
+    : { build_pack: pack };
+}
+
+/** Container port Coolify should expose for a project. Detection
+ *  persists `appPort`; legacy rows keep the historical defaults
+ *  (3000, or 80 for static builds). */
+function portsExposesFor(project: Project): string {
+  const pack = buildPackFor(project).build_pack;
+  return String(project.appPort ?? (pack === "static" ? 80 : 3000));
 }
 
 /** Last ~20 visible lines of a Coolify deployment's JSON-encoded logs,

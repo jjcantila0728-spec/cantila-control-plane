@@ -11,4 +11,16 @@ export interface GitProvider {
   /** Create a repo under `owner` (org). Idempotent: returns the existing
    *  repo if it already exists. GitHub adapter throws (unsupported). */
   createRepo(input: { owner: string; name: string; private?: boolean }): Promise<{ cloneUrl: string; defaultBranch: string }>;
+  /** Bootstrap-clone: have the git BACKEND pull `cloneAddr` (full history)
+   *  into a new repo under `owner` — no client-side `git push` involved.
+   *  Idempotent: returns the existing repo if it already exists.
+   *  `authToken` authenticates against the SOURCE host for private repos.
+   *  GitHub adapter throws (unsupported). */
+  migrateRepo(input: {
+    owner: string;
+    name: string;
+    cloneAddr: string;
+    authToken?: string;
+    private?: boolean;
+  }): Promise<{ cloneUrl: string; defaultBranch: string }>;
 }

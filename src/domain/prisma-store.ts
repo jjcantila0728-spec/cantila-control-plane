@@ -116,6 +116,8 @@ function toProject(r: DbProject): Project {
     repoUrl: r.repoUrl ?? undefined,
     repoHost: r.repoHost ?? undefined,
     branch: r.branch ?? undefined,
+    buildPack: r.buildPack ?? undefined,
+    appPort: r.appPort ?? undefined,
     autoDeploy: r.autoDeploy,
     webhookSecret: r.webhookSecret ?? undefined,
     automationKind: r.automationKind ?? undefined,
@@ -460,6 +462,8 @@ export class PrismaStore implements Store {
         repoUrl: p.repoUrl,
         repoHost: p.repoHost ?? "github",
         branch: p.branch,
+        buildPack: p.buildPack,
+        appPort: p.appPort,
         autoDeploy: p.autoDeploy,
         platform: p.platform ?? false,
         createdAt: new Date(p.createdAt),
@@ -495,6 +499,8 @@ export class PrismaStore implements Store {
     if (patch.repoUrl !== undefined) data.repoUrl = patch.repoUrl;
     if (patch.repoHost !== undefined) data.repoHost = patch.repoHost;
     if (patch.branch !== undefined) data.branch = patch.branch;
+    if (patch.buildPack !== undefined) data.buildPack = patch.buildPack;
+    if (patch.appPort !== undefined) data.appPort = patch.appPort;
     if (patch.autoDeploy !== undefined) data.autoDeploy = patch.autoDeploy;
     if (patch.webhookSecret !== undefined) data.webhookSecret = patch.webhookSecret;
     if (patch.automationKind !== undefined) data.automationKind = patch.automationKind;

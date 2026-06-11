@@ -154,6 +154,9 @@ import {
 import { isComplianceRejection } from "../sms/telnyx";
 import { config } from "../config";
 import { cantilaOrStubProvider, orgNameForAccount, gitProviderFor, repoRefFor } from "../git/resolve";
+import { detectStack } from "../git/detect-stack";
+import type { GitProvider } from "../git/provider";
+import type { RepoRef } from "../git/types";
 import type { FileNode, FileContent } from "../git/types";
 
 export interface ControlPlaneDeps {
@@ -6807,6 +6810,14 @@ export class ControlPlane {
         // already rejects non-URL input, so this is defensive only.
       }
     }
+    // Best-effort stack detection so backend apps and non-Node stacks get
+    // the right build pack + container port. Failures (private repo we
+    // can't list, empty repo, network) keep the legacy nixpacks:3000
+    // defaults — connecting must never fail because detection did.
+    const detected = await this.detectProjectStack(
+      { ...project, repoUrl: url, repoHost },
+      opts.branch ?? "main",
+    );
     // 32 random bytes hex-encoded → 64 chars, the same shape GitHub
     // recommends for repository webhook secrets.
     const webhookSecret = randomBytes(32).toString("hex");
@@ -6814,6 +6825,7 @@ export class ControlPlane {
       repoUrl: url,
       repoHost,
       branch: opts.branch ?? "main",
+      ...(detected ? { buildPack: detected.buildPack, appPort: detected.port } : {}),
       autoDeploy: opts.autoDeploy ?? true,
       webhookSecret,
     });
@@ -6828,6 +6840,116 @@ export class ControlPlane {
       project: stripWebhookSecret(updated),
       webhookSecret,
       webhookUrl: `/v1/projects/${updated.id}/git/webhook`,
+    };
+  }
+
+  /** Best-effort stack detection over a project's repo tree. Returns the
+   *  detected build configuration, or null when the tree can't be read
+   *  (private source, empty repo, provider error) — callers keep the
+   *  legacy nixpacks:3000 defaults in that case. */
+  private async detectProjectStack(
+    projectLike: { repoUrl?: string | null; repoHost?: string | null; slug: string; accountId: string },
+    branch: string,
+    providerOverride?: { provider: GitProvider; ref: RepoRef },
+  ): Promise<{ buildPack: string; port: number; stack: string } | null> {
+    try {
+      let provider: GitProvider;
+      let ref: RepoRef;
+      if (providerOverride) {
+        ({ provider, ref } = providerOverride);
+      } else {
+        const account = await this.deps.store.getAccount(projectLike.accountId);
+        if (!account) return null;
+        provider = gitProviderFor(projectLike);
+        ref = repoRefFor(projectLike, account);
+      }
+      const tree = await provider.listTree(ref, branch);
+      return await detectStack(
+        tree.filter((t) => t.type === "blob").map((t) => t.path),
+        async (p) => (await provider.readFile(ref, p, branch)).content,
+      );
+    } catch {
+      return null;
+    }
+  }
+
+  /** Bootstrap-clone a project's source into Cantila git. Instead of the
+   *  client `git push`ing source to git.cantila.app (which desktop-agent
+   *  permission layers refuse as a bulk source relocation to a host they
+   *  can't verify), the Gitea backend PULLS the repo from `sourceUrl`
+   *  server-to-server with full history (`/repos/migrate`). The migrated
+   *  repo is then wired exactly like `connectGit` (webhook secret,
+   *  auto-deploy) and its stack is detected so any runtime — static
+   *  frontend, backend service, or Docker app — deploys with the right
+   *  build pack and container port. `sourceToken` authenticates against
+   *  the SOURCE host for private repos; it is forwarded to Gitea for the
+   *  one-time clone and never persisted by Cantila. */
+  async bootstrapGit(
+    projectId: string,
+    opts: { sourceUrl: string; sourceToken?: string; branch?: string; autoDeploy?: boolean },
+  ): Promise<
+    {
+      project: Project;
+      webhookSecret: string;
+      webhookUrl: string;
+      stack: { buildPack: string; port: number; label: string };
+    }
+    | { error: string }
+  > {
+    const src = opts.sourceUrl.trim();
+    if (!/^https?:\/\//i.test(src)) {
+      return { error: "sourceUrl must be an https:// URL" };
+    }
+    const project = await this.deps.store.getProject(projectId);
+    if (!project) return { error: "project not found" };
+    // Same production guard as ensureProjectRepo: without GITEA_URL there
+    // is no durable Cantila git backend to migrate into.
+    if (config.nodeEnv === "production" && !config.giteaUrl) {
+      return { error: "Cantila git backend is not configured" };
+    }
+    const account = await this.deps.store.getAccount(project.accountId);
+    if (!account) return { error: "account not found" };
+    const owner = orgNameForAccount(account);
+    const provider = cantilaOrStubProvider();
+    let cloneUrl: string;
+    let defaultBranch: string;
+    try {
+      ({ cloneUrl, defaultBranch } = await provider.migrateRepo({
+        owner,
+        name: project.slug,
+        cloneAddr: src,
+        authToken: opts.sourceToken,
+        private: true,
+      }));
+    } catch (e) {
+      return { error: `bootstrap-clone failed: ${(e as Error).message}` };
+    }
+    const branch = opts.branch ?? defaultBranch ?? "main";
+    const ref: RepoRef = { owner, repo: project.slug };
+    const detected = await this.detectProjectStack(project, branch, { provider, ref });
+    const stack = detected ?? { buildPack: "nixpacks", port: 3000, stack: "App" };
+    const webhookSecret = randomBytes(32).toString("hex");
+    const updated = await this.deps.store.updateProject(projectId, {
+      repoUrl: cloneUrl,
+      repoHost: "cantila",
+      branch,
+      buildPack: stack.buildPack,
+      appPort: stack.port,
+      autoDeploy: opts.autoDeploy ?? true,
+      webhookSecret,
+    });
+    await this.recordEvent(
+      project.accountId,
+      "git",
+      `Source bootstrapped into Cantila git for ${project.name}`,
+      `${src} → ${cloneUrl} · ${stack.stack} (${stack.buildPack}:${stack.port}) · branch ${branch}`,
+      projectId,
+    );
+    return {
+      project: stripWebhookSecret(updated),
+      webhookSecret,
+      webhookUrl: `/v1/projects/${updated.id}/git/webhook`,
+      stack: { buildPack: stack.buildPack, port: stack.port, label: stack.stack },
     };
   }
 

@@ -130,15 +130,19 @@ export class CantilaGitProvider implements GitProvider {
     return { commitSha: data.commit.sha };
   }
 
-  async createRepo(input: { owner: string; name: string; private?: boolean }): Promise<{ cloneUrl: string; defaultBranch: string }> {
-    // ensure the org exists (idempotent)
-    await this.req(`/orgs/${input.owner}`).catch(async (e) => {
+  /** Ensure the org exists (idempotent). */
+  private async ensureOrg(owner: string): Promise<void> {
+    await this.req(`/orgs/${owner}`).catch(async (e) => {
       if (e instanceof GitError && e.status === 404) {
-        await this.req(`/orgs`, { method: "POST", body: JSON.stringify({ username: input.owner }) });
+        await this.req(`/orgs`, { method: "POST", body: JSON.stringify({ username: owner }) });
       } else {
         throw e;
       }
     });
+  }
+
+  async createRepo(input: { owner: string; name: string; private?: boolean }): Promise<{ cloneUrl: string; defaultBranch: string }> {
+    await this.ensureOrg(input.owner);
     try {
       const r = await this.req<{ clone_url: string; default_branch: string }>(
         `/orgs/${input.owner}/repos`,
@@ -149,6 +153,44 @@ export class CantilaGitProvider implements GitProvider {
             private: input.private ?? true,
             auto_init: true,
             default_branch: "main",
+          }),
+        },
+      );
+      return { cloneUrl: r.clone_url, defaultBranch: r.default_branch || "main" };
+    } catch (e) {
+      if (e instanceof GitError && (e.status === 409 || e.status === 422)) {
+        const r = await this.req<{ clone_url: string; default_branch: string }>(
+          `/repos/${input.owner}/${input.name}`,
+        );
+        return { cloneUrl: r.clone_url, defaultBranch: r.default_branch || "main" };
+      }
+      throw e;
+    }
+  }
+
+  async migrateRepo(input: {
+    owner: string;
+    name: string;
+    cloneAddr: string;
+    authToken?: string;
+    private?: boolean;
+  }): Promise<{ cloneUrl: string; defaultBranch: string }> {
+    await this.ensureOrg(input.owner);
+    try {
+      // Gitea clones the SOURCE itself (server-to-server, full history) —
+      // the bootstrap-clone flow. `mirror:false` makes it a normal repo the
+      // tenant owns from then on, not a read-only mirror.
+      const r = await this.req<{ clone_url: string; default_branch: string }>(
+        `/repos/migrate`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            clone_addr: input.cloneAddr,
+            repo_owner: input.owner,
+            repo_name: input.name,
+            mirror: false,
+            private: input.private ?? true,
+            ...(input.authToken ? { auth_token: input.authToken } : {}),
           }),
         },
       );

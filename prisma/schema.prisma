@@ -387,6 +387,14 @@ model Project {
   /// default for rows created before this column.
   repoHost      String?       @default("github")
   branch        String?
+  /// Coolify build pack for the repo ("nixpacks" | "dockerfile" |
+  /// "dockercompose" | "static"). Null = legacy default (nixpacks).
+  /// Written by bootstrapGit/connectGit stack detection so backend apps
+  /// and non-Node stacks build with the right strategy.
+  buildPack     String?
+  /// Container port the app listens on (Coolify ports_exposes).
+  /// Null = legacy default (3000, or 80 for static).
+  appPort       Int?
   autoDeploy    Boolean       @default(false)
   /// Per-project HMAC secret for verifying incoming git webhook payloads.
   /// Set by `connectGit`, returned exactly once, rotated via `rotateWebhookSecret`.

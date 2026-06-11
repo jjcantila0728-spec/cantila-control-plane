@@ -773,6 +773,15 @@ const connectGitSchema = z.object({
   autoDeploy: z.boolean().default(true),
 });
 
+const bootstrapGitSchema = z.object({
+  sourceUrl: z.string().url(),
+  // Auth token for the SOURCE host (private repos). Forwarded to the
+  // one-time Gitea migrate call, never persisted by Cantila.
+  sourceToken: z.string().optional(),
+  branch: z.string().optional(),
+  autoDeploy: z.boolean().default(true),
+});
+
 const searchDomainsSchema = z.object({
   q: z.string().min(1),
   tlds: z.string().optional(), // comma-separated
@@ -4045,6 +4054,26 @@ app.post("/v1/projects/:id/git", async (request, reply) => {
   }
   if (!(await assertProjectAccess(request, reply, id))) return;
   const result = await cp.connectGit(id, parsed.data);
+  if ("error" in result) {
+    const code = result.error === "project not found" ? 404 : 400;
+    return reply.code(code).send({ error: result.error });
+  }
+  return reply.code(201).send(result);
+});
+
+// Bootstrap-clone a project's source into Cantila git: the Gitea backend
+// PULLS the repo from `sourceUrl` server-to-server (full history) — no
+// client-side `git push` needed. The migrated repo is wired like
+// `connectGit` (webhook secret returned exactly once) and the stack is
+// detected so any runtime (static, backend, Docker) deploys correctly.
+app.post("/v1/projects/:id/git/bootstrap", async (request, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = bootstrapGitSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ error: parsed.error.flatten() });
+  }
+  if (!(await assertProjectAccess(request, reply, id))) return;
+  const result = await cp.bootstrapGit(id, parsed.data);
   if ("error" in result) {
     const code = result.error === "project not found" ? 404 : 400;
     return reply.code(code).send({ error: result.error });

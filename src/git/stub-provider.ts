@@ -10,6 +10,7 @@ const key = (r: RepoRef) => `${r.owner}/${r.repo}`;
 /** In-memory GitProvider for offline dev/tests. Not persisted. */
 export class StubGitProvider implements GitProvider {
   private repos = new Map<string, Map<string, string>>(); // key -> path -> content
+  private migratedFrom = new Map<string, string>(); // key -> source cloneAddr
 
   async getDefaultBranch(_repo: RepoRef): Promise<string> {
     return "main";
@@ -23,6 +24,25 @@ export class StubGitProvider implements GitProvider {
     const k = `${input.owner}/${input.name}`;
     if (!this.repos.has(k)) this.repos.set(k, new Map());
     return { cloneUrl: `stub://git/${k}.git`, defaultBranch: "main" };
+  }
+
+  async migrateRepo(input: {
+    owner: string;
+    name: string;
+    cloneAddr: string;
+    authToken?: string;
+    private?: boolean;
+  }): Promise<{ cloneUrl: string; defaultBranch: string }> {
+    // Offline stand-in for Gitea's /repos/migrate: register the repo and
+    // remember where it was "cloned" from so tests can assert the source.
+    const made = await this.createRepo({ owner: input.owner, name: input.name });
+    this.migratedFrom.set(`${input.owner}/${input.name}`, input.cloneAddr);
+    return made;
+  }
+
+  /** Test hook: the cloneAddr a repo was bootstrap-cloned from, if any. */
+  migrationSource(owner: string, name: string): string | undefined {
+    return this.migratedFrom.get(`${owner}/${name}`);
   }
 
   private files(r: RepoRef): Map<string, string> {

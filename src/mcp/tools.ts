@@ -733,6 +733,62 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
       },
     },
 
+    /* ---------- cantila_bootstrap_repo ---------- */
+    {
+      name: "cantila_bootstrap_repo",
+      description:
+        "Bootstrap-clone source code into a Cantila project's git: Cantila's git backend pulls the repo from a source URL (GitHub etc.) server-to-server with full history — no local git push needed. Detects the stack (Node, Python, Go, Docker, static, …) so backend apps deploy with the right build pack and port, and wires auto-deploy on push.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          projectId: { type: "string", description: "The Cantila project id." },
+          sourceUrl: {
+            type: "string",
+            description:
+              "https URL of the SOURCE repository to clone from, e.g. https://github.com/owner/name.",
+          },
+          sourceToken: {
+            type: "string",
+            description:
+              "Auth token for the source host if the repo is private. Used once for the clone, never stored.",
+          },
+          branch: {
+            type: "string",
+            description: "Branch to track. Defaults to the source's default branch.",
+          },
+        },
+        required: ["projectId", "sourceUrl"],
+      },
+      handler: async (args) => {
+        const projectId = String(args.projectId ?? "");
+        const sourceUrl = String(args.sourceUrl ?? "");
+        if (!projectId || !sourceUrl) {
+          return errorText("projectId and sourceUrl are required.");
+        }
+        const result = await cp.bootstrapGit(projectId, {
+          sourceUrl,
+          sourceToken:
+            typeof args.sourceToken === "string" ? args.sourceToken : undefined,
+          branch: typeof args.branch === "string" ? args.branch : undefined,
+        });
+        if ("error" in result) return errorText(result.error);
+        const p = result.project;
+        return text(
+          [
+            `Bootstrapped ${sourceUrl} into ${p.repoUrl}`,
+            `Stack: ${result.stack.label} · build pack ${result.stack.buildPack} · port ${result.stack.port}`,
+            `Branch: ${p.branch} · Auto-deploy: ${p.autoDeploy ? "on" : "off"}`,
+            "",
+            `Webhook URL: ${result.webhookUrl}`,
+            `Webhook secret (shown once, store securely):`,
+            `  ${result.webhookSecret}`,
+            "",
+            `Run cantila_deploy to take it live.`,
+          ].join("\n"),
+        );
+      },
+    },
+
     /* ---------- cantila_rollback ---------- */
     {
       name: "cantila_rollback",
