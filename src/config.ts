@@ -85,6 +85,13 @@ export const config = {
     apiKey: process.env.LLM_API_KEY ?? "",
     /** Anthropic key — also the bring-your-own-key fallback. */
     anthropicApiKey: process.env.ANTHROPIC_API_KEY ?? "",
+    /** claude.ai subscription OAuth token (from `claude setup-token`). When
+     *  set — and no custom LLM_BASE_URL is in play — the product-layer Claude
+     *  analysers authenticate with this Bearer token instead of an API key, so
+     *  product LLM usage rides the subscription rather than metered API billing
+     *  (§BYO-subscription). Mirrors the fleet's CLAUDE_CODE_OAUTH_TOKEN /
+     *  ANTHROPIC_AUTH_TOKEN precedence. */
+    oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN ?? process.env.ANTHROPIC_AUTH_TOKEN ?? "",
     /** OpenAI key — used when provider is "openai". */
     openaiApiKey: process.env.OPENAI_API_KEY ?? "",
   },

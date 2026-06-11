@@ -201,7 +201,7 @@ export class ClaudeAiAnalyser implements AiAnalyser {
       // Stable across every call — on real Anthropic the cache_control
       // breakpoint reuses the prefix and keeps per-tick spend bounded;
       // compatible endpoints omit it (see llmSystem).
-      system: llmSystem(SYSTEM_PROMPT, this.endpoint.cache),
+      system: llmSystem(SYSTEM_PROMPT, this.endpoint.cache, this.endpoint.oauth),
       tools: [tool],
       tool_choice: { type: "tool", name: tool.name },
       messages: [

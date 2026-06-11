@@ -29,6 +29,13 @@ export type LlmProvider = "anthropic" | "openai";
 /** Canonical Anthropic model for bring-your-own-key tenant flows. */
 const ANTHROPIC_MODEL = "claude-sonnet-4-6";
 
+/** Required first system block when authenticating with a claude.ai
+ *  subscription OAuth token. The OAuth inference path only accepts requests
+ *  whose system prompt is led by the Claude Code identity; real instructions
+ *  follow in subsequent blocks. (Verified against api.anthropic.com.) */
+export const CLAUDE_CODE_IDENTITY =
+  "You are Claude Code, Anthropic's official CLI for Claude.";
+
 /** Per-provider default model when LLM_MODEL is unset. */
 const DEFAULT_MODEL: Record<LlmProvider, string> = {
   anthropic: "claude-sonnet-4-6",
@@ -49,26 +56,118 @@ export interface LlmEndpoint {
   /** Whether to emit `cache_control: {type:"ephemeral"}` breakpoints.
    *  Only real Anthropic supports them; compatible endpoints may 400. */
   cache: boolean;
+  /** True when authenticated with a claude.ai subscription OAuth token
+   *  (Bearer) rather than an API key. OAuth requests must lead their system
+   *  prompt with the Claude Code identity — see `llmSystem`. */
+  oauth: boolean;
   /** Operator-facing label, e.g. "claude-sonnet-4-6" or
    *  "claude-sonnet-4-6 (custom endpoint)". */
   label: string;
 }
 
+/* ---------- Credential precedence (pure, unit-tested) ---------- */
+
+export interface AnthropicAuthInput {
+  /** Explicit LLM_API_KEY override (always an API key). */
+  apiKeyOverride: string;
+  /** ANTHROPIC_API_KEY. */
+  anthropicApiKey: string;
+  /** Subscription OAuth token (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN). */
+  oauthToken: string;
+  /** LLM_BASE_URL — when non-empty, a custom/compatible endpoint is in play. */
+  baseUrl: string;
+  /** LLM_MODEL — empty means the per-provider default. */
+  model: string;
+}
+
+export type AnthropicAuthPlan =
+  | { mode: "oauth"; token: string; model: string; cache: true; label: string }
+  | {
+      mode: "api-key";
+      apiKey: string;
+      model: string;
+      baseUrl: string;
+      cache: boolean;
+      label: string;
+    }
+  | { mode: "none" };
+
+/** Decide which Anthropic credential the platform analysers use.
+ *
+ *  Precedence:
+ *  1. A custom `baseUrl` forces API-key auth — OAuth tokens only authenticate
+ *     against api.anthropic.com, and compatible endpoints may reject caching.
+ *  2. Otherwise a subscription OAuth token wins (so product LLM usage rides the
+ *     subscription instead of metered API billing).
+ *  3. Otherwise an API key (LLM_API_KEY override, else ANTHROPIC_API_KEY).
+ *  4. Otherwise nothing — the caller degrades to the rule-based stub. */
+export function planAnthropicAuth(input: AnthropicAuthInput): AnthropicAuthPlan {
+  const model = input.model || DEFAULT_MODEL.anthropic;
+  const apiKey = input.apiKeyOverride || input.anthropicApiKey;
+
+  if (input.baseUrl !== "") {
+    if (!apiKey) return { mode: "none" };
+    return {
+      mode: "api-key",
+      apiKey,
+      model,
+      baseUrl: input.baseUrl,
+      cache: false,
+      label: `${model} (custom endpoint)`,
+    };
+  }
+
+  if (input.oauthToken) {
+    return {
+      mode: "oauth",
+      token: input.oauthToken,
+      model,
+      cache: true,
+      label: `${model} (claude.ai subscription)`,
+    };
+  }
+
+  if (apiKey) {
+    return { mode: "api-key", apiKey, model, baseUrl: "", cache: true, label: model };
+  }
+
+  return { mode: "none" };
+}
+
 /** Platform-default Anthropic endpoint from `config.llm`. Returns null
- *  when no Anthropic key is configured — callers degrade to rule-based. */
+ *  when no credential is configured — callers degrade to rule-based. */
 export function defaultLlmEndpoint(): LlmEndpoint | null {
-  const apiKey = config.llm.apiKey || config.llm.anthropicApiKey;
-  if (!apiKey) return null;
-  const model = config.llm.model || DEFAULT_MODEL.anthropic;
-  const custom = config.llm.baseUrl !== "";
+  const plan = planAnthropicAuth({
+    apiKeyOverride: config.llm.apiKey,
+    anthropicApiKey: config.llm.anthropicApiKey,
+    oauthToken: config.llm.oauthToken,
+    baseUrl: config.llm.baseUrl,
+    model: config.llm.model,
+  });
+
+  if (plan.mode === "none") return null;
+
+  if (plan.mode === "oauth") {
+    return {
+      // `apiKey: null` suppresses the x-api-key header so only the Bearer
+      // token is sent — the OAuth inference path rejects requests carrying both.
+      client: new Anthropic({ authToken: plan.token, apiKey: null }),
+      model: plan.model,
+      cache: plan.cache,
+      oauth: true,
+      label: plan.label,
+    };
+  }
+
   return {
     client: new Anthropic({
-      apiKey,
-      ...(custom ? { baseURL: config.llm.baseUrl } : {}),
+      apiKey: plan.apiKey,
+      ...(plan.baseUrl ? { baseURL: plan.baseUrl } : {}),
     }),
-    model,
-    cache: !custom,
-    label: custom ? `${model} (custom endpoint)` : model,
+    model: plan.model,
+    cache: plan.cache,
+    oauth: false,
+    label: plan.label,
   };
 }
 
@@ -78,6 +177,7 @@ export function anthropicEndpoint(apiKey: string): LlmEndpoint {
     client: new Anthropic({ apiKey }),
     model: ANTHROPIC_MODEL,
     cache: true,
+    oauth: false,
     label: ANTHROPIC_MODEL,
   };
 }
@@ -88,14 +188,25 @@ export function resolveLlmEndpoint(apiKey?: string): LlmEndpoint | null {
   return apiKey ? anthropicEndpoint(apiKey) : defaultLlmEndpoint();
 }
 
-/** System-prompt blocks, with the ephemeral cache breakpoint applied only
- *  when the endpoint supports prompt caching. */
-export function llmSystem(text: string, cache: boolean): Anthropic.TextBlockParam[] {
-  return [
-    cache
-      ? { type: "text", text, cache_control: { type: "ephemeral" } }
-      : { type: "text", text },
-  ];
+/** System-prompt blocks for a `messages.create` call.
+ *
+ *  - The ephemeral cache breakpoint is applied (on the instructions block) only
+ *    when the endpoint supports prompt caching.
+ *  - Under OAuth (`oauth: true`) the Claude Code identity is prepended as the
+ *    first block, because the subscription inference path only accepts a system
+ *    prompt led by that identity. The cache breakpoint stays on the instructions
+ *    block, so the whole prefix (identity + instructions) is cached as one. */
+export function llmSystem(
+  text: string,
+  cache: boolean,
+  oauth = false,
+): Anthropic.TextBlockParam[] {
+  const instructions: Anthropic.TextBlockParam = cache
+    ? { type: "text", text, cache_control: { type: "ephemeral" } }
+    : { type: "text", text };
+  return oauth
+    ? [{ type: "text", text: CLAUDE_CODE_IDENTITY }, instructions]
+    : [instructions];
 }
 
 /* ---------- OpenAI config (OpenAI adapters) ---------- */

@@ -245,7 +245,7 @@ export class ClaudeDeployPlanner implements DeployPlanner {
         max_tokens: MAX_TOKENS,
         tools: [PLAN_TOOL],
         tool_choice: { type: "tool", name: PLAN_TOOL.name },
-        system: llmSystem(SYSTEM_PROMPT, this.endpoint.cache),
+        system: llmSystem(SYSTEM_PROMPT, this.endpoint.cache, this.endpoint.oauth),
         messages: [{ role: "user", content: userTurn }],
       });
 
