@@ -8,6 +8,8 @@
 import type {
   Account,
   Project,
+  MobileBuild,
+  StoreRelease,
   ManagedDatabase,
   Mailbox,
   HostedMailbox,
@@ -162,6 +164,18 @@ export interface Store {
       >
     >,
   ): Promise<Mailbox | null>;
+
+  /* ----- mobile builds + store releases (spec 2026-06-11) ----- */
+
+  createMobileBuild(b: MobileBuild): Promise<MobileBuild>;
+  getMobileBuild(id: string): Promise<MobileBuild | null>;
+  updateMobileBuild(id: string, patch: Partial<MobileBuild>): Promise<MobileBuild>;
+  /** Newest first. */
+  listMobileBuilds(projectId: string): Promise<MobileBuild[]>;
+  createStoreRelease(r: StoreRelease): Promise<StoreRelease>;
+  updateStoreRelease(id: string, patch: Partial<StoreRelease>): Promise<StoreRelease>;
+  /** Newest first. */
+  listStoreReleases(projectId: string): Promise<StoreRelease[]>;
 
   /* ----- hosted mailboxes (plan §4.4 — real inboxes, many per project) ----- */
 
@@ -616,6 +630,12 @@ export class InMemoryStore implements Store {
     for (const [mapId, m] of this.hostedMailboxes) {
       if (m.projectId === id) this.hostedMailboxes.delete(mapId);
     }
+    for (const [mapId, b] of this.mobileBuilds) {
+      if (b.projectId === id) this.mobileBuilds.delete(mapId);
+    }
+    for (const [mapId, r] of this.storeReleases) {
+      if (r.projectId === id) this.storeReleases.delete(mapId);
+    }
     for (const [mapId, a] of this.mailAliases) {
       if (a.projectId === id) this.mailAliases.delete(mapId);
     }
@@ -675,6 +695,59 @@ export class InMemoryStore implements Store {
       }
     }
     return null;
+  }
+
+  /* ----- mobile builds + store releases (spec 2026-06-11) ----- */
+
+  private mobileBuilds = new Map<string, MobileBuild>(); // keyed by id
+  private storeReleases = new Map<string, StoreRelease>(); // keyed by id
+
+  async createMobileBuild(b: MobileBuild): Promise<MobileBuild> {
+    this.mobileBuilds.set(b.id, b);
+    return b;
+  }
+
+  async getMobileBuild(id: string): Promise<MobileBuild | null> {
+    return this.mobileBuilds.get(id) ?? null;
+  }
+
+  async updateMobileBuild(
+    id: string,
+    patch: Partial<MobileBuild>,
+  ): Promise<MobileBuild> {
+    const existing = this.mobileBuilds.get(id);
+    if (!existing) throw new Error(`mobile build not found: ${id}`);
+    const updated = { ...existing, ...patch, id };
+    this.mobileBuilds.set(id, updated);
+    return updated;
+  }
+
+  async listMobileBuilds(projectId: string): Promise<MobileBuild[]> {
+    return [...this.mobileBuilds.values()]
+      .filter((b) => b.projectId === projectId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async createStoreRelease(r: StoreRelease): Promise<StoreRelease> {
+    this.storeReleases.set(r.id, r);
+    return r;
+  }
+
+  async updateStoreRelease(
+    id: string,
+    patch: Partial<StoreRelease>,
+  ): Promise<StoreRelease> {
+    const existing = this.storeReleases.get(id);
+    if (!existing) throw new Error(`store release not found: ${id}`);
+    const updated = { ...existing, ...patch, id };
+    this.storeReleases.set(id, updated);
+    return updated;
+  }
+
+  async listStoreReleases(projectId: string): Promise<StoreRelease[]> {
+    return [...this.storeReleases.values()]
+      .filter((r) => r.projectId === projectId)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   /* ----- hosted mailboxes (plan §4.4) ----- */

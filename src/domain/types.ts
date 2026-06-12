@@ -366,6 +366,20 @@ export interface Project {
   /** Container port the app listens on (Coolify `ports_exposes`).
    *  Unset = legacy default (3000, or 80 for static). */
   appPort?: number;
+  /** Mobile app stack ("expo" | "react-native" | "flutter" | "capacitor" |
+   *  "android-native"), written by detectMobileStack. Additive to the web
+   *  buildPack — a project can deploy a backend AND build a mobile app.
+   *  Null/unset = web-only project. */
+  mobileStack?: string;
+  /** Android package name used for Play Store releases. Defaults to
+   *  app.cantila.<slug> on first mobile build; stable thereafter (Play
+   *  rejects package renames). */
+  androidApplicationId?: string;
+  /** Cantila-managed Android signing keystore, base64, encrypted at rest
+   *  with CANTILA_SECRET_KEY (enc.v1 envelope). Generated on first build. */
+  androidKeystore?: string;
+  /** JSON {storePassword,keyPassword,alias,generated}, encrypted at rest. */
+  androidKeystoreSecret?: string;
   /** When true, an incoming push webhook triggers a deploy. */
   autoDeploy: boolean;
   /** Per-project HMAC secret. Set when `connectGit` is called and used to
@@ -1140,4 +1154,52 @@ export interface ConversationSummary extends Conversation {
   /** First ~120 chars of the most recent message's content, or "" when
    *  the conversation is empty. */
   lastPreview: string;
+}
+
+/* ----- mobile builds + store releases (spec 2026-06-11) ----- */
+
+export type MobilePlatform = "android" | "ios";
+export type MobileBuildStatus = "queued" | "building" | "succeeded" | "failed";
+export type MobileArtifactKind = "aab" | "apk";
+export type StoreKind = "google_play" | "app_store";
+export type StoreReleaseStatus = "submitted" | "published" | "stubbed" | "failed";
+
+/** One mobile app build: project source -> signed artifact (.aab/.apk).
+ *  Created `queued`, flipped by the async build runner. The artifact file
+ *  lives on disk under MOBILE_ARTIFACT_DIR; the row records its path. */
+export interface MobileBuild {
+  id: string;
+  projectId: string;
+  platform: MobilePlatform;
+  mobileStack: string;
+  status: MobileBuildStatus;
+  artifactKind: MobileArtifactKind;
+  artifactPath?: string;
+  artifactSize?: number;
+  applicationId: string;
+  /** Monotonic per-project Android versionCode (max existing + 1). */
+  versionCode: number;
+  versionName: string;
+  log?: string;
+  error?: string;
+  createdAt: string;
+  finishedAt?: string;
+}
+
+/** One store submission of a finished build (Google Play track release or,
+ *  later, an App Store Connect submission). `stubbed` means the publisher
+ *  was offline (no service-account env) and the release was recorded only. */
+export interface StoreRelease {
+  id: string;
+  projectId: string;
+  buildId: string;
+  store: StoreKind;
+  /** Play track: internal | alpha | beta | production. */
+  track: string;
+  status: StoreReleaseStatus;
+  /** Provider-side reference (Play edit id, ASC submission id). */
+  externalRef?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
 }

@@ -15,6 +15,9 @@ import { StubStripeAdapter, type StripeAdapter } from "../billing/stripe";
 import { StripeRealAdapter } from "../billing/stripe-real";
 import { RuleBasedAiAnalyser } from "../ai/analyser";
 import { buildAiAnalyser } from "../ai/factory";
+import { createMobileBuildProvider } from "../mobile/build-provider";
+import { createStorePublishers } from "../mobile/store-publisher";
+import { MobileService } from "../mobile/service";
 
 async function main(): Promise<void> {
   const ruleBased = new RuleBasedAiAnalyser();
@@ -45,8 +48,26 @@ async function main(): Promise<void> {
   });
   process.stderr.write(`[cantila-mcp] seeded demo project: ${demo.id}\n`);
 
+  const mobileService = new MobileService({
+    store,
+    builder: createMobileBuildProvider(process.env),
+    publishers: createStorePublishers(process.env),
+    listFiles: async (projectId) => {
+      const result = await cp.listProjectFiles(projectId);
+      if (!result || "error" in result) return null;
+      return result.files.filter((f) => f.type === "blob").map((f) => f.path);
+    },
+    readFile: async (projectId, path) => {
+      const result = await cp.readProjectFile(projectId, path);
+      if (!result || "error" in result) return null;
+      return result.content;
+    },
+    artifactDir: process.env.MOBILE_ARTIFACT_DIR,
+  });
+
   const server = new McpServer({ name: "cantila", version: "0.1.0" });
-  for (const tool of cantilaTools(cp)) server.addTool(tool);
+  for (const tool of cantilaTools(cp, { mobile: mobileService }))
+    server.addTool(tool);
   server.start();
   process.stderr.write("[cantila-mcp] ready — JSON-RPC over stdio\n");
 }

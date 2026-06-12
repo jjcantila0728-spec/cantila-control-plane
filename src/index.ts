@@ -58,6 +58,10 @@ import {
 import { OAuthProvider } from "./auth/oauth-provider";
 import { installPs1, installSh } from "./install/script";
 import { fleetConfig } from "./fleet/config";
+import { createMobileBuildProvider } from "./mobile/build-provider";
+import { createStorePublishers } from "./mobile/store-publisher";
+import { MobileService } from "./mobile/service";
+import { registerMobileRoutes } from "./mobile/routes";
 
 // 10 auth attempts per IP per minute, shared across login/register/sso.
 const authRateLimit = createRateLimiter({ windowMs: 60_000, max: 10 });
@@ -155,12 +159,38 @@ const projectOrchestrator = new ProjectOrchestrator({
   images: imageProvider,
 });
 
+// Mobile pipeline (spec 2026-06-11) — build Android apps (iOS coming
+// soon) and publish to app stores under Cantila's developer accounts.
+// Builder goes live with MOBILE_BUILDER=docker on a host with a Docker
+// socket; Play publishing goes live with GOOGLE_PLAY_SERVICE_ACCOUNT_JSON.
+const mobileBuilder = createMobileBuildProvider(process.env);
+const storePublishers = createStorePublishers(process.env);
+const mobileService = new MobileService({
+  store,
+  builder: mobileBuilder,
+  publishers: storePublishers,
+  listFiles: async (projectId) => {
+    const result = await cp.listProjectFiles(projectId);
+    if (!result || "error" in result) return null;
+    return result.files.filter((f) => f.type === "blob").map((f) => f.path);
+  },
+  readFile: async (projectId, path) => {
+    const result = await cp.readProjectFile(projectId, path);
+    if (!result || "error" in result) return null;
+    return result.content;
+  },
+  artifactDir: process.env.MOBILE_ARTIFACT_DIR,
+});
+console.log(
+  `[mobile-builder] ${mobileBuilder.label} (${mobileBuilder.live ? "live" : "stub"}); google-play ${storePublishers.get("google_play")?.live ? "live" : "stub"}; app-store coming-soon`,
+);
+
 // Remote MCP server (plan §4.3.2 — "Cantila publishes a remote MCP
 // server"). Shares the same ControlPlane instance the HTTP API uses, so
 // stdio + remote + Console all read and write the same store. The same
 // `McpServer` class powers both transports — see `src/mcp/server.ts`.
 const mcpServer = new McpServer({ name: "cantila", version: "0.1.0" });
-for (const tool of cantilaTools(cp)) mcpServer.addTool(tool);
+for (const tool of cantilaTools(cp, { mobile: mobileService })) mcpServer.addTool(tool);
 
 /* ----- MCP OAuth connector (plan: 2026-06-01-mcp-oauth-connector).
  *  Lets an MCP host (Claude Code "Connect via URL", claude.ai/Cowork)
@@ -2887,6 +2917,13 @@ registerConnectionRoutes(app, {
   cp,
   resolveAccountId,
   writeSecret: writeConnectionSecret,
+});
+
+/* ----- Mobile builds + store publishing (spec 2026-06-11) ----- */
+
+registerMobileRoutes(app, {
+  service: mobileService,
+  assertProjectAccess,
 });
 
 /* ----- Cantila Agents — plan §4.9 ----- */

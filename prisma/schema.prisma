@@ -395,6 +395,17 @@ model Project {
   /// Container port the app listens on (Coolify ports_exposes).
   /// Null = legacy default (3000, or 80 for static).
   appPort       Int?
+  /// Mobile app stack ("expo" | "react-native" | "flutter" | "capacitor" |
+  /// "android-native") written by detectMobileStack. Additive to buildPack —
+  /// a project can deploy a backend AND build a mobile app. Null = web-only.
+  mobileStack   String?
+  /// Android package name for Play releases (app.cantila.<slug> default).
+  androidApplicationId String?
+  /// Cantila-managed Android signing keystore, base64, encrypted at rest
+  /// (enc.v1 envelope via CANTILA_SECRET_KEY).
+  androidKeystore String?
+  /// JSON {storePassword,keyPassword,alias,generated}, encrypted at rest.
+  androidKeystoreSecret String?
   autoDeploy    Boolean       @default(false)
   /// Per-project HMAC secret for verifying incoming git webhook payloads.
   /// Set by `connectGit`, returned exactly once, rotated via `rotateWebhookSecret`.
@@ -429,6 +440,8 @@ model Project {
   buckets         StorageBucket[]
   hostedMailboxes HostedMailbox[]
   mailAliases     MailAlias[]
+  mobileBuilds    MobileBuild[]
+  storeReleases   StoreRelease[]
 
   // auto-wired services — one of each, private to this project
   database    ManagedDatabase?
@@ -466,6 +479,62 @@ model Deployment {
   logs          String[]      @default([])
   durationSec   Int           @default(0)
   createdAt     DateTime      @default(now())
+}
+
+// ----- mobile builds + store releases (spec 2026-06-11) -----
+//
+// A MobileBuild turns project source into a signed Android artifact
+// (.aab/.apk); a StoreRelease submits a finished build to an app store
+// under Cantila's developer account. Status columns are plain String —
+// the boot-migration path (additive raw SQL) cannot create PG enums
+// idempotently, and the domain layer owns the vocabulary anyway.
+
+model MobileBuild {
+  id            String   @id @default(cuid())
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId     String
+  /// "android" | "ios"
+  platform      String
+  /// "expo" | "react-native" | "flutter" | "capacitor" | "android-native"
+  mobileStack   String
+  /// "queued" | "building" | "succeeded" | "failed"
+  status        String   @default("queued")
+  /// "aab" | "apk"
+  artifactKind  String   @default("aab")
+  artifactPath  String?
+  artifactSize  Int?
+  applicationId String
+  versionCode   Int
+  versionName   String
+  log           String?
+  error         String?
+  createdAt     DateTime @default(now())
+  finishedAt    DateTime?
+
+  releases StoreRelease[]
+
+  @@index([projectId, createdAt])
+}
+
+model StoreRelease {
+  id          String      @id @default(cuid())
+  project     Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  projectId   String
+  build       MobileBuild @relation(fields: [buildId], references: [id], onDelete: Cascade)
+  buildId     String
+  /// "google_play" | "app_store"
+  store       String
+  /// Play track: "internal" | "alpha" | "beta" | "production"
+  track       String      @default("internal")
+  /// "submitted" | "published" | "stubbed" | "failed"
+  status      String
+  /// Provider-side reference (Play edit id, ASC submission id).
+  externalRef String?
+  error       String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @default(now())
+
+  @@index([projectId, createdAt])
 }
 
 // ----- auto-wired services (one per project) -----

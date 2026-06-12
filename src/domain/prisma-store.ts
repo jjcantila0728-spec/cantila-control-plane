@@ -15,6 +15,8 @@ import type {
   Account as DbAccount,
   Project as DbProject,
   Deployment as DbDeployment,
+  MobileBuild as DbMobileBuild,
+  StoreRelease as DbStoreRelease,
   ManagedDatabase as DbDatabase,
   Mailbox as DbMailbox,
   HostedMailbox as DbHostedMailbox,
@@ -54,6 +56,8 @@ import type {
 import type {
   Account,
   Project,
+  MobileBuild,
+  StoreRelease,
   ManagedDatabase,
   Mailbox,
   HostedMailbox,
@@ -118,6 +122,10 @@ function toProject(r: DbProject): Project {
     branch: r.branch ?? undefined,
     buildPack: r.buildPack ?? undefined,
     appPort: r.appPort ?? undefined,
+    mobileStack: r.mobileStack ?? undefined,
+    androidApplicationId: r.androidApplicationId ?? undefined,
+    androidKeystore: r.androidKeystore ?? undefined,
+    androidKeystoreSecret: r.androidKeystoreSecret ?? undefined,
     autoDeploy: r.autoDeploy,
     webhookSecret: r.webhookSecret ?? undefined,
     automationKind: r.automationKind ?? undefined,
@@ -128,6 +136,41 @@ function toProject(r: DbProject): Project {
     coolifyAppUuid: r.coolifyAppUuid ?? undefined,
     platform: r.platform ?? false,
     createdAt: r.createdAt.toISOString(),
+  };
+}
+
+function toMobileBuild(r: DbMobileBuild): MobileBuild {
+  return {
+    id: r.id,
+    projectId: r.projectId,
+    platform: r.platform as MobileBuild["platform"],
+    mobileStack: r.mobileStack,
+    status: r.status as MobileBuild["status"],
+    artifactKind: r.artifactKind as MobileBuild["artifactKind"],
+    artifactPath: r.artifactPath ?? undefined,
+    artifactSize: r.artifactSize ?? undefined,
+    applicationId: r.applicationId,
+    versionCode: r.versionCode,
+    versionName: r.versionName,
+    log: r.log ?? undefined,
+    error: r.error ?? undefined,
+    createdAt: r.createdAt.toISOString(),
+    finishedAt: r.finishedAt?.toISOString(),
+  };
+}
+
+function toStoreRelease(r: DbStoreRelease): StoreRelease {
+  return {
+    id: r.id,
+    projectId: r.projectId,
+    buildId: r.buildId,
+    store: r.store as StoreRelease["store"],
+    track: r.track,
+    status: r.status as StoreRelease["status"],
+    externalRef: r.externalRef ?? undefined,
+    error: r.error ?? undefined,
+    createdAt: r.createdAt.toISOString(),
+    updatedAt: r.updatedAt.toISOString(),
   };
 }
 
@@ -464,6 +507,10 @@ export class PrismaStore implements Store {
         branch: p.branch,
         buildPack: p.buildPack,
         appPort: p.appPort,
+        mobileStack: p.mobileStack,
+        androidApplicationId: p.androidApplicationId,
+        androidKeystore: p.androidKeystore,
+        androidKeystoreSecret: p.androidKeystoreSecret,
         autoDeploy: p.autoDeploy,
         platform: p.platform ?? false,
         createdAt: new Date(p.createdAt),
@@ -501,6 +548,13 @@ export class PrismaStore implements Store {
     if (patch.branch !== undefined) data.branch = patch.branch;
     if (patch.buildPack !== undefined) data.buildPack = patch.buildPack;
     if (patch.appPort !== undefined) data.appPort = patch.appPort;
+    if (patch.mobileStack !== undefined) data.mobileStack = patch.mobileStack;
+    if (patch.androidApplicationId !== undefined)
+      data.androidApplicationId = patch.androidApplicationId;
+    if (patch.androidKeystore !== undefined)
+      data.androidKeystore = patch.androidKeystore;
+    if (patch.androidKeystoreSecret !== undefined)
+      data.androidKeystoreSecret = patch.androidKeystoreSecret;
     if (patch.autoDeploy !== undefined) data.autoDeploy = patch.autoDeploy;
     if (patch.webhookSecret !== undefined) data.webhookSecret = patch.webhookSecret;
     if (patch.automationKind !== undefined) data.automationKind = patch.automationKind;
@@ -620,6 +674,100 @@ export class PrismaStore implements Store {
       // No row with that id (P2025) — treat as a no-op miss.
       return null;
     }
+  }
+
+  /* ----- mobile builds + store releases (spec 2026-06-11) ----- */
+
+  async createMobileBuild(b: MobileBuild): Promise<MobileBuild> {
+    const row = await this.db.mobileBuild.create({
+      data: {
+        id: b.id,
+        projectId: b.projectId,
+        platform: b.platform,
+        mobileStack: b.mobileStack,
+        status: b.status,
+        artifactKind: b.artifactKind,
+        artifactPath: b.artifactPath,
+        artifactSize: b.artifactSize,
+        applicationId: b.applicationId,
+        versionCode: b.versionCode,
+        versionName: b.versionName,
+        log: b.log,
+        error: b.error,
+        createdAt: new Date(b.createdAt),
+        finishedAt: b.finishedAt ? new Date(b.finishedAt) : null,
+      },
+    });
+    return toMobileBuild(row);
+  }
+
+  async getMobileBuild(id: string): Promise<MobileBuild | null> {
+    const row = await this.db.mobileBuild.findUnique({ where: { id } });
+    return row ? toMobileBuild(row) : null;
+  }
+
+  async updateMobileBuild(
+    id: string,
+    patch: Partial<MobileBuild>,
+  ): Promise<MobileBuild> {
+    const data: Record<string, unknown> = {};
+    if (patch.status !== undefined) data.status = patch.status;
+    if (patch.artifactPath !== undefined) data.artifactPath = patch.artifactPath;
+    if (patch.artifactSize !== undefined) data.artifactSize = patch.artifactSize;
+    if (patch.versionCode !== undefined) data.versionCode = patch.versionCode;
+    if (patch.versionName !== undefined) data.versionName = patch.versionName;
+    if (patch.log !== undefined) data.log = patch.log;
+    if (patch.error !== undefined) data.error = patch.error;
+    if (patch.finishedAt !== undefined)
+      data.finishedAt = patch.finishedAt ? new Date(patch.finishedAt) : null;
+    const row = await this.db.mobileBuild.update({ where: { id }, data });
+    return toMobileBuild(row);
+  }
+
+  async listMobileBuilds(projectId: string): Promise<MobileBuild[]> {
+    const rows = await this.db.mobileBuild.findMany({
+      where: { projectId },
+      orderBy: { createdAt: "desc" },
+    });
+    return rows.map(toMobileBuild);
+  }
+
+  async createStoreRelease(r: StoreRelease): Promise<StoreRelease> {
+    const row = await this.db.storeRelease.create({
+      data: {
+        id: r.id,
+        projectId: r.projectId,
+        buildId: r.buildId,
+        store: r.store,
+        track: r.track,
+        status: r.status,
+        externalRef: r.externalRef,
+        error: r.error,
+        createdAt: new Date(r.createdAt),
+        updatedAt: new Date(r.updatedAt),
+      },
+    });
+    return toStoreRelease(row);
+  }
+
+  async updateStoreRelease(
+    id: string,
+    patch: Partial<StoreRelease>,
+  ): Promise<StoreRelease> {
+    const data: Record<string, unknown> = { updatedAt: new Date() };
+    if (patch.status !== undefined) data.status = patch.status;
+    if (patch.externalRef !== undefined) data.externalRef = patch.externalRef;
+    if (patch.error !== undefined) data.error = patch.error;
+    const row = await this.db.storeRelease.update({ where: { id }, data });
+    return toStoreRelease(row);
+  }
+
+  async listStoreReleases(projectId: string): Promise<StoreRelease[]> {
+    const rows = await this.db.storeRelease.findMany({
+      where: { projectId },
+      orderBy: { createdAt: "desc" },
+    });
+    return rows.map(toStoreRelease);
   }
 
   /* ----- hosted mailboxes (plan §4.4) ----- */
