@@ -6,6 +6,7 @@
 
 import type { ControlPlane } from "../core/control-plane";
 import { ownerAccountId } from "../lib/owner-account";
+import { MobileError, type MobileService } from "../mobile/service";
 import type { McpContext, ToolDefinition, ToolResult } from "./server";
 import type {
   DbEngine,
@@ -122,7 +123,10 @@ function withTenantGuard(
   };
 }
 
-export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
+export function cantilaTools(
+  cp: ControlPlane,
+  extras: { mobile?: MobileService } = {},
+): ToolDefinition[] {
   const defs: ToolDefinition[] = [
     /* ---------- cantila_deploy ---------- */
     {
@@ -1423,5 +1427,147 @@ export function cantilaTools(cp: ControlPlane): ToolDefinition[] {
       },
     },
   ];
+
+  /* ---------- mobile builds + store publishing (spec 2026-06-11) ---------- */
+  if (extras.mobile) {
+    const mobile = extras.mobile;
+    const handleMobileError = (err: unknown): ToolResult => {
+      if (err instanceof MobileError) return errorText(err.message);
+      throw err;
+    };
+
+    defs.push(
+      {
+        name: "cantila_build_mobile",
+        description:
+          "Build the project's mobile app into a store-ready artifact. Android (.aab/.apk) is available today; iOS is coming soon. Detects the mobile stack (Expo, React Native, Flutter, Capacitor, native Android) automatically. Returns the queued build — poll cantila_list_mobile_builds for completion.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            projectId: {
+              type: "string",
+              description: "The Cantila project id to build.",
+            },
+            platform: {
+              type: "string",
+              enum: ["android", "ios"],
+              description: 'Target platform. Use "android" (iOS is coming soon).',
+            },
+            artifactKind: {
+              type: "string",
+              enum: ["aab", "apk"],
+              description:
+                'Artifact type — "aab" (Play Store, default) or "apk" (direct install).',
+            },
+            versionName: {
+              type: "string",
+              description: 'Human version label, e.g. "1.2.0". Defaults to 1.0.<versionCode>.',
+            },
+          },
+          required: ["projectId", "platform"],
+        },
+        handler: async (args) => {
+          try {
+            const build = await mobile.buildMobileApp(String(args.projectId), {
+              platform: args.platform === "ios" ? "ios" : "android",
+              artifactKind:
+                args.artifactKind === "apk" ? "apk" : args.artifactKind === "aab" ? "aab" : undefined,
+              versionName:
+                typeof args.versionName === "string" ? args.versionName : undefined,
+            });
+            return text(
+              `Mobile build queued: ${build.id}\nStack: ${build.mobileStack} · ${build.artifactKind} · versionCode ${build.versionCode} (${build.versionName})\nApplication id: ${build.applicationId}\nPoll cantila_list_mobile_builds to follow it; publish with cantila_publish_mobile once it succeeds.`,
+            );
+          } catch (err) {
+            return handleMobileError(err);
+          }
+        },
+      },
+      {
+        name: "cantila_list_mobile_builds",
+        description:
+          "List a project's mobile builds (newest first) with status, version and artifact info, plus its store releases.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            projectId: {
+              type: "string",
+              description: "The Cantila project id.",
+            },
+          },
+          required: ["projectId"],
+        },
+        handler: async (args) => {
+          const projectId = String(args.projectId);
+          const builds = await mobile.listBuilds(projectId);
+          const releases = await mobile.listReleases(projectId);
+          if (builds.length === 0) {
+            return text(
+              "No mobile builds yet. Run cantila_build_mobile to create one.",
+            );
+          }
+          const buildLines = builds.map(
+            (b) =>
+              `${b.id} — ${b.status} · ${b.platform}/${b.mobileStack} · v${b.versionName} (code ${b.versionCode}) · ${b.artifactKind}${b.artifactSize ? ` · ${b.artifactSize} bytes` : ""}${b.error ? ` · error: ${b.error.slice(0, 200)}` : ""}`,
+          );
+          const releaseLines = releases.map(
+            (r) =>
+              `${r.id} — ${r.status} · ${r.store} · track ${r.track} · build ${r.buildId}${r.error ? ` · error: ${r.error.slice(0, 200)}` : ""}`,
+          );
+          return text(
+            `${builds.length} build(s):\n${buildLines.join("\n")}${releases.length ? `\n\n${releases.length} release(s):\n${releaseLines.join("\n")}` : ""}`,
+          );
+        },
+      },
+      {
+        name: "cantila_publish_mobile",
+        description:
+          "Publish a succeeded mobile build to an app store under Cantila's developer account. Google Play is available today (tracks: internal, alpha, beta, production); the App Store is coming soon.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            projectId: {
+              type: "string",
+              description: "The Cantila project id.",
+            },
+            buildId: {
+              type: "string",
+              description: "A succeeded build id from cantila_list_mobile_builds.",
+            },
+            store: {
+              type: "string",
+              enum: ["google_play", "app_store"],
+              description: 'Target store. Use "google_play" (App Store is coming soon).',
+            },
+            track: {
+              type: "string",
+              enum: ["internal", "alpha", "beta", "production"],
+              description: "Play release track. Defaults to internal.",
+            },
+          },
+          required: ["projectId", "buildId", "store"],
+        },
+        handler: async (args) => {
+          try {
+            const release = await mobile.publishRelease(String(args.projectId), {
+              buildId: String(args.buildId),
+              store: args.store === "app_store" ? "app_store" : "google_play",
+              track: typeof args.track === "string" ? args.track : undefined,
+            });
+            const note =
+              release.status === "stubbed"
+                ? "\nNote: the Google Play publisher is offline on this environment — the release was recorded; set GOOGLE_PLAY_SERVICE_ACCOUNT_JSON to publish for real."
+                : "";
+            return text(
+              `Release ${release.id}: ${release.status} — ${release.store} (${release.track} track)${release.externalRef ? `\nProvider ref: ${release.externalRef}` : ""}${release.error ? `\nError: ${release.error}` : ""}${note}`,
+            );
+          } catch (err) {
+            return handleMobileError(err);
+          }
+        },
+      },
+    );
+  }
+
   return defs.map((def) => withTenantGuard(cp, def));
 }

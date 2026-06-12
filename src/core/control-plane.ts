@@ -7741,6 +7741,29 @@ export class ControlPlane {
     const mailboxes = rows.filter(
       (r): r is NonNullable<typeof r> => r !== null,
     );
+
+    // Include hosted mailboxes (including platform-owned ones like info@cantila.app)
+    // so they appear in the Mail Overview alongside transactional mailboxes.
+    const hostedMailboxes = await this.deps.store.listHostedMailboxes(accountId);
+    for (const hm of hostedMailboxes) {
+      const project = await this.deps.store.getProject(hm.projectId);
+      if (!project) continue;
+      // Map HostedMailbox into the Mailbox shape for the overview.
+      mailboxes.push({
+        id: hm.id,
+        projectId: hm.projectId,
+        address: hm.address,
+        sendingDomain: hm.address.split("@")[1] || "unknown",
+        smtpHost: "",
+        smtpUser: hm.address,
+        smtpPassword: mask(""),
+        status: hm.status === "active" ? "active" : "provisioning",
+        createdAt: hm.createdAt,
+        projectSlug: project.slug,
+        projectName: project.name,
+      });
+    }
+
     const domainAgg = new Map<string, { mailboxes: number; projects: Set<string> }>();
     for (const r of mailboxes) {
       const entry = domainAgg.get(r.sendingDomain) ?? {
