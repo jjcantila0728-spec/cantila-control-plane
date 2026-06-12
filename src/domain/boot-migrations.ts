@@ -137,6 +137,86 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "Project.appPort — container port the app listens on (Coolify ports_exposes). Null = legacy default (3000, or 80 for static).",
     sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "appPort" INTEGER;',
   },
+  {
+    id: "20260611000000_add_project_mobile_stack",
+    description:
+      'Project.mobileStack — mobile app stack ("expo" | "react-native" | "flutter" | "capacitor" | "android-native") written by detectMobileStack. Null = web-only project.',
+    sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "mobileStack" TEXT;',
+  },
+  {
+    id: "20260611000001_add_project_android_application_id",
+    description:
+      "Project.androidApplicationId — Android package name for Play releases (app.cantila.<slug> default, stable once set).",
+    sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "androidApplicationId" TEXT;',
+  },
+  {
+    id: "20260611000002_add_project_android_keystore",
+    description:
+      "Project.androidKeystore — Cantila-managed Android signing keystore, base64, encrypted at rest (enc.v1 envelope).",
+    sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "androidKeystore" TEXT;',
+  },
+  {
+    id: "20260611000003_add_project_android_keystore_secret",
+    description:
+      "Project.androidKeystoreSecret — keystore passwords JSON, encrypted at rest (enc.v1 envelope).",
+    sql: 'ALTER TABLE "Project" ADD COLUMN IF NOT EXISTS "androidKeystoreSecret" TEXT;',
+  },
+  {
+    id: "20260611000004_create_mobile_build",
+    description:
+      "MobileBuild table — mobile app builds (source → signed .aab/.apk) for the mobile pipeline (spec 2026-06-11).",
+    sql: `CREATE TABLE IF NOT EXISTS "MobileBuild" (
+      "id" TEXT NOT NULL,
+      "projectId" TEXT NOT NULL,
+      "platform" TEXT NOT NULL,
+      "mobileStack" TEXT NOT NULL,
+      "status" TEXT NOT NULL DEFAULT 'queued',
+      "artifactKind" TEXT NOT NULL DEFAULT 'aab',
+      "artifactPath" TEXT,
+      "artifactSize" INTEGER,
+      "applicationId" TEXT NOT NULL,
+      "versionCode" INTEGER NOT NULL,
+      "versionName" TEXT NOT NULL,
+      "log" TEXT,
+      "error" TEXT,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "finishedAt" TIMESTAMP(3),
+      CONSTRAINT "MobileBuild_pkey" PRIMARY KEY ("id"),
+      CONSTRAINT "MobileBuild_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );`,
+  },
+  {
+    id: "20260611000005_create_mobile_build_project_index",
+    description:
+      "MobileBuild [projectId, createdAt] index — backs the per-project build list (newest first).",
+    sql: 'CREATE INDEX IF NOT EXISTS "MobileBuild_projectId_createdAt_idx" ON "MobileBuild"("projectId", "createdAt");',
+  },
+  {
+    id: "20260611000006_create_store_release",
+    description:
+      "StoreRelease table — app-store submissions of finished mobile builds (Google Play now, App Store coming soon).",
+    sql: `CREATE TABLE IF NOT EXISTS "StoreRelease" (
+      "id" TEXT NOT NULL,
+      "projectId" TEXT NOT NULL,
+      "buildId" TEXT NOT NULL,
+      "store" TEXT NOT NULL,
+      "track" TEXT NOT NULL DEFAULT 'internal',
+      "status" TEXT NOT NULL,
+      "externalRef" TEXT,
+      "error" TEXT,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "StoreRelease_pkey" PRIMARY KEY ("id"),
+      CONSTRAINT "StoreRelease_projectId_fkey" FOREIGN KEY ("projectId") REFERENCES "Project"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      CONSTRAINT "StoreRelease_buildId_fkey" FOREIGN KEY ("buildId") REFERENCES "MobileBuild"("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );`,
+  },
+  {
+    id: "20260611000007_create_store_release_project_index",
+    description:
+      "StoreRelease [projectId, createdAt] index — backs the per-project release list (newest first).",
+    sql: 'CREATE INDEX IF NOT EXISTS "StoreRelease_projectId_createdAt_idx" ON "StoreRelease"("projectId", "createdAt");',
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.
