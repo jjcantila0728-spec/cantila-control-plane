@@ -25,23 +25,45 @@ export interface DeployBridgeDeps {
   walk?: (dir: string) => Promise<{ path: string; content: string }[]>;
 }
 
-async function defaultWalk(dir: string): Promise<{ path: string; content: string }[]> {
+// Hard ceiling to guard against OOM on a pathological file — NOT a normal-source
+// limit. The old 512KB cap silently dropped lockfiles and bundled source, which
+// is exactly how a tree ships incomplete and the build dies with "Module not found".
+const MAX_FILE_BYTES = 25 * 1024 * 1024;
+
+export async function defaultWalk(dir: string): Promise<{ path: string; content: string }[]> {
   const out: { path: string; content: string }[] = [];
+  const oversized: string[] = [];
+  const binary: string[] = [];
   async function rec(d: string) {
     let entries: any[];
     try { entries = await readdir(d, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       const abs = path.join(d, e.name);
       if (e.name === ".git" || e.name === "node_modules") continue;
-      if (e.isDirectory()) await rec(abs);
-      else {
-        const s = await stat(abs);
-        if (s.size > 512 * 1024) continue;
-        out.push({ path: path.relative(dir, abs).split(path.sep).join("/"), content: await readFile(abs, "utf8") });
-      }
+      const rel = path.relative(dir, abs).split(path.sep).join("/");
+      if (e.isDirectory()) { await rec(abs); continue; }
+      const s = await stat(abs);
+      if (s.size > MAX_FILE_BYTES) { oversized.push(`${rel} (${Math.round(s.size / 1024 / 1024)}MB)`); continue; }
+      const buf = await readFile(abs);
+      // The GitProvider.writeFile contract is UTF-8 only (the adapter base64-encodes
+      // a utf-8 string), so a binary blob would be silently corrupted. Detect via a
+      // NUL byte in the head and skip-with-record rather than mangle it.
+      if (buf.subarray(0, 8192).includes(0)) { binary.push(rel); continue; }
+      out.push({ path: rel, content: buf.toString("utf8") });
     }
   }
   await rec(dir);
+  // Fail loud — never silently ship an incomplete tree.
+  if (oversized.length) {
+    throw new Error(
+      `refusing to deploy: ${oversized.length} file(s) exceed ${MAX_FILE_BYTES / 1024 / 1024}MB and would be dropped: ${oversized.join(", ")}`,
+    );
+  }
+  if (binary.length) {
+    console.warn(
+      `[deploy-bridge] skipped ${binary.length} binary file(s) (utf-8 push only): ${binary.slice(0, 10).join(", ")}${binary.length > 10 ? "…" : ""}`,
+    );
+  }
   return out;
 }
 
@@ -69,6 +91,9 @@ export class DeployBridge {
       await provider.createRepo({ owner: ref.owner, name: ref.repo, private: true });
 
       const files = await walk(input.workspaceDir);
+      if (files.length === 0) {
+        throw new Error("workspace produced no files to publish — refusing to deploy an empty tree");
+      }
       for (const f of files) {
         await provider.writeFile(ref, { path: f.path, content: f.content, branch, message: "fleet build" });
       }

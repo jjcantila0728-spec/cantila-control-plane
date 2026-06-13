@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DeployBridge } from "./deploy-bridge";
+import { mkdtemp, writeFile, mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { DeployBridge, defaultWalk } from "./deploy-bridge";
 import { StubGitProvider } from "../git/stub-provider";
 
 function fakeCp(project: any) {
@@ -46,4 +49,28 @@ test("null project (not found) does not deploy", async () => {
   const res = await bridge.publish({ projectId: "missing", workspaceDir: "/ws", onEvent: () => {} });
   assert.equal(res.deployed, false);
   assert.equal(cp.calls.deploy, 0);
+});
+
+test("empty workspace refuses to deploy an empty tree (no silent ship)", async () => {
+  const project = { id: "p1", accountId: "acc", slug: "coffee", repoUrl: "https://git.cantila.app/shop/coffee.git", repoHost: "cantila", branch: "main" };
+  const cp = fakeCp(project);
+  const bridge = new DeployBridge(deps(cp, []) as any);
+  const res = await bridge.publish({ projectId: "p1", workspaceDir: "/ws", onEvent: () => {} });
+  assert.equal(res.deployed, false);
+  assert.equal(cp.calls.deploy, 0);
+  assert.match(res.detail, /empty tree|no files/i);
+});
+
+test("defaultWalk pushes text/large files but skips binary (utf-8-only push)", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "dw-"));
+  await mkdir(path.join(dir, "lib"), { recursive: true });
+  await writeFile(path.join(dir, "index.ts"), "export const x = 1;\n", "utf8");
+  // A 700KB lib file — the old 512KB cap would have silently dropped this.
+  await writeFile(path.join(dir, "lib", "big.ts"), "// big\n" + "a".repeat(700 * 1024), "utf8");
+  // A binary file (contains NUL) — must be skipped, not corrupted.
+  await writeFile(path.join(dir, "logo.png"), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x01, 0x02]));
+  const files = await defaultWalk(dir);
+  const paths = files.map((f) => f.path).sort();
+  assert.deepEqual(paths, ["index.ts", "lib/big.ts"]);
+  assert.equal(files.find((f) => f.path === "lib/big.ts")?.content.length, 7 + 700 * 1024);
 });
