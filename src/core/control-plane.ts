@@ -76,6 +76,10 @@ import {
   type DeployOutcome,
   type DeployStepEvent,
 } from "../deploy/pipeline";
+import {
+  checkArchiveCompleteness,
+  formatIncompleteSourceError,
+} from "../deploy/check-source";
 import { UptimeChecker, type UptimeMonitor } from "../monitoring/uptime";
 import { AgentBrain, createDefaultBrain } from "../agents";
 import type { AgentName, BrainSnapshot } from "../agents";
@@ -6160,6 +6164,7 @@ export class ControlPlane {
     projectId: string,
     opts: { trigger: DeployTrigger; source: DeploySource },
   ): Promise<DeployOutcome> {
+    await this.assertSourceComplete(projectId, opts.source);
     const outcome = await runDeploy(this.deps, {
       projectId,
       trigger: opts.trigger,
@@ -6167,6 +6172,57 @@ export class ControlPlane {
     });
     await this.emitDeployEvent(projectId, outcome, opts.trigger);
     return outcome;
+  }
+
+  /** Pre-build gate: refuse to deploy a repo whose build entrypoints import
+   *  files missing from the tree (a lossy/partial source push — exactly the
+   *  failure that left `homepal` crash-looping with an unbuildable repo).
+   *  Turns a silent `exited:unhealthy` into a precise, actionable error.
+   *
+   *  Fail-OPEN by design: any internal error (no repo, archive/unzip/parse
+   *  failure) lets the deploy proceed — the gate only ever blocks on a
+   *  positive finding, never on its own malfunction. Set
+   *  `CANTILA_DISABLE_SOURCE_GATE=1` to bypass entirely if ever needed. */
+  private async assertSourceComplete(
+    projectId: string,
+    source: DeploySource,
+  ): Promise<void> {
+    if (process.env.CANTILA_DISABLE_SOURCE_GATE === "1") return;
+    // Only source-from-repo builds have a tree to validate; an uploaded
+    // prebuilt image has no source graph.
+    if (source.kind === "upload") return;
+    // Only validate an already-connected repo. Crucially we must NOT
+    // provision one here — `archiveProject` would call `ensureProjectRepo`
+    // and create a repo, masking the pipeline's "connect a repo first"
+    // guard. No repo yet → nothing to gate; let the pipeline handle it.
+    const project = await this.deps.store.getProject(projectId);
+    if (!project || !project.repoUrl) return;
+    let archive: Uint8Array;
+    try {
+      const res = await this.archiveProject(projectId);
+      if (!res || "error" in res) return; // no connected repo → nothing to gate
+      archive = res.data;
+    } catch (err) {
+      console.warn(
+        `[source-gate] could not fetch archive for ${projectId}; skipping check: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    let report;
+    try {
+      report = checkArchiveCompleteness(archive);
+    } catch (err) {
+      console.warn(
+        `[source-gate] could not analyse source for ${projectId}; skipping check: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    if (report.missing.length === 0) return;
+    throw new Error(formatIncompleteSourceError(report));
   }
 
   /** Streaming variant — fires `onStep` after each pipeline step so an SSE
@@ -6180,6 +6236,7 @@ export class ControlPlane {
       pace?: boolean;
     },
   ): Promise<DeployOutcome> {
+    await this.assertSourceComplete(projectId, opts.source);
     const outcome = await runDeploy(this.deps, {
       projectId,
       trigger: opts.trigger,

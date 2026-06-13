@@ -1170,18 +1170,36 @@ export function nixpacksBuildEnv(buildPack: string): Record<string, string> {
   return { NPM_CONFIG_PRODUCTION: "false", YARN_PRODUCTION: "false" };
 }
 
-/** Last ~20 visible lines of a Coolify deployment's JSON-encoded logs,
- *  flattened for an error message. Tolerates unparseable input. */
+/** Pattern for log lines that carry the ACTUAL failure reason, as opposed
+ *  to Coolify's verbose pre-build env-var warnings/tips. */
+const BUILD_ERROR_RE =
+  /error|fail|cannot|not found|module not found|unresolved|missing|exit(ed)? code|fatal|ELIFECYCLE|npm err|throw|panic|traceback/i;
+
+/** A legible tail of a Coolify deployment's JSON-encoded logs for an error
+ *  message. The naive "last N lines, capped to 1500 chars" buried the real
+ *  cause: Coolify prints long `NPM_CONFIG_PRODUCTION`/`YARN_PRODUCTION`
+ *  warnings + tips that ate the budget, so the genuine "Module not found"
+ *  line was truncated away (and downstream diagnosis blamed the warnings).
+ *  This surfaces error-signal lines first so the real reason is never lost.
+ *  Tolerates unparseable input. */
 function tailOfBuildLogs(logs: string | undefined): string {
   if (!logs) return "(no build logs)";
+  let lines: string[];
   try {
-    const lines = (JSON.parse(logs) as { output?: string; hidden?: boolean }[])
+    lines = (JSON.parse(logs) as { output?: string; hidden?: boolean }[])
       .filter((l) => l && !l.hidden && l.output)
-      .map((l) => String(l.output).trimEnd());
-    return lines.slice(-20).join(" | ").slice(0, 1500) || "(empty build logs)";
+      .map((l) => String(l.output).trimEnd())
+      .filter((l) => l.length > 0);
   } catch {
     return logs.slice(-1500);
   }
+  if (lines.length === 0) return "(empty build logs)";
+  const recent = lines.slice(-60);
+  const errorLines = recent.filter((l) => BUILD_ERROR_RE.test(l)).slice(-8);
+  const lastLines = recent.slice(-6);
+  // Error lines first (the cause), then the final lines (the context), de-duped.
+  const ordered = [...errorLines, ...lastLines.filter((l) => !errorLines.includes(l))];
+  return ordered.join(" | ").slice(0, 1500) || "(empty build logs)";
 }
 
 interface CoolifyResource {
