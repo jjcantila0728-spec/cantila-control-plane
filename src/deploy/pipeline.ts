@@ -65,6 +65,12 @@ export interface DataPlane {
    *  Best-effort by contract: a failure here leaves the Domain row in its
    *  `sslActive: false` state and the verify sweep retries / reports. */
   attachDomain?(project: Project, hostname: string): Promise<void>;
+  /** After a failed health check, ask the data plane WHY the container is
+   *  unhealthy — its status, exit code, and a tail of its runtime logs —
+   *  so the deploy records a concrete crash reason instead of a bare
+   *  "verify-failed". Optional + best-effort: the stub omits it; a failure
+   *  here just yields no extra detail and the step stays "verify-failed". */
+  diagnoseCrash?(project: Project, url: string): Promise<string | undefined>;
 }
 
 /** Emitted once for each pipeline step as it completes. The HTTP SSE
@@ -311,7 +317,21 @@ export async function runDeploy(
 
   // 8 — verify
   const healthy = await dataPlane.healthCheck(url);
-  await emit(healthy ? "verified" : "verify-failed");
+  if (healthy) {
+    await emit("verified");
+  } else {
+    // Capture the runtime crash reason (container status + log tail) so the
+    // step trace tells the deploying agent WHY — symmetric with the
+    // build-failed:<reason> recorded above. Best-effort: a diagnosis
+    // failure must never mask the verify-failed itself.
+    let reason: string | undefined;
+    try {
+      reason = await dataPlane.diagnoseCrash?.(project, url);
+    } catch {
+      /* diagnosis is observability, not a gate */
+    }
+    await emit(reason ? `verify-failed:${reason.slice(0, 600)}` : "verify-failed");
+  }
 
   const status: "live" | "failed" = healthy ? "live" : "failed";
   await store.updateDeployment(deployment.id, {

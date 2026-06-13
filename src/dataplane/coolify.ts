@@ -307,7 +307,7 @@ export class CoolifyDataPlane implements DataPlane {
     await this.ensureBuildPack(uuid, project, region);
 
     // Push env vars (best-effort — Coolify returns 200 even for already-set keys).
-    await this.syncEnv(uuid, env, region);
+    await this.syncEnv(uuid, env, region, buildPackFor(project).build_pack);
 
     // Trigger a fresh deploy. For an existing app this is a redeploy that
     // rebuilds the image from source and rolls the container.
@@ -419,6 +419,57 @@ export class CoolifyDataPlane implements DataPlane {
       }
     }
     return false;
+  }
+
+  /** Explain a failed health check: the container's Coolify status (e.g.
+   *  `exited`, `running:unhealthy`) plus a tail of its runtime logs, so the
+   *  deploy records WHY instead of a bare "verify-failed". Always returns a
+   *  string (at minimum naming the unreachable URL); the status/log lookups
+   *  are best-effort and silently omitted when unavailable. */
+  async diagnoseCrash(
+    project: Project,
+    url: string,
+  ): Promise<string | undefined> {
+    const parts: string[] = [`health check got no 200 from ${url}`];
+    const status = await this.fetchResourceStatus(project).catch(
+      () => undefined,
+    );
+    if (status) parts.push(`container status=${status}`);
+    const uuid =
+      this.appUuids.get(project.id) ?? project.coolifyAppUuid ?? undefined;
+    if (uuid) {
+      const logs = await this.fetchAppLogs(uuid, this.regionFor(project)).catch(
+        () => undefined,
+      );
+      if (logs) parts.push(`logs: ${logs}`);
+    }
+    return parts.join(" · ");
+  }
+
+  /** Best-effort tail of a Coolify application's runtime container logs.
+   *  Returns undefined when the endpoint is unavailable or returns nothing
+   *  — crash diagnosis must never depend on it. */
+  private async fetchAppLogs(
+    appUuid: string,
+    region: ResolvedRegion,
+  ): Promise<string | undefined> {
+    try {
+      const res = await this.request<{ logs?: string } | string>(
+        "GET",
+        `/applications/${encodeURIComponent(appUuid)}/logs?lines=100`,
+        undefined,
+        region,
+      );
+      const raw = typeof res === "string" ? res : (res?.logs ?? "");
+      const tail = String(raw)
+        .split(/\r?\n/)
+        .filter((l) => l.trim())
+        .slice(-12)
+        .join(" | ");
+      return tail.slice(0, 800) || undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   async sampleMetrics(project: Project): Promise<ProjectMetricSample[]> {
@@ -589,7 +640,7 @@ export class CoolifyDataPlane implements DataPlane {
         git_branch: project.branch ?? "main",
         ...buildPackFor(project),
         ports_exposes: portsExposesFor(project),
-        domains: fqdn,
+        ...(await this.domainFields(project, fqdn)),
         instant_deploy: false,
       };
       const created = await this.request<{ uuid: string }>(
@@ -678,12 +729,87 @@ export class CoolifyDataPlane implements DataPlane {
         git_branch: project.branch ?? "main",
         ...buildPackFor(project),
         ports_exposes: portsExposesFor(project),
-        domains: fqdn,
+        ...(await this.domainFields(project, fqdn)),
         instant_deploy: false,
       },
       region,
     );
     return created.uuid;
+  }
+
+  /** Create-body fragment that wires the project's free *.cantila.app fqdn
+   *  to its Coolify app. Single-container apps take Coolify's `domains`
+   *  field; docker-compose apps must use `docker_compose_domains` keyed by
+   *  the compose service (Coolify 422s on `domains` for compose). When the
+   *  service can't be resolved we create without a domain rather than fail
+   *  the whole deploy. */
+  private async domainFields(
+    project: Project,
+    fqdn: string,
+  ): Promise<Record<string, unknown>> {
+    const buildPack = buildPackFor(project).build_pack;
+    if (buildPack !== "dockercompose") return { domains: fqdn };
+    const composeService = await this.resolveComposeService(project);
+    if (!composeService) {
+      console.warn(
+        `[coolify] ${project.id}: docker-compose app — could not resolve a ` +
+          `web service to map ${fqdn} to; creating without a domain (attach ` +
+          `it from the Console). Coolify rejects 'domains' for compose apps.`,
+      );
+    }
+    return domainCreateFields({ buildPack, fqdn, composeService });
+  }
+
+  /** The compose service the project's domain should map to. Only resolvable
+   *  for Cantila-hosted (Gitea) repos, whose compose file we can read over
+   *  the Gitea API. Returns null otherwise (e.g. a GitHub compose repo) —
+   *  the app then deploys without an auto-attached domain. */
+  private async resolveComposeService(
+    project: Project,
+  ): Promise<string | null> {
+    if (
+      project.repoHost !== "cantila" ||
+      !project.repoUrl ||
+      !this.giteaApiUrl ||
+      !this.giteaToken
+    ) {
+      return null;
+    }
+    const parsed = parseGiteaRepo(project.repoUrl);
+    if (!parsed) return null;
+    const branch = project.branch ?? "main";
+    for (const path of [
+      "docker-compose.yml",
+      "docker-compose.yaml",
+      "compose.yml",
+      "compose.yaml",
+    ]) {
+      const raw = await this.fetchGiteaRaw(
+        parsed.owner,
+        parsed.repo,
+        branch,
+        path,
+      ).catch(() => null);
+      const svc = raw ? firstComposeService(raw) : null;
+      if (svc) return svc;
+    }
+    return null;
+  }
+
+  /** Fetch a single file from a Cantila-hosted Gitea repo (raw bytes).
+   *  Returns null on any non-200 so callers can probe alternative paths. */
+  private async fetchGiteaRaw(
+    owner: string,
+    repo: string,
+    ref: string,
+    path: string,
+  ): Promise<string | null> {
+    const res = await fetch(
+      `${this.giteaApiUrl}/api/v1/repos/${owner}/${repo}/raw/${path}?ref=${encodeURIComponent(ref)}`,
+      { headers: { Authorization: `token ${this.giteaToken}` } },
+    );
+    if (!res.ok) return null;
+    return res.text();
   }
 
   /** Add a read-only deploy key to a Gitea repo. Tolerates 422 (already set). */
@@ -830,6 +956,7 @@ export class CoolifyDataPlane implements DataPlane {
     appUuid: string,
     env: Record<string, string>,
     region: ResolvedRegion,
+    buildPack?: string,
   ): Promise<void> {
     // Bulk env-var upload — Coolify accepts a `data` array. Keys that
     // already exist are updated in place; new keys are created.
@@ -840,6 +967,20 @@ export class CoolifyDataPlane implements DataPlane {
       is_build_time: false,
       is_literal: true,
     }));
+
+    // Build-time vars: keep Nixpacks from dropping devDependencies under its
+    // default NODE_ENV=production (else typescript/webpack/vite are missing
+    // at compile time and the build fails). is_build_time:true so they apply
+    // during the build only, not at runtime.
+    for (const [key, value] of Object.entries(nixpacksBuildEnv(buildPack ?? ""))) {
+      data.push({
+        key,
+        value,
+        is_preview: false,
+        is_build_time: true,
+        is_literal: true,
+      });
+    }
 
     // Merge the platform-level claude.ai subscription token so every Coolify
     // app (new or redeployed) inherits it automatically — no manual edit
@@ -954,6 +1095,79 @@ function buildPackFor(project: Project): {
 function portsExposesFor(project: Project): string {
   const pack = buildPackFor(project).build_pack;
   return String(project.appPort ?? (pack === "static" ? 80 : 3000));
+}
+
+/** Coolify rejects the `domains` field for docker-compose apps — domains
+ *  must be set per-service via `docker_compose_domains`
+ *  (`[{ name, domain }]`). Returns the create-body fragment that wires the
+ *  project's free *.cantila.app fqdn:
+ *    - non-compose build packs   → `{ domains }` (single container);
+ *    - compose + resolved service → `{ docker_compose_domains }`;
+ *    - compose + unknown service  → `{}` — still un-breaks the create
+ *      (sending `domains` 422'd: "The domains field cannot be used for
+ *      dockercompose applications"). The caller logs that the domain must
+ *      be attached separately. */
+export function domainCreateFields(args: {
+  buildPack: string;
+  fqdn: string;
+  composeService: string | null;
+}): Record<string, unknown> {
+  if (args.buildPack !== "dockercompose") return { domains: args.fqdn };
+  if (args.composeService) {
+    return {
+      docker_compose_domains: [
+        { name: args.composeService, domain: args.fqdn },
+      ],
+    };
+  }
+  return {};
+}
+
+/** First web-facing service in a docker-compose file: the first top-level
+ *  `services:` entry that publishes ports, else the first service. Minimal
+ *  indentation scan — no YAML dependency, tolerant of comments and blank
+ *  lines. Returns null when no services block parses. */
+export function firstComposeService(yaml: string): string | null {
+  const lines = yaml.split(/\r?\n/).map((l) => l.replace(/\t/g, "  "));
+  let servicesIndent = -1; // indent of the `services:` key
+  let serviceIndent = -1; // indent of service-name keys (one level in)
+  let current: string | null = null;
+  const services: { name: string; hasPorts: boolean }[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const indent = line.length - line.trimStart().length;
+
+    if (servicesIndent === -1) {
+      if (/^services\s*:/.test(trimmed)) servicesIndent = indent;
+      continue;
+    }
+    // dedent back to/above `services:` ends the block
+    if (indent <= servicesIndent) break;
+
+    if (serviceIndent === -1) serviceIndent = indent;
+    if (indent === serviceIndent) {
+      current = trimmed.replace(/:.*$/, "").trim();
+      if (current) services.push({ name: current, hasPorts: false });
+    } else if (current && /^ports\s*:/.test(trimmed)) {
+      const svc = services.find((s) => s.name === current);
+      if (svc) svc.hasPorts = true;
+    }
+  }
+
+  if (services.length === 0) return null;
+  return (services.find((s) => s.hasPorts) ?? services[0]!).name;
+}
+
+/** Build-time env vars that stop Nixpacks/npm/yarn from skipping
+ *  devDependencies under their default NODE_ENV=production — without these,
+ *  build tools declared as devDependencies (typescript, webpack, vite…) are
+ *  absent at compile time and the build fails. Empty for non-Nixpacks build
+ *  packs (Dockerfile / compose own their installs). */
+export function nixpacksBuildEnv(buildPack: string): Record<string, string> {
+  if (buildPack !== "nixpacks") return {};
+  return { NPM_CONFIG_PRODUCTION: "false", YARN_PRODUCTION: "false" };
 }
 
 /** Last ~20 visible lines of a Coolify deployment's JSON-encoded logs,
