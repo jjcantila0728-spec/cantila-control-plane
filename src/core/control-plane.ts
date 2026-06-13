@@ -6950,6 +6950,7 @@ export class ControlPlane {
       webhookSecret: string;
       webhookUrl: string;
       stack: { buildPack: string; port: number; label: string };
+      autoDeployTriggered: boolean;
     }
     | { error: string }
   > {
@@ -7002,11 +7003,33 @@ export class ControlPlane {
       `${src} → ${cloneUrl} · ${stack.stack} (${stack.buildPack}:${stack.port}) · branch ${branch}`,
       projectId,
     );
+
+    // Smooth deploy: bootstrap is an explicit "take this live" action, so when
+    // autoDeploy is on (default) we kick off the first deploy now instead of
+    // leaving the project stuck in `provisioning` with 0 deployments waiting
+    // for a manual `cantila_deploy`. Fire-and-forget — a deploy runs for
+    // minutes and must not block this response — but NEVER silently: a failure
+    // is recorded as a visible project event (the deploy itself streams its own
+    // outcome via emitDeployEvent on success/failure).
+    const autoDeployTriggered = (opts.autoDeploy ?? true) !== false;
+    if (autoDeployTriggered) {
+      void this.deploy(projectId, { trigger: "git", source: { kind: "git", ref: branch } }).catch((e) =>
+        this.recordEvent(
+          project.accountId,
+          "deploy",
+          `Auto-deploy failed for ${project.name}`,
+          e instanceof Error ? e.message : String(e),
+          projectId,
+        ).catch(() => undefined),
+      );
+    }
+
     return {
       project: stripWebhookSecret(updated),
       webhookSecret,
       webhookUrl: `/v1/projects/${updated.id}/git/webhook`,
       stack: { buildPack: stack.buildPack, port: stack.port, label: stack.stack },
+      autoDeployTriggered,
     };
   }
 

@@ -62,6 +62,7 @@ test("bootstrapGit migrates the source server-side and wires the project like co
   assert.equal(result.project.repoHost, "cantila");
   assert.ok(result.project.repoUrl && result.project.repoUrl.length > 0);
   assert.equal(result.project.autoDeploy, true);
+  assert.equal(result.autoDeployTriggered, true); // bootstrap takes it live by default
   assert.equal(result.webhookSecret.length, 64);
   assert.equal(result.webhookUrl, `/v1/projects/${id}/git/webhook`);
   // The response never carries the secret on the project itself.
@@ -120,6 +121,17 @@ test("bootstrapGit honors a Dockerfile (any stack) including its EXPOSE port", a
   const project = await store.getProject(id);
   assert.equal(project?.buildPack, "dockerfile");
   assert.equal(project?.appPort, 5000);
+});
+
+test("bootstrapGit with autoDeploy:false wires the repo but does NOT take it live", async () => {
+  const { cp, store } = makeCp();
+  const { id } = await makeProject(cp, store, "Manual Deploy");
+  const result = await cp.bootstrapGit(id, {
+    sourceUrl: "https://github.com/acme/manual",
+    autoDeploy: false,
+  });
+  assert.ok(!("error" in result));
+  assert.equal(result.autoDeployTriggered, false);
 });
 
 test("bootstrapGit rejects a non-https source", async () => {

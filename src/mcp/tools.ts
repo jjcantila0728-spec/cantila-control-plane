@@ -787,7 +787,9 @@ export function cantilaTools(
             `Webhook secret (shown once, store securely):`,
             `  ${result.webhookSecret}`,
             "",
-            `Run cantila_deploy to take it live.`,
+            result.autoDeployTriggered
+              ? `Auto-deploy started — it'll be live at its URL shortly. Run cantila_status to watch progress.`
+              : `Run cantila_deploy to take it live.`,
           ].join("\n"),
         );
       },
