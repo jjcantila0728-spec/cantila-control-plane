@@ -63,6 +63,12 @@ interface RouteDeps {
   /** When present, new automation instances are provisioned eagerly
    *  (a real container is created) instead of waiting for a deploy. */
   workspaceProvisioner?: WorkspaceProvisioner;
+  /** True when the workspace provisioner stands up REAL containers
+   *  (Coolify) — surfaced on `/v1/automations/info` so the Console
+   *  badge reflects reality even though the global registry adapters
+   *  stay stubbed (per-instance adapters are built from
+   *  `automationConfig`, not the registry). */
+  workspacesLive?: boolean;
 }
 
 /** Spawn a background "capture" task that re-iterates the adapter's
@@ -124,8 +130,16 @@ interface AutomationSummary {
   /** The workspace's native UI URL — set once the container is
    *  provisioned. Absent until provisioning completes. */
   workspaceUrl?: string;
-  /** Admin username for the native workspace UI. */
+  /** Admin sign-in for the native workspace UI. The instance belongs
+   *  to this account, so its own admin credentials are shown to it
+   *  (the Console renders them in the workspace credentials panel —
+   *  n8n's editor needs them for its login screen). */
   workspaceAdminUser?: string;
+  workspaceAdminEmail?: string;
+  workspaceAdminPassword?: string;
+  /** OpenClaw only: the engine API key the embedded dashboard uses
+   *  (the Console appends it as a `#key=` fragment on the iframe URL). */
+  workspaceKey?: string;
 }
 
 function toSummary(p: Project): AutomationSummary | null {
@@ -146,6 +160,12 @@ function toSummary(p: Project): AutomationSummary | null {
     adminUrl: workspaceUrl ?? `https://${p.slug}.cantila.app`,
     workspaceUrl,
     workspaceAdminUser: cfg?.workspaceAdminUser as string | undefined,
+    workspaceAdminEmail: cfg?.workspaceAdminEmail as string | undefined,
+    workspaceAdminPassword: cfg?.workspaceAdminPassword as string | undefined,
+    workspaceKey:
+      p.automationKind === "openclaw"
+        ? (cfg?.workspaceApiKey as string | undefined)
+        : undefined,
   };
 }
 

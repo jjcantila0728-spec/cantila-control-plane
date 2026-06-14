@@ -17,7 +17,9 @@ function makeWorkspaceProvisioner(kind: string): WorkspaceProvisioner {
       return {
         workspaceUrl: `https://${k}-${project.slug}.cantila.app`,
         adminUser: "admin",
+        adminEmail: `admin@${k}-${project.slug}.cantila.app`,
         adminPassword: "ws-secret-pw",
+        apiKey: "ws-api-key",
       };
     },
   };
@@ -114,7 +116,13 @@ test("workspace provisioning is idempotent — second deploy skips creation", as
   const wsProvisioner: WorkspaceProvisioner = {
     async createWorkspace() {
       callCount++;
-      return { workspaceUrl: "https://n8n-idem.cantila.app", adminUser: "admin", adminPassword: "pw" };
+      return {
+        workspaceUrl: "https://n8n-idem.cantila.app",
+        adminUser: "admin",
+        adminEmail: "admin@n8n-idem.cantila.app",
+        adminPassword: "pw",
+        apiKey: "ws-api-key",
+      };
     },
   };
 
@@ -137,7 +145,13 @@ test("regular (non-automation) project does not get a workspace", async () => {
   const wsProvisioner: WorkspaceProvisioner = {
     async createWorkspace() {
       called = true;
-      return { workspaceUrl: "x", adminUser: "x", adminPassword: "x" };
+      return {
+        workspaceUrl: "x",
+        adminUser: "x",
+        adminEmail: "x",
+        adminPassword: "x",
+        apiKey: "x",
+      };
     },
   };
 

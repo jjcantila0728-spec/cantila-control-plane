@@ -28,7 +28,9 @@ export const stubWorkspaceProvisioner: WorkspaceProvisioner = {
     return {
       workspaceUrl: `https://${kind}-${project.slug}.cantila.app`,
       adminUser: "admin",
+      adminEmail: "admin@cantila.app",
       adminPassword: secret().slice(0, 24),
+      apiKey: secret().slice(0, 32),
     };
   },
 };

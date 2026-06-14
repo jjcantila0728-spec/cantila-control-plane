@@ -50,7 +50,14 @@ export interface WorkspaceProvisioner {
   ): Promise<{
     workspaceUrl: string;
     adminUser: string;
+    /** Email used as the engine's admin login (n8n requires an email
+     *  identity for its owner account). */
+    adminEmail: string;
     adminPassword: string;
+    /** Engine API key — the SAME value injected into the container env
+     *  (`OPENCLAW_API_KEY`), so the per-instance adapter can call the
+     *  engine without a credential round-trip. */
+    apiKey: string;
   }>;
   /** Tear down a workspace. Optional — best-effort by contract. */
   destroyWorkspace?(workspaceUrl: string): Promise<void>;
@@ -132,6 +139,9 @@ export async function provisionProjectServices(
           ...(project.automationConfig ?? {}),
           workspaceUrl: ws.workspaceUrl,
           workspaceAdminUser: ws.adminUser,
+          workspaceAdminEmail: ws.adminEmail,
+          workspaceAdminPassword: ws.adminPassword,
+          workspaceApiKey: ws.apiKey,
         },
       });
       await inject("AUTOMATION_WORKSPACE_URL", ws.workspaceUrl);
