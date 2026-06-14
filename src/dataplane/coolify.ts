@@ -862,11 +862,16 @@ export class CoolifyDataPlane implements DataPlane {
         region,
       );
     } catch (err) {
-      // Don't fail the deploy because the bookkeeping PATCH failed.
-      console.warn(
-        `[coolify] failed to set migrate pre_deployment_command on ${appUuid}: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+      // Fail loudly. This is the PRIMARY mechanism that applies the tenant's
+      // schema to its freshly-provisioned, empty database. If we can't install
+      // it, the migration won't run and the app boots against schema-less
+      // tables — every query throws P2021 while the deploy reports "live".
+      // Failing here surfaces as `build-failed:<reason>` in the pipeline, so a
+      // broken deploy is reported broken instead of silently going live.
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `failed to install database migration hook (pre_deployment_command) ` +
+          `on ${appUuid}: ${reason}`,
       );
     }
   }

@@ -234,3 +234,71 @@ test("startContainer creates a compose app with docker_compose_domains and never
     globalThis.fetch = original;
   }
 });
+
+// --- D: migration hook is a gate, not best-effort --------------------
+// If Coolify rejects installing the `pre_deployment_command` that applies
+// the tenant's schema, the migration never runs and the app boots against
+// an empty database (P2021). Swallowing that PATCH failure makes the deploy
+// report "live" while broken. startContainer must fail loudly instead.
+
+test("startContainer fails the deploy when the migration hook can't be installed", async () => {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    const u = String(url);
+    const method = String(init?.method ?? "GET");
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    // App lookup → none exist yet (force a create).
+    if (method === "GET" && /\/applications$/.test(u)) {
+      return { ok: true, status: 200, json: async () => [], text: async () => "[]" } as Response;
+    }
+    // The migrate-hook PATCH is rejected by Coolify.
+    if (method === "PATCH" && body && "pre_deployment_command" in body) {
+      return {
+        ok: false,
+        status: 500,
+        json: async () => ({ message: "cannot set pre_deployment_command" }),
+        text: async () => '{"message":"cannot set pre_deployment_command"}',
+      } as Response;
+    }
+    // Deployment poll → finished (so the ONLY failure path is the hook).
+    if (method === "GET" && /\/deployments\//.test(u)) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ status: "finished" }),
+        text: async () => "{}",
+      } as Response;
+    }
+    // Everything else succeeds (create, other PATCHes, POST /deploy).
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ uuid: "app_new", deployment_uuid: "dep_1" }),
+      text: async () => "{}",
+    } as Response;
+  }) as typeof fetch;
+
+  try {
+    const dp = new CoolifyDataPlane({
+      apiUrl: "http://coolify.test/api/v1",
+      apiToken: "t",
+      serverUuid: "s",
+      projectUuid: "p",
+    });
+    const project = makeProject({
+      slug: "demo",
+      repoUrl: "https://github.com/owner/demo",
+      branch: "main",
+    });
+    await assert.rejects(
+      () =>
+        dp.startContainer(project, "coolify:pending", "s", {
+          DATABASE_URL: "postgres://app:pw@db:5432/demo",
+        }),
+      /migrat|pre_deployment_command/i,
+      "a failed migration-hook install must fail the deploy, not be swallowed",
+    );
+  } finally {
+    globalThis.fetch = original;
+  }
+});

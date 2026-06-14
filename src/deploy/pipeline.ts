@@ -71,6 +71,21 @@ export interface DataPlane {
    *  "verify-failed". Optional + best-effort: the stub omits it; a failure
    *  here just yields no extra detail and the step stays "verify-failed". */
   diagnoseCrash?(project: Project, url: string): Promise<string | undefined>;
+  /** Apply the tenant's database schema to its provisioned database using
+   *  the freshly-built image, BEFORE the app container goes live. Returns
+   *  whether the migration succeeded plus a log tail for the step trace.
+   *  Optional: the stub omits it (no real DB); the Coolify plane runs the
+   *  project's `prisma migrate deploy` / `db push` against `DATABASE_URL`.
+   *  When present, the pipeline GATES the deploy on it — a failure fails the
+   *  deploy with `migrate-failed:<reason>` instead of booting the app against
+   *  an empty schema (the P2021 "table does not exist" trap). A no-op that
+   *  returns `{ ok: true }` when the project has no migrations / no Prisma
+   *  schema, so non-database apps deploy unchanged. */
+  runMigration?(
+    project: Project,
+    imageRef: string,
+    env: Record<string, string>,
+  ): Promise<{ ok: boolean; log?: string }>;
 }
 
 /** Emitted once for each pipeline step as it completes. The HTTP SSE
@@ -272,6 +287,45 @@ export async function runDeploy(
   const { imageRef } = await dataPlane.buildImage(project, input.source);
   await emit("image-built");
 
+  // 4b — migrate the project's database BEFORE anything serves traffic.
+  // Step 3 provisioned an EMPTY Postgres and injected DATABASE_URL; without
+  // applying the tenant's schema now, the app would boot against schema-less
+  // tables and every query would throw P2021 ("table does not exist") — a
+  // deploy that reports "live" while being broken. Gate the deploy on it:
+  // a failed migration fails the deploy (symmetric with build-failed) and
+  // the container never starts. Data planes that don't implement
+  // runMigration keep the old behaviour. `env` (incl. DATABASE_URL) is
+  // computed once here and reused by startContainer below.
+  const env = toEnvMap(await store.listEnvVars(project.id), isPreview);
+  if (dataPlane.runMigration) {
+    let migration: { ok: boolean; log?: string };
+    try {
+      migration = await dataPlane.runMigration(project, imageRef, env);
+    } catch (err) {
+      migration = { ok: false, log: err instanceof Error ? err.message : String(err) };
+    }
+    if (!migration.ok) {
+      const reason = (migration.log ?? "migration failed").slice(0, 600);
+      await emit(`migrate-failed:${reason}`);
+      await store.updateDeployment(deployment.id, {
+        status: "failed",
+        imageRef,
+        logs: steps,
+      });
+      if (!isPreview) {
+        await store.updateProject(project.id, { status: "crashed" });
+      }
+      return {
+        deploymentId: deployment.id,
+        status: "failed",
+        url: "",
+        steps,
+        provisioned,
+      };
+    }
+    await emit("migrated");
+  }
+
   // 5 — schedule
   const { nodeId } = await dataPlane.schedule(project);
   await emit(`scheduled:${nodeId}`);
@@ -280,8 +334,8 @@ export async function runDeploy(
   // (the Coolify plane awaits its deployment and throws with the build-log
   // tail). Record it as a failed deployment instead of letting the row
   // rot in "building" — and keep the error text in the step trace so
-  // `cantila logs` / troubleshoot show WHY.
-  const env = toEnvMap(await store.listEnvVars(project.id), isPreview);
+  // `cantila logs` / troubleshoot show WHY. `env` was computed above (before
+  // the migration step) and includes the injected DATABASE_URL.
   try {
     await dataPlane.startContainer(project, imageRef, nodeId, env);
   } catch (err) {
