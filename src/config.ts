@@ -60,6 +60,18 @@ export const config = {
   giteaUrl: process.env.GITEA_URL ?? "",
   /** Gitea admin API token used to create orgs/repos and read/write files. */
   giteaToken: process.env.GITEA_TOKEN ?? "",
+  /** Cantila-native git backend (plan §22 — drop the Gitea bundle). When
+   *  `CANTILA_GIT=native`, repoHost="cantila" projects resolve to the
+   *  NativeGitProvider (bare repo per project on box 1) instead of Gitea.
+   *  Unset → Gitea (back-compat). Reversible env flip. */
+  nativeGit: (process.env.CANTILA_GIT ?? "") === "native",
+  /** Filesystem root for per-project bare repos. */
+  nativeGitRoot: process.env.CANTILA_GIT_ROOT ?? "/srv/cantila-git",
+  /** Public base for clone URLs the native backend hands back (served by
+   *  git http-backend behind Traefik at the same git.cantila.app shape). */
+  nativeGitPublicBase: (
+    process.env.CANTILA_GIT_PUBLIC_BASE ?? "https://git.cantila.app"
+  ).replace(/\/+$/, ""),
   /** Product-layer LLM provider (plan §5.6). Defaults reproduce the
    *  original Anthropic/Claude behaviour exactly, so leaving these unset
    *  changes nothing. Set LLM_PROVIDER=openai (with OPENAI_API_KEY) to

@@ -5,14 +5,31 @@ import { parseRepo } from "../github/github-files";
 import { GitHubGitProvider } from "./github-provider";
 import { CantilaGitProvider } from "./cantila-provider";
 import { StubGitProvider } from "./stub-provider";
+import {
+  NativeGitProvider,
+  makeGitExec,
+  makeNativeGitFs,
+} from "./native-provider";
 
 // Singletons — providers are stateless except the stub (which holds the
 // in-memory store, so dev edits persist across calls within a process).
 const githubProvider = new GitHubGitProvider(config.githubToken);
 const stubProvider = new StubGitProvider();
-const cantilaProvider = config.giteaUrl
-  ? new CantilaGitProvider(config.giteaUrl, config.giteaToken)
+// The Cantila-backed provider for repoHost="cantila": the native git backend
+// (plan §22) when CANTILA_GIT=native, else Gitea, else the stub (offline).
+const nativeProvider = config.nativeGit
+  ? new NativeGitProvider({
+      root: config.nativeGitRoot,
+      publicBase: config.nativeGitPublicBase,
+      exec: makeGitExec(),
+      fs: makeNativeGitFs(),
+    })
   : null;
+const cantilaProvider =
+  nativeProvider ??
+  (config.giteaUrl
+    ? new CantilaGitProvider(config.giteaUrl, config.giteaToken)
+    : null);
 
 export type AccountLike = { id: string; handle: string };
 export type ProjectLike = { repoHost?: string | null; repoUrl?: string | null; slug: string };
