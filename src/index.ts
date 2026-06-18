@@ -15,6 +15,7 @@ import { backfillTenantMailboxes } from "./domain/backfill-mailboxes";
 import { mailboxProvisioner } from "./mail/provisioner";
 import { verifyMailInboundSecret } from "./mail/inbound-webhook-auth";
 import { createMailInboundPoller } from "./mail/imap-inbound";
+import { makeResolveInboundProject } from "./mail/resolve-inbound-project";
 import { selectDataPlane } from "./dataplane/factory";
 import { selectProvisioner } from "./dataplane/coolify-provisioner";
 import { ControlPlane } from "./core/control-plane";
@@ -4485,15 +4486,17 @@ app
     app.log.info("background jobs started (uptime sweeps every 30s)");
     // Inbound mail bridge (plan §20.11): pull mail off the Mailcow node over
     // IMAP and feed it to receiveInboundMail. Dormant unless MAILCOW_IMAP_* is
-    // set — null poller otherwise, so today's behaviour is unchanged. Routes
-    // a recipient to its owning project via the hosted-mailbox address index.
+    // set — null poller otherwise, so today's behaviour is unchanged. Routes a
+    // recipient to its owning project via an explicit HostedMailbox row first,
+    // then the project's own `<slug>.cantila.app` subdomain (the wildcard
+    // platform-default scheme — its `info@<slug>` inbox has no mailbox row).
     const inboundPoller = createMailInboundPoller({
-      resolveProject: async (to) => {
-        const mbx = await store.findHostedMailboxByAddress(
-          to.trim().toLowerCase(),
-        );
-        return mbx?.projectId ?? null;
-      },
+      resolveProject: makeResolveInboundProject({
+        findHostedMailboxByAddress: (address) =>
+          store.findHostedMailboxByAddress(address),
+        findDomainByHostname: (hostname) =>
+          store.findDomainByHostname(hostname),
+      }),
       deliver: async (projectId, msg) => {
         const r = await cp.receiveInboundMail(projectId, msg);
         return { ok: !("error" in r) };
