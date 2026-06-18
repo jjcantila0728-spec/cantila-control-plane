@@ -14,6 +14,7 @@ import { reconcileProjectMailboxes } from "./domain/reconcile-mailboxes";
 import { backfillTenantMailboxes } from "./domain/backfill-mailboxes";
 import { mailboxProvisioner } from "./mail/provisioner";
 import { verifyMailInboundSecret } from "./mail/inbound-webhook-auth";
+import { createMailInboundPoller } from "./mail/imap-inbound";
 import { selectDataPlane } from "./dataplane/factory";
 import { selectProvisioner } from "./dataplane/coolify-provisioner";
 import { ControlPlane } from "./core/control-plane";
@@ -4482,6 +4483,29 @@ app
     );
     cp.startBackgroundJobs();
     app.log.info("background jobs started (uptime sweeps every 30s)");
+    // Inbound mail bridge (plan §20.11): pull mail off the Mailcow node over
+    // IMAP and feed it to receiveInboundMail. Dormant unless MAILCOW_IMAP_* is
+    // set — null poller otherwise, so today's behaviour is unchanged. Routes
+    // a recipient to its owning project via the hosted-mailbox address index.
+    const inboundPoller = createMailInboundPoller({
+      resolveProject: async (to) => {
+        const mbx = await store.findHostedMailboxByAddress(
+          to.trim().toLowerCase(),
+        );
+        return mbx?.projectId ?? null;
+      },
+      deliver: async (projectId, msg) => {
+        const r = await cp.receiveInboundMail(projectId, msg);
+        return { ok: !("error" in r) };
+      },
+      log: (m) => app.log.info(m),
+    });
+    if (inboundPoller) {
+      const everyMs =
+        Number(process.env.MAILCOW_IMAP_POLL_MS ?? "60000") || 60000;
+      inboundPoller.start(everyMs);
+      app.log.info(`mail inbound poller started (every ${everyMs}ms)`);
+    }
   })
   .catch((err) => {
     app.log.error(err);
