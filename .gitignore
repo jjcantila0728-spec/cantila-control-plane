@@ -7,3 +7,7 @@ dist/
 
 # Prisma generated client
 /src/generated/
+
+# Scratch Coolify API dumps
+/apps.json
+/hp.json

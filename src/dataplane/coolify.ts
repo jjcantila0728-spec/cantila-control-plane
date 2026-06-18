@@ -26,8 +26,10 @@
 import { generateKeyPairSync, createPublicKey } from "node:crypto";
 import type { Project, ProjectMetricSample, Region, Runtime } from "../domain/types";
 import type { DataPlane, DeploySource } from "../deploy/pipeline";
+import type { ImageBuilder } from "../deploy/image-builder";
 import type { MetricsCollector } from "./metrics-collector";
 import type { RpsCollector } from "./rps-collector";
+import { synthesiseMetrics, hashSeed } from "./metrics-synth";
 
 /** Per-region Coolify panel binding (plan §19.8 multi-server). Phase 3
  *  uses one Coolify panel per region — this carries each panel's URL,
@@ -109,6 +111,13 @@ export interface CoolifyDataPlaneOptions {
   /** Gitea admin token, used to register each project's deploy key on
    *  its repo. */
   giteaToken?: string;
+  /** Optional off-box image builder (plan 2026-06-18 §Stage 1). When wired,
+   *  `buildImage` asks it to build + push the project's image to a registry;
+   *  the returned ref makes Coolify *pull* the pre-built image instead of
+   *  building from source on the production box (the fast-build path). When
+   *  the builder declines (no repo, compose app, long-tail stack) the deploy
+   *  falls back to today's Coolify source build, so this is purely additive. */
+  imageBuilder?: ImageBuilder;
 }
 
 /** Concrete per-project routing — apiUrl/apiToken/serverUuid/projectUuid
@@ -156,6 +165,7 @@ export class CoolifyDataPlane implements DataPlane {
   private readonly rpsCollector?: RpsCollector;
   private readonly giteaApiUrl?: string;
   private readonly giteaToken?: string;
+  private readonly imageBuilder?: ImageBuilder;
 
   constructor(opts: CoolifyDataPlaneOptions) {
     this.defaultApiUrl = opts.apiUrl.replace(/\/+$/, "");
@@ -167,6 +177,7 @@ export class CoolifyDataPlane implements DataPlane {
     this.rpsCollector = opts.rpsCollector;
     this.giteaApiUrl = opts.giteaApiUrl?.replace(/\/+$/, "") || undefined;
     this.giteaToken = opts.giteaToken || undefined;
+    this.imageBuilder = opts.imageBuilder;
 
     const regions = new Map<Region, ResolvedRegionGroup>();
     if (opts.regions && Object.keys(opts.regions).length > 0) {
@@ -241,9 +252,32 @@ export class CoolifyDataPlane implements DataPlane {
   }
 
   async buildImage(
-    _project: Project,
+    project: Project,
     source: DeploySource,
   ): Promise<{ imageRef: string }> {
+    // Fast-build path (plan 2026-06-18 §Stage 1): when an off-box image
+    // builder is wired, build + push the project's image to a registry and
+    // return the registry ref. `startContainer` recognises a real image ref
+    // and configures Coolify to *pull* it instead of building from source on
+    // the production box (Nixpacks cold builds are the dominant cost). The
+    // builder declines (returns null) for repos it can't build into a single
+    // image — no repo, docker-compose apps, long-tail stacks — and we fall
+    // back to today's source build, so this is purely additive.
+    if (this.imageBuilder && source.kind === "git" && project.repoUrl) {
+      const built = await this.imageBuilder
+        .build({ project, ref: source.ref })
+        .catch((err) => {
+          console.warn(
+            `[coolify] off-box image build failed for ${project.id}, ` +
+              `falling back to source build: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+          );
+          return null;
+        });
+      if (built) return { imageRef: built.imageRef };
+    }
+
     // Coolify builds atomically during deploy for git sources, so there
     // is no separate image-build step on this side — return a stable
     // placeholder so the Deployment row records something. For an
@@ -274,11 +308,24 @@ export class CoolifyDataPlane implements DataPlane {
     env: Record<string, string>,
   ): Promise<void> {
     const region = this.regionFor(project);
+    // A real registry ref means the off-box builder produced a pullable image
+    // (plan 2026-06-18 §Stage 1). We then run Coolify in pull-only mode: the
+    // app is (or becomes) a docker-image app pointed at the built tag, and we
+    // skip the source-build bookkeeping (build pack, build-time env). A
+    // placeholder ref (`coolify:pending`) keeps the legacy source-build path.
+    const pulling = isImageRef(imageRef);
     // Lookup precedence: in-memory cache → persisted Project column →
     // Coolify's app list (slow, scanned by name) → create.
     let uuid = await this.findAppUuid(project);
     if (!uuid) {
       uuid = await this.createApp(project, imageRef);
+    } else if (pulling) {
+      // Existing app (created on a prior deploy): point it at the freshly
+      // built image tag so this deploy pulls the new bytes. For an app that
+      // was originally a git app, this also converts its source to the
+      // registry image. Best-effort — a legacy app that won't convert just
+      // keeps source-building (no worse than before, no speedup for it).
+      await this.ensureDockerImageSource(uuid, imageRef, region);
     }
     // Memoize + persist whatever uuid we ended up with so the next
     // deploy / restart skips straight to env-sync + redeploy.
@@ -297,17 +344,30 @@ export class CoolifyDataPlane implements DataPlane {
     // tenant's Prisma schema is applied to its (freshly-provisioned, empty)
     // Postgres in this very deploy — otherwise the app boots against a
     // schema-less DB and every query throws P2021 ("table does not exist").
+    // Applies to both the source-build and pull paths (the built image
+    // carries prisma + the schema, so the pre-deploy hook runs the same way).
     await this.ensureMigrateHook(uuid, region);
 
-    // Converge the Coolify build pack with the project's declared runtime.
-    // Without this, an app created before the project was switched to
-    // `runtime: docker` (or created by an older control plane that always
-    // chose nixpacks) keeps building with Nixpacks forever — which turns a
-    // Vite repo into a static Caddy site whose SPA fallback shadows /api/*.
-    await this.ensureBuildPack(uuid, project, region);
+    // Source-build bookkeeping only — skip it entirely when pulling a
+    // pre-built image. Converge the Coolify build pack with the project's
+    // declared runtime; without this, an app created before the project was
+    // switched to `runtime: docker` (or created by an older control plane
+    // that always chose nixpacks) keeps building with Nixpacks forever —
+    // which turns a Vite repo into a static Caddy site whose SPA fallback
+    // shadows /api/*. For a pull app, forcing a build pack would be wrong.
+    if (!pulling) {
+      await this.ensureBuildPack(uuid, project, region);
+    }
 
-    // Push env vars (best-effort — Coolify returns 200 even for already-set keys).
-    await this.syncEnv(uuid, env, region, buildPackFor(project).build_pack);
+    // Push env vars (best-effort — Coolify returns 200 even for already-set
+    // keys). Build-time vars (NPM_CONFIG_PRODUCTION etc.) only matter for the
+    // source-build path; a pulled image is already built, so omit them.
+    await this.syncEnv(
+      uuid,
+      env,
+      region,
+      pulling ? undefined : buildPackFor(project).build_pack,
+    );
 
     // Trigger a fresh deploy. For an existing app this is a redeploy that
     // rebuilds the image from source and rolls the container.
@@ -907,6 +967,35 @@ export class CoolifyDataPlane implements DataPlane {
     }
   }
 
+  /** Point an existing Coolify app at a pre-built registry image (plan
+   *  2026-06-18 §Stage 1). PATCHes `docker_registry_image_name` +
+   *  `docker_registry_image_tag` so the next `/deploy` pulls the freshly
+   *  built tag instead of rebuilding from source. For an app originally
+   *  created as a git app this also converts it to image-pull mode.
+   *  Best-effort: a legacy app Coolify won't convert simply keeps
+   *  source-building (no regression, just no speedup for that app). */
+  private async ensureDockerImageSource(
+    appUuid: string,
+    imageRef: string,
+    region: ResolvedRegion,
+  ): Promise<void> {
+    const { image, tag } = splitImageRef(imageRef);
+    try {
+      await this.request(
+        "PATCH",
+        `/applications/${encodeURIComponent(appUuid)}`,
+        { docker_registry_image_name: image, docker_registry_image_tag: tag },
+        region,
+      );
+    } catch (err) {
+      console.warn(
+        `[coolify] could not point ${appUuid} at pre-built image ${imageRef}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
   /** Poll a Coolify deployment until it reaches a terminal state.
    *  Throws on `failed`/`cancelled` with the build-log tail so the
    *  pipeline (and ultimately the operator) sees WHY the build broke
@@ -1331,108 +1420,6 @@ function splitImageRef(ref: string): { image: string; tag: string } {
   return { image: trimmed, tag: "latest" };
 }
 
-function synthesiseMetrics(
-  project: Project,
-  liveStatus?: string,
-  reading?: { cpuPct: number; memPct: number; replicas: number } | null,
-  rpsReading?: { rps: number } | null,
-): ProjectMetricSample[] {
-  const SAMPLE_COUNT = 12;
-  const INTERVAL_MS = 5_000;
-  const now = Date.now();
-  const seed = hashSeed(project.id);
-  // Coolify is the source of truth for whether the container is up
-  // when we have its status; otherwise fall back to the Cantila side.
-  const effectiveStatus = mapCoolifyStatus(liveStatus) ?? project.status;
-  // When a real reading is available, anchor CPU + memory to it so
-  // gauges + ScaleAgent see ground truth on the latest sample. The
-  // historical samples still smooth around it so the sparkline reads
-  // like a series, not a single dot.
-  const baseCpu = reading
-    ? reading.cpuPct
-    : effectiveStatus === "live"
-      ? 25 + (seed % 30)
-      : effectiveStatus === "sleeping"
-        ? 2 + (seed % 5)
-        : 0;
-  // Anchor RPS to the real Traefik reading when available; otherwise
-  // fall back to the status-derived baseline. A reading of exactly 0
-  // is still a real measurement (the app is up but idle), so we
-  // accept zero through the conditional rather than degrading to
-  // synthesis.
-  const baseRps = rpsReading
-    ? rpsReading.rps
-    : effectiveStatus === "live"
-      ? 4 + (seed % 12)
-      : effectiveStatus === "sleeping"
-        ? 0.1 + (seed % 5) / 10
-        : 0;
-  const baseMem = reading
-    ? reading.memPct
-    : effectiveStatus === "live" || effectiveStatus === "sleeping"
-      ? 35 + (seed % 25)
-      : 0;
-  const out: ProjectMetricSample[] = [];
-  for (let i = SAMPLE_COUNT - 1; i >= 0; i--) {
-    const at = new Date(now - i * INTERVAL_MS).toISOString();
-    // Without a real reading, a "down" status zeroes everything.
-    // With a real reading, we trust the container — `docker stats`
-    // only emits a row when the container is running, so a reading
-    // implies live.
-    if (
-      !reading &&
-      (effectiveStatus === "crashed" ||
-        effectiveStatus === "paused" ||
-        effectiveStatus === "provisioning" ||
-        effectiveStatus === "building")
-    ) {
-      out.push({ at, cpuPct: 0, memPct: 0, rps: 0 });
-      continue;
-    }
-    const jitter = (Math.random() - 0.5) * 0.2;
-    // The newest sample (i === 0) lands exactly on the real reading
-    // when present — no jitter — so the Console gauge and the
-    // /metrics endpoint match what the operator would see on the
-    // host directly. The older samples get smooth-jitter.
-    const cpuJ = i === 0 && reading ? 0 : jitter;
-    const memJ = i === 0 && reading ? 0 : jitter * 0.5;
-    // Newest sample anchors to the real Traefik RPS (no jitter) when
-    // a reading is present; older samples smooth around it like CPU
-    // + memory do.
-    const rpsJ = i === 0 && rpsReading ? 0 : jitter;
-    out.push({
-      at,
-      cpuPct: Math.round(clamp(baseCpu * (1 + cpuJ), 0, 100) * 10) / 10,
-      memPct: Math.round(clamp(baseMem * (1 + memJ), 0, 100) * 10) / 10,
-      rps: Math.round(Math.max(0, baseRps * (1 + rpsJ)) * 10) / 10,
-    });
-  }
-  return out;
-}
-
-/** Translate a Coolify resource status string into the Cantila
- *  Project status vocabulary so `synthesiseMetrics` has one decision
- *  axis. Returns `undefined` when the input is unrecognised — the
- *  caller then uses the Cantila-side status instead. */
-function mapCoolifyStatus(
-  s: string | undefined,
-): "live" | "sleeping" | "crashed" | "paused" | undefined {
-  if (!s) return undefined;
-  const lower = s.toLowerCase();
-  if (lower.startsWith("running")) return "live";
-  if (lower.startsWith("exited") || lower.startsWith("dead")) return "crashed";
-  if (lower.startsWith("paused")) return "paused";
-  if (lower.startsWith("restarting") || lower.startsWith("created"))
-    return "sleeping";
-  return undefined;
-}
-
-function hashSeed(s: string): number {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
-  return Math.abs(h);
-}
-
 /** Collapse the (possibly redundant) single-server + multi-server
  *  fields on a `CoolifyRegionConfig` into one deduped, ordered list.
  *  `servers` wins when both are set (the explicit-multi form); a lone
@@ -1452,8 +1439,4 @@ function resolveRegionServers(cfg: CoolifyRegionConfig): string[] {
     add(cfg.serverUuid);
   }
   return out;
-}
-
-function clamp(v: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, v));
 }

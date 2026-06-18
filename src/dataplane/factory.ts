@@ -12,6 +12,14 @@ import type { Region } from "../domain/types";
 import { stubDataPlane } from "./stub";
 import { CoolifyDataPlane, type CoolifyRegionConfig } from "./coolify";
 import {
+  BuildxImageBuilder,
+  noopImageBuilder,
+  type ImageBuilder,
+} from "../deploy/image-builder";
+import { createNodeBuildHost } from "../deploy/image-builder-host";
+import { VpsDataPlane, type VpsRegistryAuth } from "./vps";
+import { systemSshRunner } from "./ssh-exec";
+import {
   SshDockerStatsCollector,
   type SshTarget,
 } from "./ssh-docker-stats";
@@ -76,6 +84,58 @@ function parseRegions(
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Build the off-box image builder from env (plan 2026-06-18 §Stage 1).
+ *  Enabled by `CANTILA_BUILDER=buildx` + a registry; otherwise returns the
+ *  noop builder and the data plane builds from source exactly as today.
+ *
+ *  Recognised vars:
+ *    CANTILA_BUILDER=buildx            — turn the fast-build path on
+ *    CANTILA_REGISTRY_URL              — registry host (defaults to the
+ *                                        host of GITEA_URL when unset)
+ *    CANTILA_REGISTRY_NAMESPACE        — path namespace (default `cantila`)
+ *    CANTILA_REGISTRY_USER / _PASSWORD — registry login (default to
+ *                                        GITEA_USER / GITEA_TOKEN)
+ *
+ *  Returns `{ builder, label }` — `label` is appended to the data-plane
+ *  label so logs show whether fast builds are active. */
+export function selectImageBuilder(env: NodeJS.ProcessEnv): {
+  builder: ImageBuilder;
+  label?: string;
+} {
+  if (env.CANTILA_BUILDER?.trim().toLowerCase() !== "buildx") {
+    return { builder: noopImageBuilder };
+  }
+  const giteaUrl = env.GITEA_URL?.trim();
+  const giteaHost = giteaUrl ? safeHost(giteaUrl) : undefined;
+  const registry = env.CANTILA_REGISTRY_URL?.trim() || giteaHost;
+  if (!registry) {
+    console.warn(
+      "[dataplane] CANTILA_BUILDER=buildx but no CANTILA_REGISTRY_URL " +
+        "(and no GITEA_URL to derive one) — staying on source build",
+    );
+    return { builder: noopImageBuilder };
+  }
+  const host = createNodeBuildHost({
+    registry,
+    registryUser: env.CANTILA_REGISTRY_USER?.trim() || env.GITEA_USER?.trim(),
+    registryPassword:
+      env.CANTILA_REGISTRY_PASSWORD?.trim() || env.GITEA_TOKEN?.trim(),
+  });
+  const builder = new BuildxImageBuilder(host, {
+    registry,
+    namespace: env.CANTILA_REGISTRY_NAMESPACE?.trim() || undefined,
+  });
+  return { builder, label: "buildx" };
+}
+
+function safeHost(url: string): string | undefined {
+  try {
+    return new URL(url).host;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseDefaultRegion(env: NodeJS.ProcessEnv): Region | undefined {
@@ -168,10 +228,75 @@ function parseTraefikTargets(
   return out;
 }
 
+/** SSH targets for the VPS data plane (plan 2026-06-18 §Stage 2). One host
+ *  via `CANTILA_VPS_HOST`, or several via `CANTILA_VPS_HOSTS` (comma list);
+ *  all share `CANTILA_VPS_USER` / `_PORT` / `_KEY_PATH`. */
+function parseVpsNodes(env: NodeJS.ProcessEnv): SshTarget[] {
+  const user = env.CANTILA_VPS_USER?.trim() || undefined;
+  const port = parsePort(env.CANTILA_VPS_PORT);
+  const privateKeyPath = env.CANTILA_VPS_KEY_PATH?.trim() || undefined;
+  const multi = env.CANTILA_VPS_HOSTS?.trim();
+  const hosts = multi
+    ? multi.split(",").map((h) => h.trim()).filter(Boolean)
+    : [env.CANTILA_VPS_HOST?.trim()].filter((h): h is string => !!h);
+  return hosts.map((host) => ({ host, user, port, privateKeyPath }));
+}
+
+/** Registry auth for `docker login` / image push — shared by the VPS
+ *  data plane and the image builder. Defaults to Gitea creds. */
+function parseRegistryAuth(env: NodeJS.ProcessEnv): VpsRegistryAuth | undefined {
+  const url =
+    env.CANTILA_REGISTRY_URL?.trim() ||
+    (env.GITEA_URL ? safeHost(env.GITEA_URL.trim()) : undefined);
+  if (!url) return undefined;
+  return {
+    url,
+    user: env.CANTILA_REGISTRY_USER?.trim() || env.GITEA_USER?.trim(),
+    password: env.CANTILA_REGISTRY_PASSWORD?.trim() || env.GITEA_TOKEN?.trim(),
+  };
+}
+
 export function selectDataPlane(
   env: NodeJS.ProcessEnv = process.env,
   opts: SelectDataPlaneOptions = {},
 ): DataPlaneSelection {
+  // Direct-to-VPS data plane (plan 2026-06-18 §Stage 2) — selected ahead of
+  // Coolify when `CANTILA_DATAPLANE=vps` and at least one VPS host is set.
+  // Coolify config can stay in place untouched so flipping the flag back is
+  // an instant rollback.
+  if (env.CANTILA_DATAPLANE?.trim().toLowerCase() === "vps") {
+    const nodes = parseVpsNodes(env);
+    if (nodes.length === 0) {
+      console.warn(
+        "[dataplane] CANTILA_DATAPLANE=vps but no CANTILA_VPS_HOST(S) set — " +
+          "falling back to Coolify/stub selection",
+      );
+    } else {
+      const { builder } = selectImageBuilder(env);
+      if (builder === noopImageBuilder) {
+        console.warn(
+          "[dataplane] VPS plane active but no image builder " +
+            "(set CANTILA_BUILDER=buildx + a registry) — only prebuilt/" +
+            "uploaded images will deploy; git sources will fail to build",
+        );
+      }
+      return {
+        dataPlane: new VpsDataPlane({
+          nodes,
+          ssh: systemSshRunner(),
+          imageBuilder: builder,
+          apexDomain: env.CANTILA_APEX_DOMAIN?.trim() || undefined,
+          network: env.CANTILA_VPS_NETWORK?.trim() || undefined,
+          entrypoint: env.CANTILA_VPS_TRAEFIK_ENTRYPOINT?.trim() || undefined,
+          certResolver: env.CANTILA_VPS_TRAEFIK_CERTRESOLVER?.trim() || undefined,
+          registry: parseRegistryAuth(env),
+        }),
+        label: `VPS (${nodes.length} node${nodes.length > 1 ? "s" : ""})`,
+        live: true,
+      };
+    }
+  }
+
   const apiUrl = env.COOLIFY_API_URL?.trim();
   const apiToken = env.COOLIFY_API_TOKEN?.trim();
   let regions = parseRegions(env);
@@ -239,11 +364,15 @@ export function selectDataPlane(
         )
       : (legacyServers?.length ?? 0) > 1;
 
+    const { builder: imageBuilder, label: builderLabel } =
+      selectImageBuilder(env);
+
     const liveLabel = buildLiveLabel({
       multiRegion: !!regions && Object.keys(regions).length > 1,
       multiNode: hasMultiNode,
       realMetrics: !!metricsCollector,
       realRps: !!rpsCollector,
+      builder: builderLabel,
     });
 
     return {
@@ -261,6 +390,7 @@ export function selectDataPlane(
         rpsCollector,
         giteaApiUrl: env.GITEA_URL?.trim() || undefined,
         giteaToken: env.GITEA_TOKEN?.trim() || undefined,
+        imageBuilder,
       }),
       label: liveLabel,
       live: true,
@@ -274,11 +404,13 @@ function buildLiveLabel(flags: {
   multiNode: boolean;
   realMetrics: boolean;
   realRps: boolean;
+  builder?: string;
 }): string {
   const parts: string[] = [];
   if (flags.multiRegion) parts.push("multi-region");
   if (flags.multiNode) parts.push("multi-node");
   if (flags.realMetrics) parts.push("real metrics");
   if (flags.realRps) parts.push("real rps");
+  if (flags.builder) parts.push(flags.builder);
   return parts.length === 0 ? "Coolify" : `Coolify (${parts.join(", ")})`;
 }
