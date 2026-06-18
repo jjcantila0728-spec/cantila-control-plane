@@ -17,6 +17,7 @@ import {
   type ImageBuilder,
 } from "../deploy/image-builder";
 import { createNodeBuildHost } from "../deploy/image-builder-host";
+import { sshBuildHost } from "../deploy/image-builder-ssh-host";
 import { VpsDataPlane, type VpsRegistryAuth } from "./vps";
 import { systemSshRunner } from "./ssh-exec";
 import {
@@ -98,6 +99,12 @@ function parseRegions(
  *    CANTILA_REGISTRY_USER / _PASSWORD — registry login (default to
  *                                        GITEA_USER / GITEA_TOKEN)
  *
+ *  Build host (plan §19.12 Phase 1, Path B): when a remote build node is
+ *  configured the build runs there over SSH (the control-plane container
+ *  has no docker), otherwise it falls back to the local docker host:
+ *    CANTILA_BUILD_SSH_HOST            — remote build node; enables sshBuildHost
+ *    CANTILA_BUILD_SSH_USER / _PORT / _KEY_PATH — SSH connection details
+ *
  *  Returns `{ builder, label }` — `label` is appended to the data-plane
  *  label so logs show whether fast builds are active. */
 export function selectImageBuilder(env: NodeJS.ProcessEnv): {
@@ -117,17 +124,44 @@ export function selectImageBuilder(env: NodeJS.ProcessEnv): {
     );
     return { builder: noopImageBuilder };
   }
-  const host = createNodeBuildHost({
-    registry,
-    registryUser: env.CANTILA_REGISTRY_USER?.trim() || env.GITEA_USER?.trim(),
-    registryPassword:
-      env.CANTILA_REGISTRY_PASSWORD?.trim() || env.GITEA_TOKEN?.trim(),
-  });
+  const registryUser =
+    env.CANTILA_REGISTRY_USER?.trim() || env.GITEA_USER?.trim();
+  const registryPassword =
+    env.CANTILA_REGISTRY_PASSWORD?.trim() || env.GITEA_TOKEN?.trim();
+
+  // Prefer a dedicated build node over SSH when configured (prod: the app
+  // container has no docker). Otherwise build on the local docker host
+  // (dev / a host that does have buildx).
+  const buildSsh = parseBuildSshTarget(env);
+  const host = buildSsh
+    ? sshBuildHost({
+        ssh: systemSshRunner(),
+        target: buildSsh,
+        registry,
+        registryUser,
+        registryPassword,
+      })
+    : createNodeBuildHost({ registry, registryUser, registryPassword });
+
   const builder = new BuildxImageBuilder(host, {
     registry,
     namespace: env.CANTILA_REGISTRY_NAMESPACE?.trim() || undefined,
   });
-  return { builder, label: "buildx" };
+  return { builder, label: buildSsh ? "buildx (ssh)" : "buildx" };
+}
+
+/** SSH target for the dedicated build node (plan §19.12 Phase 1, Path B).
+ *  Returns undefined when `CANTILA_BUILD_SSH_HOST` is unset — the builder
+ *  then runs on the local docker host. */
+function parseBuildSshTarget(env: NodeJS.ProcessEnv): SshTarget | undefined {
+  const host = env.CANTILA_BUILD_SSH_HOST?.trim();
+  if (!host) return undefined;
+  return {
+    host,
+    user: env.CANTILA_BUILD_SSH_USER?.trim() || undefined,
+    port: parsePort(env.CANTILA_BUILD_SSH_PORT),
+    privateKeyPath: env.CANTILA_BUILD_SSH_KEY_PATH?.trim() || undefined,
+  };
 }
 
 function safeHost(url: string): string | undefined {

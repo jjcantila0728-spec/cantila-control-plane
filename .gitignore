@@ -11,3 +11,6 @@ dist/
 # Scratch Coolify API dumps
 /apps.json
 /hp.json
+
+# Local SSH keys for VPS data plane
+/.secrets/

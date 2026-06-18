@@ -39,3 +39,22 @@ test("registry derived from GITEA_URL host when CANTILA_REGISTRY_URL unset", () 
   assert.notEqual(builder, noopImageBuilder);
   assert.equal(label, "buildx");
 });
+
+test("CANTILA_BUILD_SSH_HOST → remote build host, label 'buildx (ssh)'", () => {
+  const { builder, label } = selectImageBuilder({
+    CANTILA_BUILDER: "buildx",
+    CANTILA_REGISTRY_URL: "git.cantila.app",
+    CANTILA_BUILD_SSH_HOST: "168.119.97.112",
+    CANTILA_BUILD_SSH_USER: "root",
+  });
+  assert.notEqual(builder, noopImageBuilder);
+  assert.equal(label, "buildx (ssh)");
+});
+
+test("no build SSH host → local builder, label 'buildx'", () => {
+  const { label } = selectImageBuilder({
+    CANTILA_BUILDER: "buildx",
+    CANTILA_REGISTRY_URL: "git.cantila.app",
+  });
+  assert.equal(label, "buildx");
+});

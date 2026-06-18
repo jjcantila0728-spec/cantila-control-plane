@@ -17,11 +17,19 @@ export interface SshExecResult {
   code: number;
 }
 
+export interface SshRunOptions {
+  /** When set, the string is piped to the remote command's stdin (and the
+   *  channel is closed). Used by the SSH build host's `writeFile`, which
+   *  pipes file content into `cat > path` rather than embedding it in the
+   *  command line. When unset, stdin is `/dev/null`. */
+  stdin?: string;
+}
+
 export interface SshRunner {
   /** Run `command` on `target`. Resolves with stdout on exit 0; rejects
    *  with an Error (message includes stderr tail) on non-zero or transport
-   *  failure. */
-  run(target: SshTarget, command: string): Promise<string>;
+   *  failure. Optionally pipes `opts.stdin` to the remote process. */
+  run(target: SshTarget, command: string, opts?: SshRunOptions): Promise<string>;
 }
 
 export interface SystemSshRunnerOptions {
@@ -37,7 +45,7 @@ export function systemSshRunner(opts: SystemSshRunnerOptions = {}): SshRunner {
   const timeoutMs = opts.timeoutMs ?? 600_000;
   const sshBinary = opts.sshBinary ?? "ssh";
   return {
-    run(target, command) {
+    run(target, command, opts) {
       return new Promise<string>((resolve, reject) => {
         const args: string[] = [
           "-o",
@@ -52,9 +60,14 @@ export function systemSshRunner(opts: SystemSshRunnerOptions = {}): SshRunner {
         if (target.privateKeyPath) args.push("-i", target.privateKeyPath);
         args.push(`${target.user ?? "root"}@${target.host}`, command);
 
+        const hasStdin = opts?.stdin !== undefined;
+        const stdin: "pipe" | "ignore" = hasStdin ? "pipe" : "ignore";
         const child = spawn(sshBinary, args, {
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: [stdin, "pipe", "pipe"] as const,
         });
+        if (hasStdin) {
+          child.stdin!.end(opts!.stdin);
+        }
         let stdout = "";
         let stderr = "";
         const timer = setTimeout(() => {
@@ -65,8 +78,8 @@ export function systemSshRunner(opts: SystemSshRunnerOptions = {}): SshRunner {
           }
           reject(new Error(`ssh timeout after ${timeoutMs}ms`));
         }, timeoutMs);
-        child.stdout.on("data", (b) => (stdout += b.toString("utf8")));
-        child.stderr.on("data", (b) => (stderr += b.toString("utf8")));
+        child.stdout!.on("data", (b) => (stdout += b.toString("utf8")));
+        child.stderr!.on("data", (b) => (stderr += b.toString("utf8")));
         child.on("error", (err) => {
           clearTimeout(timer);
           reject(err);
