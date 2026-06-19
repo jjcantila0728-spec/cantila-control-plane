@@ -19,6 +19,7 @@ import {
 import { createNodeBuildHost } from "../deploy/image-builder-host";
 import { sshBuildHost } from "../deploy/image-builder-ssh-host";
 import { VpsDataPlane, type VpsRegistryAuth } from "./vps";
+import { PlatformDeployer, PLATFORM_APPS } from "../deploy/platform-deployer";
 import { systemSshRunner } from "./ssh-exec";
 import {
   SshDockerStatsCollector,
@@ -148,6 +149,45 @@ export function selectImageBuilder(env: NodeJS.ProcessEnv): {
     namespace: env.CANTILA_REGISTRY_NAMESPACE?.trim() || undefined,
   });
   return { builder, label: buildSsh ? "buildx (ssh)" : "buildx" };
+}
+
+/** Build the PlatformDeployer that lets the control-plane self-deploy its own
+ *  platform apps (control-plane, console) from git, no Coolify (plan §19.12
+ *  Phase 2 follow-up — the durable replacement for scripts/ship-platform.sh).
+ *  Reuses the fast-build pipeline: requires `CANTILA_BUILDER=buildx` (so an
+ *  off-box image builder exists) AND a build SSH node (`CANTILA_BUILD_SSH_HOST`)
+ *  — the CP SSHes there to build off-box and to swap the live container.
+ *  Returns null when either is missing (manual ship-platform.sh stays the
+ *  fallback). */
+export function selectPlatformDeployer(
+  env: NodeJS.ProcessEnv,
+): PlatformDeployer | null {
+  const { builder, label } = selectImageBuilder(env);
+  // No label → noopImageBuilder (buildx off / no registry) → can't build.
+  if (!label) return null;
+  const node = parseBuildSshTarget(env);
+  if (!node) return null;
+
+  const giteaUrl = env.GITEA_URL?.trim();
+  const registryHost =
+    env.CANTILA_REGISTRY_URL?.trim() ||
+    (giteaUrl ? safeHost(giteaUrl) : undefined);
+  const registry: VpsRegistryAuth | undefined = registryHost
+    ? {
+        url: registryHost,
+        user: env.CANTILA_REGISTRY_USER?.trim() || env.GITEA_USER?.trim(),
+        password:
+          env.CANTILA_REGISTRY_PASSWORD?.trim() || env.GITEA_TOKEN?.trim(),
+      }
+    : undefined;
+
+  return new PlatformDeployer({
+    ssh: systemSshRunner(),
+    node,
+    imageBuilder: builder,
+    apps: PLATFORM_APPS,
+    registry,
+  });
 }
 
 /** SSH target for the dedicated build node (plan §19.12 Phase 1, Path B).

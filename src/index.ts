@@ -14,6 +14,7 @@ import { reconcileProjectMailboxes } from "./domain/reconcile-mailboxes";
 import { backfillTenantMailboxes } from "./domain/backfill-mailboxes";
 import { mailboxProvisioner } from "./mail/provisioner";
 import { verifyMailInboundSecret } from "./mail/inbound-webhook-auth";
+import { selectPlatformDeployer } from "./dataplane/factory";
 import { createMailInboundPoller } from "./mail/imap-inbound";
 import { makeResolveInboundProject } from "./mail/resolve-inbound-project";
 import { selectDataPlane } from "./dataplane/factory";
@@ -559,6 +560,10 @@ if (config.requireAuth) {
     // admin keys; the route layer handles that gate itself, so /v1/cantilapay/*
     // bypasses this top-level enforcement.
     if (url.startsWith("/v1/cantilapay/")) return;
+    // Operator-only platform self-deploy (plan §19.12 Phase 2 follow-up). These
+    // routes carry their OWN gate — the `CANTILA_ADMIN_TOKEN` admin token, same
+    // as /v1/auth/admin/* — so they bypass the API-key/session hook.
+    if (url.startsWith("/v1/platform/")) return;
     // Node-agent endpoints (plan §5.5 — BYO-VPS). The agent on the
     // tenant's box doesn't hold an API key — the raw enrollment token
     // it presents in the body is the credential, and the CP looks it
@@ -2703,6 +2708,44 @@ app.post("/v1/auth/admin/reset-password", async (request, reply) => {
     return reply
       .code(400)
       .send({ error: err instanceof Error ? err.message : "reset failed" });
+  }
+});
+
+// Operator-only: self-deploy a Cantila platform app (control-plane, console)
+// from git through the CP's own pipeline — the durable replacement for the
+// manual scripts/ship-platform.sh two-step after Coolify was dropped (plan
+// §19.12 Phase 2 follow-up). Builds the image off-box (buildx) + swaps the
+// live container over SSH, preserving its env + Traefik labels. Gated by
+// CANTILA_ADMIN_TOKEN like admin reset; 503 when unset so dev can't trigger
+// a prod deploy, 503 again when the fast-build pipeline isn't configured.
+app.post("/v1/platform/apps/:app/deploy", async (request, reply) => {
+  const adminToken = process.env.CANTILA_ADMIN_TOKEN;
+  if (!adminToken) {
+    return reply
+      .code(503)
+      .send({ error: "platform deploy disabled — CANTILA_ADMIN_TOKEN not set" });
+  }
+  const provided = request.headers["x-cantila-admin-token"];
+  if (typeof provided !== "string" || provided !== adminToken) {
+    return reply.code(403).send({ error: "forbidden" });
+  }
+  const { app: appName } = request.params as { app: string };
+  const body = (request.body ?? {}) as { ref?: unknown };
+  const ref = typeof body.ref === "string" ? body.ref : undefined;
+  const deployer = selectPlatformDeployer(process.env);
+  if (!deployer) {
+    return reply.code(503).send({
+      error:
+        "platform deployer not configured (needs CANTILA_BUILDER=buildx + CANTILA_BUILD_SSH_HOST)",
+    });
+  }
+  try {
+    const result = await deployer.deploy(appName, ref);
+    return reply.code(200).send(result);
+  } catch (err) {
+    return reply
+      .code(400)
+      .send({ error: err instanceof Error ? err.message : "deploy failed" });
   }
 });
 
