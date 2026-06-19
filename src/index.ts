@@ -17,6 +17,7 @@ import { verifyMailInboundSecret } from "./mail/inbound-webhook-auth";
 import { createMailInboundPoller } from "./mail/imap-inbound";
 import { makeResolveInboundProject } from "./mail/resolve-inbound-project";
 import { selectDataPlane } from "./dataplane/factory";
+import { materializeBuildSshKey, writeKeyFile } from "./dataplane/build-ssh-key";
 import { selectProvisioner } from "./dataplane/coolify-provisioner";
 import { ControlPlane } from "./core/control-plane";
 import type { ApiKey, AccountPlan } from "./domain/types";
@@ -101,6 +102,13 @@ const store = createStore();
 // each project's Coolify Application UUID on `Project.coolifyAppUuid`
 // instead of rebuilding the in-process cache from a full /applications
 // scan after every restart (plan §19).
+// Materialize the fast-build SSH key from its base64 env var (it must land on
+// disk before the factory reads CANTILA_BUILD_SSH_KEY_PATH — the container fs
+// is rebuilt each deploy, so the key persists in the env, not the image).
+{
+  const keyPath = materializeBuildSshKey(process.env, { writeKey: writeKeyFile });
+  if (keyPath) console.log(`[dataplane] build SSH key materialized at ${keyPath}`);
+}
 const dataPlaneSelection = selectDataPlane(process.env, { store });
 const dataPlane = dataPlaneSelection.dataPlane;
 console.log(`[dataplane] ${dataPlaneSelection.label} (${dataPlaneSelection.live ? "live" : "stub"})`);

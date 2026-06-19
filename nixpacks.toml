@@ -1,0 +1,7 @@
+# Coolify builds this app with Nixpacks. The fast-build path
+# (CANTILA_BUILDER=buildx) shells out to the system `ssh` binary to drive a
+# remote `docker buildx` build host (src/dataplane/ssh-exec.ts), so the
+# runtime image needs an SSH client. Additive — Nixpacks still auto-detects
+# the Node toolchain; this only appends the apt package.
+[phases.setup]
+aptPkgs = ["openssh-client"]
