@@ -28,9 +28,12 @@ htpasswd -bB "$HTPASSWD" "$NATIVE_GIT_TOKEN" "$NATIVE_GIT_TOKEN" 2>/dev/null
 # but set it defensively for any uid drift.
 git config --system --add safe.directory '*' || true
 
-# fcgiwrap on a unix socket nginx talks to.
+# fcgiwrap on a unix socket nginx talks to. The socket must be reachable by the
+# nginx worker user (`nginx`) — nginx drops privileges to it, so a root-owned
+# 0660 socket gives the worker `connect(): Permission denied` → 502. `-U/-G`
+# make spawn-fcgi create the socket owned by nginx:nginx.
 rm -f /run/fcgiwrap.sock
-spawn-fcgi -s /run/fcgiwrap.sock -F 4 -- /usr/bin/fcgiwrap >/dev/null 2>&1
+spawn-fcgi -s /run/fcgiwrap.sock -U nginx -G nginx -F 4 -- /usr/bin/fcgiwrap >/dev/null 2>&1
 chmod 660 /run/fcgiwrap.sock
 
 echo "native-git serving ${GIT_PROJECT_ROOT} on :${NATIVE_GIT_PORT:-80}"
