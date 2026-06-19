@@ -31,9 +31,20 @@ test("Next.js → multi-stage node Dockerfile with cached npm ci layer", () => {
   const ciIdx = df!.indexOf("RUN npm ci");
   const copyAllIdx = df!.indexOf("COPY . .");
   assert.ok(ciIdx > 0 && copyAllIdx > ciIdx, "npm ci must precede COPY . .");
-  assert.match(df!, /COPY package\*\.json \.\//);
+  assert.match(df!, /COPY package\*\.json \.npmrc\* \.\//);
   assert.match(df!, /EXPOSE 3000/);
   assert.match(df!, /ENV PORT=3000/);
+});
+
+test("node deps stage copies .npmrc so npm ci honors legacy-peer-deps", () => {
+  // The control-plane sets legacy-peer-deps=true in .npmrc (the Agent SDK
+  // peer-wants zod 4 while the repo stays on zod 3). Without copying .npmrc
+  // into the deps stage, `npm ci` hits the peer conflict and the build dies.
+  const df = generateDockerfile(stack({ stack: "Next.js", port: 3000 }))!;
+  const npmrcIdx = df.indexOf(".npmrc");
+  const ciIdx = df.indexOf("RUN npm ci");
+  assert.ok(npmrcIdx > 0, ".npmrc must be copied into the deps stage");
+  assert.ok(npmrcIdx < ciIdx, ".npmrc must be copied before npm ci");
 });
 
 test("node port flows into EXPOSE/PORT", () => {

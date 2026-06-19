@@ -65,7 +65,11 @@ function nodeDockerfile(port: number): string {
     "# syntax=docker/dockerfile:1",
     "FROM node:20-alpine AS deps",
     "WORKDIR /app",
-    "COPY package*.json ./",
+    // `.npmrc*` is optional (glob no-ops when absent) — copies it for apps
+    // that pin npm behaviour (e.g. the control-plane's legacy-peer-deps=true,
+    // needed because the Agent SDK peer-wants zod 4 vs the repo's zod 3) so
+    // `npm ci` doesn't die on a peer conflict.
+    "COPY package*.json .npmrc* ./",
     "RUN npm ci",
     "",
     "FROM node:20-alpine AS build",

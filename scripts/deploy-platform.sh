@@ -40,7 +40,9 @@ cat > "$src/Dockerfile.cantila" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1
 FROM node:20-alpine AS deps
 WORKDIR /app
-COPY package*.json ./
+# .npmrc* is optional — copies it when present (e.g. control-plane's
+# legacy-peer-deps=true) so npm ci doesn't die on a peer conflict.
+COPY package*.json .npmrc* ./
 RUN npm ci
 FROM node:20-alpine AS build
 WORKDIR /app
