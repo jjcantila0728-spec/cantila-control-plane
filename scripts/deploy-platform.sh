@@ -35,8 +35,16 @@ repo="${cn%-*}"                          # image repo name Coolify used
 tag="manual-$(date -u +%Y%m%d%H%M%S)"
 img="$repo:$tag"
 
-# --- canonical Node Dockerfile (mirrors src/deploy/dockerfiles.ts) ---
-cat > "$src/Dockerfile.cantila" <<'DOCKERFILE'
+# Build with the repo's OWN Dockerfile when present (e.g. control-plane needs
+# prisma + the Agent-SDK handled exactly — the cache-only deps stage of the
+# generic one can't run a prisma-generate install hook). Otherwise generate the
+# canonical Node Dockerfile (mirrors src/deploy/dockerfiles.ts).
+if [ -f "$src/Dockerfile" ]; then
+  dockerfile="$src/Dockerfile"
+  echo "[1/3] build $img  (from $src, repo Dockerfile)"
+else
+  dockerfile="$src/Dockerfile.cantila"
+  cat > "$dockerfile" <<'DOCKERFILE'
 # syntax=docker/dockerfile:1
 FROM node:20-alpine AS deps
 WORKDIR /app
@@ -56,9 +64,9 @@ COPY --from=build /app ./
 EXPOSE 3000
 CMD ["npm", "run", "start"]
 DOCKERFILE
-
-echo "[1/3] build $img  (from $src)"
-docker buildx build --load -f "$src/Dockerfile.cantila" -t "$img" "$src"
+  echo "[1/3] build $img  (from $src, generated canonical Dockerfile)"
+fi
+docker buildx build --load -f "$dockerfile" -t "$img" "$src"
 
 echo "[2/3] reconstruct run command from live $cn, swapping image -> $img"
 net="$(docker inspect "$cn" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
