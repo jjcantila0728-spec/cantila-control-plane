@@ -80,10 +80,10 @@ run="/root/build/$app/.run-$tag.sh"
   # env minus container-runtime defaults that belong to the image, not the app
   docker inspect "$cn" --format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -vE '^(PATH|HOME|HOSTNAME|TERM|NODE_VERSION|YARN_VERSION)=' \
-    | while IFS= read -r e; do [ -n "$e" ] && printf '  -e %q \\\n' "$e"; done
+    | while IFS= read -r e; do [ -n "$e" ] || continue; printf '  -e %q \\\n' "$e"; done
   # labels (keep Traefik routing + everything else Coolify set; harmless)
   docker inspect "$cn" --format '{{range $k,$v := .Config.Labels}}{{$k}}={{$v}}{{println}}{{end}}' \
-    | while IFS= read -r l; do [ -n "$l" ] && printf '  -l %q \\\n' "$l"; done
+    | while IFS= read -r l; do [ -n "$l" ] || continue; printf '  -l %q \\\n' "$l"; done
   echo "  $img"
 } > "$run"
 chmod +x "$run"
