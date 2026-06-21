@@ -80,6 +80,7 @@ import {
   checkArchiveCompleteness,
   formatIncompleteSourceError,
 } from "../deploy/check-source";
+import { summariseDeploys, type DeploySummary } from "../deploy/deploy-metrics";
 import { UptimeChecker, type UptimeMonitor } from "../monitoring/uptime";
 import { AgentBrain, createDefaultBrain } from "../agents";
 import type { AgentName, BrainSnapshot } from "../agents";
@@ -5085,6 +5086,21 @@ export class ControlPlane {
       totalSavingsCentsPerMonth: total,
       recommendations,
     };
+  }
+
+  /** Account-wide Chat-Deploy success metrics (top-tier program #8/#13):
+   *  success rate, failure-reason breakdown, and per-trigger totals across
+   *  every deployment in the account's projects. Pure aggregation over the
+   *  persisted Deployment records — no new storage. The Console renders this
+   *  as the deploy-health panel. */
+  async getDeployMetrics(accountId: string): Promise<DeploySummary> {
+    const projects = await this.deps.store.listProjects(accountId);
+    const allDeploys = (
+      await Promise.all(
+        projects.map((p) => this.deps.store.listDeployments(p.id)),
+      )
+    ).flat();
+    return summariseDeploys(allDeploys);
   }
 
   /** Inspect a deployment and return a plain-language explanation of what

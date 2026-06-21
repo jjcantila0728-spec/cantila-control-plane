@@ -3587,6 +3587,12 @@ app.get("/v1/cost/optimise", async (request) => {
   return cp.getCostOptimisation(resolveAccountId(request));
 });
 
+// Chat-Deploy success metrics (top-tier program #8/#13) — account-wide
+// success rate + failure-reason breakdown + per-trigger totals.
+app.get("/v1/deploy/metrics", async (request) => {
+  return cp.getDeployMetrics(resolveAccountId(request));
+});
+
 // Monitoring (plan §5.3) — uptime monitors + active alerts + summary.
 // ?fresh=1 forces a sweep right now (slower but the snapshot is current to
 // the millisecond). Without it, the snapshot is whatever the periodic
