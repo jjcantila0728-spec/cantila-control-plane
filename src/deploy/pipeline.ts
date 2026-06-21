@@ -20,6 +20,7 @@ import {
   type WorkspaceProvisioner,
 } from "./provisioning";
 import { id, now } from "../lib/ids";
+import { classifyFailure } from "./deploy-metrics";
 
 export interface DeploySource {
   kind: "git" | "upload" | "chat";
@@ -402,6 +403,24 @@ export async function runDeploy(
       status: healthy ? "live" : "crashed",
     });
   }
+
+  // Structured deploy-outcome line for Chat-Deploy success instrumentation
+  // (#8). One greppable JSON record per terminal deploy: trigger, status,
+  // time-to-live (or time-to-fail), and the failure bucket — feeds dashboards
+  // and the `[deploy]` log filter without any new storage.
+  const durationMs = Date.now() - new Date(deployment.createdAt).getTime();
+  console.log(
+    "[deploy] " +
+      JSON.stringify({
+        deploymentId: deployment.id,
+        projectId: project.id,
+        trigger: deployment.trigger,
+        status,
+        durationMs,
+        preview: isPreview,
+        reason: status === "failed" ? classifyFailure(steps) : undefined,
+      }),
+  );
 
   return { deploymentId: deployment.id, status, url, steps, provisioned };
 }
