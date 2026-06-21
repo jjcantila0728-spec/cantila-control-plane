@@ -212,6 +212,9 @@ for (const tool of cantilaTools(cp, { mobile: mobileService })) mcpServer.addToo
 const oauthProvider = new OAuthProvider({
   now: () => Date.now(),
   mintSession: (userId) => cp.mintSessionForOAuth(userId),
+  // Sign client_ids so MCP host registrations survive a redeploy + work
+  // across instances (otherwise a redeploy drops every connection).
+  secret: process.env.CANTILA_SECRET_KEY,
 });
 
 /** Public base URL for OAuth metadata + redirects. Prefer an explicit

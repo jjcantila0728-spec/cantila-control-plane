@@ -37,6 +37,44 @@ test("DCR registers a public client and echoes it back", () => {
   assert.ok(provider.getClient(client.client_id));
 });
 
+test("signed client_ids survive a redeploy — a fresh provider with the same secret still recognises the client", () => {
+  const secret = "test-secret-key-abc123";
+  const before = new OAuthProvider({
+    now: () => 1_000_000,
+    mintSession: async () => ({ token: "cts_x", expiresAt: "2026-06-08T00:00:00Z" }),
+    secret,
+  });
+  const reg = before.registerClient({
+    client_name: "Claude",
+    redirect_uris: ["https://claude.ai/api/mcp/auth_callback"],
+  });
+
+  // Simulate a control-plane redeploy: a brand-new provider, empty in-memory
+  // map, same signing secret. The cached client_id must still resolve.
+  const after = new OAuthProvider({
+    now: () => 2_000_000,
+    mintSession: async () => ({ token: "cts_x", expiresAt: "2026-06-08T00:00:00Z" }),
+    secret,
+  });
+  const recovered = after.getClient(reg.client_id);
+  assert.ok(recovered, "client must survive a redeploy");
+  assert.deepEqual(recovered!.redirectUris, [
+    "https://claude.ai/api/mcp/auth_callback",
+  ]);
+
+  // A different secret must NOT validate it (no cross-tenant forgery).
+  const wrong = new OAuthProvider({
+    now: () => 3_000_000,
+    mintSession: async () => ({ token: "cts_x", expiresAt: "2026-06-08T00:00:00Z" }),
+    secret: "different-secret",
+  });
+  assert.equal(wrong.getClient(reg.client_id), undefined);
+
+  // A tampered client_id (swapped redirect) must fail verification.
+  const tampered = reg.client_id.slice(0, -4) + "AAAA";
+  assert.equal(after.getClient(tampered), undefined);
+});
+
 test("DCR rejects a registration with no redirect_uris", () => {
   const { provider } = makeProvider();
   assert.throws(

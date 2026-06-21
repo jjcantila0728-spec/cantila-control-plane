@@ -74,9 +74,8 @@ test("getDeployMetrics counts only the caller's own account deployments", async 
   assert.equal(m.live, 2);
   assert.equal(m.failed, 1);
   assert.equal(m.successRatePct, Math.round((2 / 3) * 1000) / 10);
+  // deepEqual proves acc_b's health failure does NOT leak into acc_a's view.
   assert.deepEqual(m.byFailureReason, { build_failed: 1 });
-  // acc_b's health failure must be absent from acc_a's view.
-  assert.equal(m.byFailureReason.health_check_failed, undefined);
 
   const mb = await cp.getDeployMetrics("acc_b");
   assert.equal(mb.failed, 1);

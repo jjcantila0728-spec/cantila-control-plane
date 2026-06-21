@@ -1,12 +1,19 @@
-/* In-memory OAuth provider for the MCP connector (v1).
+/* OAuth provider for the MCP connector.
  *
- * Holds dynamically-registered (RFC 7591) clients + pending authorization
- * codes, and issues `cts_` Console sessions as access tokens via the
- * injected `mintSession`. In-memory is acceptable for v1 — single Coolify
- * instance, and the register→authorize→token window is seconds long.
- * Moving clients/codes to the Store (surviving restarts / multi-instance)
- * is a documented follow-up. */
-import { randomBytes } from "node:crypto";
+ * Issues `cts_` Console sessions as access tokens via the injected
+ * `mintSession`. Dynamically-registered (RFC 7591) clients are STATELESS:
+ * the client metadata (name + redirect_uris) is signed into the `client_id`
+ * itself with `secret` (HMAC-SHA256), so any instance can verify a client
+ * forever — registrations survive a control-plane redeploy AND work across
+ * multiple instances with no shared store. This fixes the "MCP connection
+ * drops after a deploy" class of bug: hosts (Claude, Cowork) cache their
+ * client_id and reuse it on re-auth, and the server must still recognise it.
+ *
+ * A short-lived in-memory map is kept only as a same-instance cache + as the
+ * fallback when no `secret` is configured (dev). Authorization codes stay
+ * in-memory: they live for ~60s between /authorize and /token, far shorter
+ * than a deploy window, so persisting them buys nothing. */
+import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
 import type { OAuthClient, OAuthAuthCode } from "./oauth";
 import { verifyPkceS256 } from "./pkce";
 
@@ -20,6 +27,49 @@ export interface OAuthProviderDeps {
   ) => Promise<{ token: string; expiresAt: string }>;
   /** Injectable clock (ms since epoch) for deterministic expiry tests. */
   now: () => number;
+  /** Signing key for stateless client_ids (CANTILA_SECRET_KEY in prod).
+   *  When unset, falls back to random opaque ids held only in memory. */
+  secret?: string;
+}
+
+/** Encode a stateless, signed client_id: `mcpc_<payload>.<sig>` where
+ *  payload is base64url(JSON{n,r,t}) and sig is HMAC-SHA256(secret, payload). */
+function signClientId(
+  secret: string,
+  meta: { clientName: string; redirectUris: string[]; createdAt: number },
+): string {
+  const payload = Buffer.from(
+    JSON.stringify({ n: meta.clientName, r: meta.redirectUris, t: meta.createdAt }),
+  ).toString("base64url");
+  const sig = createHmac("sha256", secret).update(payload).digest("base64url");
+  return `mcpc_${payload}.${sig}`;
+}
+
+/** Verify + decode a signed client_id. Returns null if it isn't a valid
+ *  signed id for this secret (tampered, wrong key, or legacy opaque id). */
+function verifyClientId(secret: string, clientId: string): OAuthClient | null {
+  if (!clientId.startsWith("mcpc_")) return null;
+  const body = clientId.slice("mcpc_".length);
+  const dot = body.indexOf(".");
+  if (dot <= 0) return null; // legacy opaque id (no signature segment)
+  const payload = body.slice(0, dot);
+  const sig = body.slice(dot + 1);
+  const expected = createHmac("sha256", secret).update(payload).digest("base64url");
+  const a = Buffer.from(sig);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (!Array.isArray(p.r) || p.r.length === 0) return null;
+    return {
+      clientId,
+      clientName: typeof p.n === "string" ? p.n : "MCP client",
+      redirectUris: p.r,
+      createdAt: typeof p.t === "number" ? p.t : 0,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** The RFC 7591 registration response we echo back to the host. */
@@ -48,13 +98,18 @@ export class OAuthProvider {
     if (redirectUris.length === 0) {
       throw new Error("redirect_uris must contain at least one URI");
     }
-    const clientId = `mcpc_${randomBytes(16).toString("hex")}`;
     const clientName = input.client_name ?? "MCP client";
+    const createdAt = this.deps.now();
+    // Stateless signed id when a secret is configured (survives redeploy +
+    // multi-instance); random opaque id otherwise (dev, in-memory only).
+    const clientId = this.deps.secret
+      ? signClientId(this.deps.secret, { clientName, redirectUris, createdAt })
+      : `mcpc_${randomBytes(16).toString("hex")}`;
     this.clients.set(clientId, {
       clientId,
       clientName,
       redirectUris,
-      createdAt: this.deps.now(),
+      createdAt,
     });
     return {
       client_id: clientId,
@@ -67,7 +122,19 @@ export class OAuthProvider {
   }
 
   getClient(clientId: string): OAuthClient | undefined {
-    return this.clients.get(clientId);
+    // Same-instance fast path.
+    const cached = this.clients.get(clientId);
+    if (cached) return cached;
+    // Durable path: verify the signature so a client registered before a
+    // redeploy (or on another instance) is still recognised.
+    if (this.deps.secret) {
+      const verified = verifyClientId(this.deps.secret, clientId);
+      if (verified) {
+        this.clients.set(clientId, verified); // re-cache for this instance
+        return verified;
+      }
+    }
+    return undefined;
   }
 
   /** Mint a single-use authorization code bound to the PKCE challenge,
