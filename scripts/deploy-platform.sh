@@ -69,14 +69,14 @@ fi
 docker buildx build --load -f "$dockerfile" -t "$img" "$src"
 
 echo "[2/3] reconstruct run command from live $cn, swapping image -> $img"
-net="$(docker inspect "$cn" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')"
+net="$(docker inspect "$cn" --format '{{.HostConfig.NetworkMode}}')"
 restart="$(docker inspect "$cn" --format '{{.HostConfig.RestartPolicy.Name}}')"
 run="/root/build/$app/.run-$tag.sh"
 {
   echo "#!/bin/bash"
   echo "set -e"
   echo "docker rm -f $cn 2>/dev/null || true"
-  printf 'docker run -d --name %s --restart %s --network %s \\\n' "$cn" "${restart:-unless-stopped}" "${net:-coolify}"
+  printf 'docker run -d --name %s --restart %s --network %s \\\n' "$cn" "${restart:-unless-stopped}" "${net:-cantila}"
   # env minus container-runtime defaults that belong to the image, not the app
   docker inspect "$cn" --format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -vE '^(PATH|HOME|HOSTNAME|TERM|NODE_VERSION|YARN_VERSION)=' \
