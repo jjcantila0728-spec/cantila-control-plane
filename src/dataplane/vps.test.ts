@@ -108,6 +108,31 @@ test("buildRunCommand pulls, removes the old container, and runs with Traefik la
   assert.match(cmd, /-e FOO='bar'/);
 });
 
+test("buildRunCommand reclaims the host from any OTHER container (old Coolify-hashed) before starting", () => {
+  const cmd = buildRunCommand({
+    container: "cantila-prj_abc",
+    imageRef: "reg/cantila-prj_abc:abc",
+    env: {},
+    hosts: ["demo.cantila.app"],
+    network: "cantila",
+    entrypoint: "websecure",
+    certResolver: "le",
+    port: 3000,
+  });
+  // Iterates running containers, skips the new one, and removes any whose
+  // Traefik labels already claim demo.cantila.app — fixes the redeploy
+  // router conflict where the old hashed container kept the same Host() rule.
+  assert.match(cmd, /for c in \$\(docker ps --format '\{\{\.Names\}\}'\)/);
+  assert.match(cmd, /\[ "\$c" = 'cantila-prj_abc' \]/);
+  assert.match(cmd, /grep -qF 'Host\(`demo\.cantila\.app`\)'/);
+  const reclaimIdx = cmd.indexOf("docker ps --format");
+  const runIdx = cmd.indexOf("docker run -d");
+  assert.ok(
+    reclaimIdx > -1 && reclaimIdx < runIdx,
+    "host reclaim must run before docker run",
+  );
+});
+
 test("buildRunCommand includes docker login only when registry creds are set", () => {
   const withAuth = buildRunCommand({
     container: "c",

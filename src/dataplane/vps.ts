@@ -325,9 +325,27 @@ export function buildRunCommand(a: RunCommandArgs): string {
     `docker network create ${a.network} >/dev/null 2>&1 || true`,
     `docker pull ${sq(a.imageRef)}`,
     `docker rm -f ${a.container} >/dev/null 2>&1 || true`,
+    ...a.hosts.map((h) => reclaimHostStep(h, a.container)),
     runParts.join(" "),
   ].filter(Boolean);
   return steps.join(" && ");
+}
+
+/** Remove any OTHER running container whose Traefik labels already claim
+ *  `host`, so a redeploy can't leave two containers fighting over the same
+ *  `Host()` router rule. The old Coolify-created containers use hashed names
+ *  (not `cantila-<id>`), so the plain `docker rm -f <new name>` in
+ *  buildRunCommand never reaped them — this does, by matching the rule label
+ *  value rather than the name. Self-skips `keep` and is fully best-effort. */
+export function reclaimHostStep(host: string, keep: string): string {
+  const pattern = "Host(`" + host + "`)";
+  return (
+    `for c in $(docker ps --format '{{.Names}}'); do ` +
+    `[ "$c" = ${sq(keep)} ] && continue; ` +
+    `docker inspect "$c" --format '{{json .Config.Labels}}' 2>/dev/null ` +
+    `| grep -qF ${sq(pattern)} && docker rm -f "$c" >/dev/null 2>&1 || true; ` +
+    `done`
+  );
 }
 
 /** Assemble the remote one-off `docker run --rm` that applies the schema. */
