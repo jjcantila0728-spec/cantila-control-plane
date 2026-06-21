@@ -22,19 +22,6 @@ async function realFileExists(p: string): Promise<boolean> {
   try { await access(p); return true; } catch { return false; }
 }
 
-async function realProbe(url: string): Promise<number> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 3000);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    return res.status;
-  } catch {
-    return 0;
-  } finally {
-    clearTimeout(t);
-  }
-}
-
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** Select the smoke-test backend from config. Noop unless FLEET_SANDBOX=docker. */
@@ -44,7 +31,10 @@ export function getSandboxRunner(): SandboxRunner {
     return new DockerSandboxRunner({
       exec: realExec,
       fileExists: realFileExists,
-      probe: realProbe,
+      // probe omitted on purpose: the runner probes via a one-off curl
+      // container on the sandbox network, which works whether docker is a
+      // local socket or a remote daemon (the host loopback the old realProbe
+      // hit is not the control-plane container's loopback).
       sleep,
       now: () => Date.now(),
       defaultTimeoutMs: cfg.sandboxTimeoutMs,

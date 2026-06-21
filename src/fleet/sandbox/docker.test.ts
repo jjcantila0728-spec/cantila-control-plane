@@ -70,6 +70,30 @@ test("always tears down containers even when a step throws", async () => {
   assert.match(flat(calls).join("\n"), /rm -f/i, "teardown must run in finally");
 });
 
+test("probes via a one-off curl container on the sandbox network when no probe is injected", async () => {
+  const calls: ExecCall[] = [];
+  let clock = 0;
+  const runner = new DockerSandboxRunner({
+    // exec returns "200" stdout for the curl probe container, "" otherwise
+    exec: async (cmd: string, args: string[]) => {
+      calls.push({ cmd, args });
+      const isProbe = args.includes("curlimages/curl:8.11.1");
+      return { code: 0, stdout: isProbe ? "200" : "", stderr: "" };
+    },
+    fileExists: async () => false,
+    // probe intentionally omitted -> in-network container probe path
+    sleep: async (ms: number) => { clock += ms; },
+    now: () => clock,
+    pollIntervalMs: 1000,
+  });
+  const res = await runner.run({ workspaceDir: "/ws", stack: "node", projectId: "p1" });
+  assert.equal(res.passed, true);
+  const joined = flat(calls).join("\n");
+  assert.match(joined, /curlimages\/curl/, "should probe via a curl container");
+  assert.match(joined, /--network cantila-sbnet-p1/, "probe must run on the sandbox network");
+  assert.match(joined, /http:\/\/cantila-sandbox-p1:8080\//, "probe targets the app container by name, not host loopback");
+});
+
 test("does not leak host secrets into the sandbox container env", async () => {
   const SECRET = "super-secret-prod-value-xyz";
   process.env.CANTILA_SECRET_KEY = SECRET;

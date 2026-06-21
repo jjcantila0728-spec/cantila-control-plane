@@ -8,8 +8,11 @@ export interface DockerDeps {
   exec: (cmd: string, args: string[]) => Promise<ExecResult>;
   /** True when an absolute path exists (used to detect prisma/schema.prisma). */
   fileExists: (absPath: string) => Promise<boolean>;
-  /** HTTP GET; resolves to the status code, or 0 on connection error. */
-  probe: (url: string) => Promise<number>;
+  /** Optional HTTP GET resolving to the status code (0 on error). When omitted
+   *  the runner probes via a one-off curl container on the sandbox network,
+   *  which is the correct path for a remote/socket docker daemon. Injected in
+   *  unit tests for determinism. */
+  probe?: (url: string) => Promise<number>;
   sleep: (ms: number) => Promise<void>;
   now: () => number;
   pollIntervalMs?: number;
@@ -80,15 +83,33 @@ export class DockerSandboxRunner implements SandboxRunner {
         image, "sh", "-c", "npm start",
       ]);
 
-      // 4. probe until healthy or timeout
-      const healthUrl = `http://127.0.0.1:${port}/health`;
-      const rootUrl = `http://127.0.0.1:${port}/`;
+      // 4. probe until healthy or timeout. Probe from a one-off curl container
+      //    ON the sandbox network (http://<app>:<port>) rather than the host's
+      //    127.0.0.1 — the app's port is only published on whichever host the
+      //    docker daemon lives on, which is NOT the control-plane container's
+      //    loopback. Going through the network makes the probe correct whether
+      //    docker is a local socket or remote (SSH) daemon. Falls back to the
+      //    injected probe() when present (unit tests / future host-local mode).
+      const healthUrl = `http://${app}:${port}/health`;
+      const rootUrl = `http://${app}:${port}/`;
+      const probeUrl = async (url: string): Promise<number> => {
+        if (probe) return probe(url);
+        try {
+          const r = await exec("docker", [
+            "run", "--rm", "--network", net, "curlimages/curl:8.11.1",
+            "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", url,
+          ]);
+          return Number.parseInt((r.stdout || "").trim(), 10) || 0;
+        } catch {
+          return 0;
+        }
+      };
       const deadline = start + timeout;
       let status = 0;
       while (now() < deadline) {
-        status = await probe(healthUrl);
+        status = await probeUrl(healthUrl);
         if (status === 200) break;
-        status = await probe(rootUrl);
+        status = await probeUrl(rootUrl);
         if (status === 200) break;
         await sleep(poll);
       }
