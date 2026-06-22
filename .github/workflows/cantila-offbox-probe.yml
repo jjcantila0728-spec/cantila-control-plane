@@ -1,0 +1,89 @@
+name: cantila-offbox-probe
+
+# Off-box uptime + DNS/WHOIS-drift prober.
+#
+# WHY: the on-box monitor (/root/cantila-monitor.sh on box1) cannot alert when
+# the box itself is dead — it dies with it. This GitHub-hosted prober runs on
+# Microsoft's infra, completely off-box, so total box death (or a Hetzner/Traefik
+# edge outage, or the recurring Namecheap WHOIS suspension) still pages us.
+#
+# It mirrors the on-box monitor's checks and posts to the SAME ntfy topic.
+# Stateless (no transition tracking): a sustained outage re-alerts every run,
+# which for a true box-death is desirable escalation, not spam. The job also
+# exit 1's on failure so GitHub's own Actions notifications fire as a backstop.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # 5 min = GitHub Actions minimum interval
+  workflow_dispatch: {}      # allow manual run from the Actions tab
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offbox-probe
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe Cantila endpoints + DNS
+        env:
+          # Override via repo secret CANTILA_NTFY_TOPIC if the topic is rotated.
+          NTFY_TOPIC: ${{ secrets.CANTILA_NTFY_TOPIC || 'cantila-alerts-9k3mz7qp' }}
+        run: |
+          set -uo pipefail
+          NTFY_URL="https://ntfy.sh/${NTFY_TOPIC}"
+          EXPECT_IP="168.119.97.112"
+          EXPECT_NS="registrar-servers.com"   # Namecheap BasicDNS; drifts on WHOIS suspension
+          fails=()
+
+          check_http() {
+            local key="$1" url="$2" expect="$3" code
+            code="$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$url" 2>/dev/null || echo 000)"
+            if echo " $expect " | grep -q " $code "; then
+              echo "OK   $key  $url -> $code"
+            else
+              echo "FAIL $key  $url -> $code (expected: $expect)"
+              fails+=("$key — $url returned $code")
+            fi
+          }
+
+          check_http api     "https://api.cantila.app/v1/health" "200"
+          check_http console "https://console.cantila.app"       "200 301 302 307 308"
+          check_http mcp     "https://mcp.cantila.app"           "200 401"
+          check_http status  "https://status.cantila.app"        "200"
+
+          # DNS / WHOIS-suspension drift (the recurring failure mode)
+          ns="$(dig +short NS cantila.app 2>/dev/null | tr '\n' ' ')"
+          if echo "$ns" | grep -q "$EXPECT_NS"; then
+            echo "OK   dns_ns  NS: $ns"
+          else
+            echo "FAIL dns_ns  NS drift: got [$ns] expected *.$EXPECT_NS"
+            fails+=("dns_ns — NS drift: got [$ns] expected *.$EXPECT_NS (Namecheap WHOIS suspension? check verify-contact email)")
+          fi
+          a="$(dig +short A api.cantila.app 2>/dev/null | head -1)"
+          if [ "$a" = "$EXPECT_IP" ]; then
+            echo "OK   dns_a  A api.cantila.app = $a"
+          else
+            echo "FAIL dns_a  A api.cantila.app = [$a] expected $EXPECT_IP"
+            fails+=("dns_a — A api.cantila.app = [$a] expected $EXPECT_IP (parked/suspended?)")
+          fi
+
+          if [ ${#fails[@]} -eq 0 ]; then
+            echo "All probes green."
+            exit 0
+          fi
+
+          msg="Off-box probe (GitHub Actions) sees Cantila DOWN — the on-box monitor may be down too (box death?):"$'\n'
+          for f in "${fails[@]}"; do msg="${msg}- ${f}"$'\n'; done
+          curl -s -m 15 \
+            -H "Title: 🛰️ OFF-BOX: Cantila unreachable" \
+            -H "Priority: urgent" \
+            -H "Tags: rotating_light,satellite" \
+            -d "$msg" "$NTFY_URL" >/dev/null || true
+
+          echo "::error::Off-box probe failures: ${fails[*]}"
+          exit 1
