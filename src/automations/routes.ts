@@ -18,6 +18,7 @@ import type { ControlPlane } from "../core/control-plane";
 import type { Store } from "../domain/store";
 import type { AutomationKind, Project } from "../domain/types";
 import type { WorkflowGraph, AutomationEngineAdapter } from "./engine";
+import { listLiveWorkflows, liveEnvFromProcess } from "./live-workflows";
 import { parseN8nWorkflowExport, N8nEngineAdapter } from "./engines/n8n";
 import { OpenClawEngineAdapter } from "./engines/openclaw";
 import type { DefaultEngineRegistry } from "./registry";
@@ -186,6 +187,17 @@ export function registerAutomationRoutes(
         live: (registry.labels.get(k) ?? "").endsWith("@live"),
       })),
     };
+  });
+
+  /* ----- live platform instances: real workflows from the deployed
+     n8n + OpenClaw (talks to their actual APIs, not the canvas engine). ----- */
+  app.get("/v1/automations/live/:kind/workflows", async (request, reply) => {
+    resolveAccountId(request); // require auth (throws -> 401 via global hook)
+    const { kind } = request.params as { kind: string };
+    if (kind !== "n8n" && kind !== "openclaw") {
+      return reply.code(404).send({ error: "unknown automation kind" });
+    }
+    return listLiveWorkflows(kind, liveEnvFromProcess());
   });
 
   /* ----- instances ----- */
