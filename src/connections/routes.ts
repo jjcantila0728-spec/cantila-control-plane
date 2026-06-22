@@ -41,10 +41,14 @@ interface RouteDeps {
    *  the audit feed sits alongside its connection. */
   cp?: ControlPlane;
   resolveAccountId: (req: FastifyRequest) => string;
-  /** Pluggable secret writer — Phase A uses an in-memory map so the
-   *  scaffold has no external dependency. The real impl writes through
-   *  the secrets manager. */
+  /** Pluggable secret writer — when absent, an in-memory map backs the
+   *  scaffold so it has no external dependency. The real impl writes
+   *  through the persistent secret store (Postgres, encrypted at rest). */
   writeSecret?: (ref: string, payload: Record<string, string>) => Promise<void>;
+  /** Pluggable secret deleter, paired with `writeSecret`. When absent,
+   *  deletes fall back to the in-memory map. Provided in prod so a
+   *  deleted connection doesn't orphan its row in the secret store. */
+  deleteSecret?: (ref: string) => Promise<void>;
 }
 
 /** Project the row over the wire — never leaks `secretRef` consumers
@@ -67,15 +71,20 @@ export function registerConnectionRoutes(
   app: FastifyInstance,
   deps: RouteDeps,
 ): void {
-  const { store, cp, resolveAccountId, writeSecret } = deps;
+  const { store, cp, resolveAccountId, writeSecret, deleteSecret } = deps;
 
-  // Phase-A fallback secret store. Replaced when the real secrets
-  // manager is wired through `writeSecret`.
+  // Fallback secret store, used only when no real `writeSecret` is wired
+  // (scaffold / tests). Prod passes a persistent, encrypted writer.
   const inMemorySecrets = new Map<string, Record<string, string>>();
   const persist = writeSecret
     ? writeSecret
     : async (ref: string, payload: Record<string, string>) => {
         inMemorySecrets.set(ref, payload);
+      };
+  const forget = deleteSecret
+    ? deleteSecret
+    : async (ref: string) => {
+        inMemorySecrets.delete(ref);
       };
 
   /* ----- catalog ----- */
@@ -205,7 +214,7 @@ export function registerConnectionRoutes(
       return reply.code(404).send({ error: "connection not found" });
     }
     await store.deleteConnection(id);
-    inMemorySecrets.delete(conn.secretRef);
+    await forget(conn.secretRef);
     return reply.code(204).send();
   });
 

@@ -217,6 +217,18 @@ const MIGRATIONS: AdditiveColumnMigration[] = [
       "StoreRelease [projectId, createdAt] index — backs the per-project release list (newest first).",
     sql: 'CREATE INDEX IF NOT EXISTS "StoreRelease_projectId_createdAt_idx" ON "StoreRelease"("projectId", "createdAt");',
   },
+  {
+    id: "20260622000000_create_connection_secret",
+    description:
+      "ConnectionSecret table — durable, encrypted-at-rest store for Cantila Connections credential payloads (API-key fields + OAuth access/refresh tokens, plan §4.11/§15.5). Replaces the process-memory Map so saved connections survive a control-plane redeploy and work across instances. `payload` holds the enc.v1 envelope (or plaintext JSON when CANTILA_SECRET_KEY is unset).",
+    sql: `CREATE TABLE IF NOT EXISTS "ConnectionSecret" (
+      "ref" TEXT NOT NULL,
+      "payload" TEXT NOT NULL,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "ConnectionSecret_pkey" PRIMARY KEY ("ref")
+    );`,
+  },
 ];
 
 /** Apply every additive migration. Safe to call multiple times.

@@ -37,6 +37,10 @@ import { registerAutomationRoutes } from "./automations/routes";
 import { selectWorkspaceProvisioner } from "./dataplane/coolify-workspace-provisioner";
 import { registerConnectionRoutes } from "./connections/routes";
 import {
+  createInMemoryConnectionSecretStore,
+  createPrismaConnectionSecretStore,
+} from "./connections/connection-secret-store";
+import {
   registerCantilapayRoutes,
   selectPaymentProcessor,
   startDeliveryWorker as startCantilapayDeliveryWorker,
@@ -130,23 +134,26 @@ console.log(
 // `OpenClawEngineAdapter` when their env vars are set.
 const engineRegistry = buildDefaultRegistry();
 
-/** In-process secrets store backing Cantila Connections (plan §4.11).
- *  Phase A placeholder for the real secrets manager — connection routes
- *  write through it, the credential broker (plan §15.5 Phase F) reads
- *  through it to push real bytes into engines. Shared at module scope
- *  so writes from `/v1/connections` are visible to the broker. */
-const connectionSecrets = new Map<string, Record<string, string>>();
-const writeConnectionSecret = async (
+/** Secrets store backing Cantila Connections (plan §4.11). Connection
+ *  routes write through it; the credential broker (plan §15.5 Phase F)
+ *  reads through it to push real bytes into engines. Postgres-backed
+ *  (encrypted at rest) when STORE=prisma, so saved connection
+ *  credentials survive a control-plane redeploy and work across
+ *  instances; falls back to a process-memory map for STORE=memory /
+ *  tests where there is no database. */
+const connectionSecretStore =
+  config.store === "prisma"
+    ? createPrismaConnectionSecretStore(getPrisma())
+    : createInMemoryConnectionSecretStore();
+const writeConnectionSecret = (
   ref: string,
   payload: Record<string, string>,
-): Promise<void> => {
-  connectionSecrets.set(ref, payload);
-};
-const readConnectionSecret = async (
+): Promise<void> => connectionSecretStore.write(ref, payload);
+const readConnectionSecret = (
   ref: string,
-): Promise<Record<string, string> | null> => {
-  return connectionSecrets.get(ref) ?? null;
-};
+): Promise<Record<string, string> | null> => connectionSecretStore.read(ref);
+const deleteConnectionSecret = (ref: string): Promise<void> =>
+  connectionSecretStore.remove(ref);
 
 const cp = new ControlPlane({
   store,
@@ -2973,6 +2980,7 @@ registerConnectionRoutes(app, {
   cp,
   resolveAccountId,
   writeSecret: writeConnectionSecret,
+  deleteSecret: deleteConnectionSecret,
 });
 
 /* ----- Mobile builds + store publishing (spec 2026-06-11) ----- */
