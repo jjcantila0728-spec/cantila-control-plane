@@ -84,6 +84,22 @@ export class UptimeChecker {
       healthy = false;
     }
     const responseMs = Date.now() - t0;
+
+    // Converge stored status toward observed reality. A project frozen in a
+    // non-terminal state ("building"/"provisioning") whose domain is serving
+    // has lost its deploy's terminal write (the CP process died between the
+    // "building" and "live" writes — see GUIDE-project-status-reconciliation).
+    // Repair it so the Console stops showing "Building" on a live project.
+    // Only the toward-live direction is reconciled here; the failure
+    // direction (a build hung too long) is a time-bounded watchdog concern,
+    // and deliberate states (paused/sleeping/crashed) are never overridden.
+    if (
+      healthy &&
+      (project.status === "building" || project.status === "provisioning")
+    ) {
+      await this.deps.store.updateProject(project.id, { status: "live" });
+    }
+
     const entry = this.state.get(project.id) ?? {
       history: [],
       lastResponseMs: [],
