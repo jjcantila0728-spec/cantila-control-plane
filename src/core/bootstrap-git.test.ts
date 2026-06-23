@@ -64,7 +64,9 @@ test("bootstrapGit migrates the source server-side and wires the project like co
   assert.equal(result.project.autoDeploy, true);
   assert.equal(result.autoDeployTriggered, true); // bootstrap takes it live by default
   assert.equal(result.webhookSecret.length, 64);
-  assert.equal(result.webhookUrl, `/v1/projects/${id}/git/webhook`);
+  // Absolute, pasteable URL — the receiver path under the public API origin.
+  assert.match(result.webhookUrl, /^https:\/\/[^/]+\/v1\/projects\/.+\/git\/webhook$/);
+  assert.ok(result.webhookUrl.endsWith(`/v1/projects/${id}/git/webhook`));
   // The response never carries the secret on the project itself.
   assert.equal(result.project.webhookSecret, undefined);
 

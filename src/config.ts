@@ -50,6 +50,15 @@ export const config = {
    *  the cantila-console repo automatically. When false (the default),
    *  the agent only queues proposals for human review. */
   seoAgentAutoApply: flag(process.env.SEO_AGENT_AUTO_APPLY),
+  /** Public origin of the control-plane API. Used to build ABSOLUTE git
+   *  webhook URLs handed to GitHub/GitLab at connect time (a relative path
+   *  can't be pasted into a host's webhook config). Defaults to
+   *  https://api.<CANTILA_PUBLIC_HOST or cantila.app>; override in
+   *  dev/staging. Trailing slashes are trimmed. */
+  apiPublicUrl: (
+    process.env.CANTILA_API_PUBLIC_URL ??
+    `https://api.${process.env.CANTILA_PUBLIC_HOST ?? "cantila.app"}`
+  ).replace(/\/+$/, ""),
   /** GitHub PAT used by the live SeoFixer adapter. When absent, the stub
    *  fixer is used — auto-apply degrades to a no-op that logs intent. */
   githubToken: process.env.GITHUB_TOKEN ?? "",

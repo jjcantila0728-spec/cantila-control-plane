@@ -173,3 +173,48 @@ export async function deleteFile(
   );
   return { commitSha: data.commit.sha };
 }
+
+/** Idempotently install a `push` webhook on a GitHub repo pointing at
+ *  Cantila's per-project receiver. This is what turns "I connected a repo"
+ *  into "every git push auto-deploys" without the user hand-pasting the
+ *  hook into GitHub's settings. Requires a token with `admin:repo_hook`
+ *  scope on the repo (a tenant's own PAT, used once and never stored).
+ *
+ *  Idempotent: if a hook already targets the same receiver URL we PATCH it
+ *  (refreshing the secret + events) rather than stacking a duplicate, so
+ *  reconnecting or rotating the secret stays clean. */
+export async function registerPushWebhook(
+  ref: RepoRef,
+  token: string,
+  opts: { url: string; secret: string },
+): Promise<{ hookId: number; created: boolean }> {
+  if (!ref.owner || !ref.repo) {
+    throw new GithubError(400, "cannot register webhook: unparseable repo");
+  }
+  const base = `${API}/repos/${ref.owner}/${ref.repo}/hooks`;
+  const config = {
+    url: opts.url,
+    secret: opts.secret,
+    content_type: "json",
+    insecure_ssl: "0",
+  };
+
+  // Reuse an existing hook with the same receiver URL if present.
+  const existing = await gh<{ id: number; config?: { url?: string } }[]>(base, token);
+  const match = Array.isArray(existing)
+    ? existing.find((h) => h.config?.url === opts.url)
+    : undefined;
+  if (match) {
+    await gh(`${base}/${match.id}`, token, {
+      method: "PATCH",
+      body: JSON.stringify({ active: true, events: ["push"], config }),
+    });
+    return { hookId: match.id, created: false };
+  }
+
+  const created = await gh<{ id: number }>(base, token, {
+    method: "POST",
+    body: JSON.stringify({ name: "web", active: true, events: ["push"], config }),
+  });
+  return { hookId: created.id, created: true };
+}

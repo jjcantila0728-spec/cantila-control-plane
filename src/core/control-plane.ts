@@ -219,6 +219,22 @@ export interface ControlPlaneDeps {
    *  Traefik has issued its Let's Encrypt cert). Defaults to a real
    *  HTTPS HEAD/GET probe; tests inject a deterministic stub. */
   domainProbe?: (hostname: string) => Promise<boolean>;
+  /** Optional — installs a `push` webhook on a connected GitHub repo so
+   *  `connectGit` turns into true auto-deploy-on-push without the user
+   *  hand-pasting the hook into GitHub's settings. Wired by the HTTP boot
+   *  to the live GitHub REST adapter; tests inject a stub. Absent → connect
+   *  returns the URL+secret for manual setup (the legacy behaviour). */
+  githubWebhookRegistrar?: GitHubWebhookRegistrar;
+}
+
+/** Port: register Cantila's push-webhook on an external git host. */
+export interface GitHubWebhookRegistrar {
+  register(input: {
+    repoUrl: string;
+    token: string;
+    webhookUrl: string;
+    secret: string;
+  }): Promise<{ hookId: number }>;
 }
 
 export interface CreateProjectInput {
@@ -6856,9 +6872,23 @@ export class ControlPlane {
 
   async connectGit(
     projectId: string,
-    opts: { repoUrl: string; branch?: string; autoDeploy?: boolean },
+    opts: {
+      repoUrl: string;
+      branch?: string;
+      autoDeploy?: boolean;
+      /** One-time token with `admin:repo_hook` scope on the repo. When
+       *  supplied (and the repo is on GitHub), the push webhook is
+       *  registered automatically. Used once, never persisted. */
+      registrationToken?: string;
+    },
   ): Promise<
-    { project: Project; webhookSecret: string; webhookUrl: string }
+    {
+      project: Project;
+      webhookSecret: string;
+      webhookUrl: string;
+      webhookRegistered: boolean;
+      webhookRegistrationError?: string;
+    }
     | { error: string }
   > {
     const url = opts.repoUrl.trim();
@@ -6902,18 +6932,52 @@ export class ControlPlane {
       autoDeploy: opts.autoDeploy ?? true,
       webhookSecret,
     });
+    const webhookUrl = this.webhookUrlFor(updated.id);
+
+    // Best-effort auto-registration: turn "repo connected" into true
+    // push-to-deploy without the user hand-pasting the hook into GitHub.
+    // A one-time `registrationToken` (tenant's own PAT) is preferred; the
+    // platform `GITHUB_TOKEN` is a fallback for repos the platform owns.
+    // Failure NEVER fails the connect — it degrades to manual setup, the
+    // same discipline as stack detection above.
+    let webhookRegistered = false;
+    let webhookRegistrationError: string | undefined;
+    const regToken = opts.registrationToken ?? config.githubToken;
+    const isGithub = /(^|\/\/|@)github\.com[/:]/i.test(url);
+    if (regToken && isGithub && this.deps.githubWebhookRegistrar) {
+      try {
+        await this.deps.githubWebhookRegistrar.register({
+          repoUrl: url,
+          token: regToken,
+          webhookUrl,
+          secret: webhookSecret,
+        });
+        webhookRegistered = true;
+      } catch (e) {
+        webhookRegistrationError = (e as Error).message;
+      }
+    }
+
     await this.recordEvent(
       project.accountId,
       "git",
       `Git connected to ${project.name}`,
-      `${url} · branch ${updated.branch} · auto-deploy ${updated.autoDeploy ? "on" : "off"}`,
+      `${url} · branch ${updated.branch} · auto-deploy ${updated.autoDeploy ? "on" : "off"}` +
+        (webhookRegistered ? " · webhook auto-registered" : ""),
       projectId,
     );
     return {
       project: stripWebhookSecret(updated),
       webhookSecret,
-      webhookUrl: `/v1/projects/${updated.id}/git/webhook`,
+      webhookUrl,
+      webhookRegistered,
+      ...(webhookRegistrationError ? { webhookRegistrationError } : {}),
     };
+  }
+
+  /** Absolute, pasteable receiver URL for a project's git webhook. */
+  private webhookUrlFor(projectId: string): string {
+    return `${config.apiPublicUrl}/v1/projects/${projectId}/git/webhook`;
   }
 
   /** Best-effort stack detection over a project's repo tree. Returns the
@@ -7043,7 +7107,7 @@ export class ControlPlane {
     return {
       project: stripWebhookSecret(updated),
       webhookSecret,
-      webhookUrl: `/v1/projects/${updated.id}/git/webhook`,
+      webhookUrl: this.webhookUrlFor(updated.id),
       stack: { buildPack: stack.buildPack, port: stack.port, label: stack.stack },
       autoDeployTriggered,
     };

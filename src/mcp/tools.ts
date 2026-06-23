@@ -688,7 +688,7 @@ export function cantilaTools(
     {
       name: "cantila_connect_git",
       description:
-        "Connect a git repository to a Cantila project. Pushes to the configured branch auto-deploy via the webhook receiver.",
+        "Connect a git repository to a Cantila project so pushes to the tracked branch auto-deploy. Provide a one-time GitHub token (registrationToken) and Cantila installs the push webhook for you — true push-to-deploy with no manual GitHub setup. Without it, the returned URL+secret can be added to GitHub's webhook settings by hand.",
       inputSchema: {
         type: "object",
         properties: {
@@ -705,6 +705,11 @@ export function cantilaTools(
             type: "boolean",
             description: "Auto-deploy on push? Defaults to true.",
           },
+          registrationToken: {
+            type: "string",
+            description:
+              "One-time GitHub token with admin:repo_hook scope. When given, Cantila auto-installs the push webhook on the repo. Used once, never stored.",
+          },
         },
         required: ["projectId", "repoUrl"],
       },
@@ -719,21 +724,36 @@ export function cantilaTools(
           branch: typeof args.branch === "string" ? args.branch : undefined,
           autoDeploy:
             typeof args.autoDeploy === "boolean" ? args.autoDeploy : undefined,
+          registrationToken:
+            typeof args.registrationToken === "string" ? args.registrationToken : undefined,
         });
         if ("error" in result) return errorText(result.error);
         const p = result.project;
-        return text(
-          [
-            `Connected ${p.repoUrl} to ${p.slug}`,
-            `Branch: ${p.branch} · Auto-deploy: ${p.autoDeploy ? "on" : "off"}`,
-            "",
-            `Webhook URL: ${result.webhookUrl}`,
-            `Webhook secret (shown once, store securely):`,
-            `  ${result.webhookSecret}`,
-            "",
-            `Set header X-Hub-Signature-256: sha256=<HMAC-SHA256 of body, hex> on every push.`,
-          ].join("\n"),
-        );
+        const lines = [
+          `Connected ${p.repoUrl} to ${p.slug}`,
+          `Branch: ${p.branch} · Auto-deploy: ${p.autoDeploy ? "on" : "off"}`,
+          "",
+        ];
+        if (result.webhookRegistered) {
+          lines.push(
+            `✅ Push webhook auto-installed on the repo — every push to ${p.branch} now deploys automatically. Nothing else to do.`,
+          );
+        } else {
+          if (result.webhookRegistrationError) {
+            lines.push(
+              `⚠️ Couldn't auto-install the webhook (${result.webhookRegistrationError}). Add it manually:`,
+            );
+          } else {
+            lines.push(`To enable push-to-deploy, add this webhook to the repo:`);
+          }
+          lines.push(
+            `  Payload URL: ${result.webhookUrl}`,
+            `  Content type: application/json`,
+            `  Secret (shown once, store securely): ${result.webhookSecret}`,
+            `  Events: just the push event`,
+          );
+        }
+        return text(lines.join("\n"));
       },
     },
 

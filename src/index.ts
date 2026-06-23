@@ -21,6 +21,7 @@ import { selectDataPlane } from "./dataplane/factory";
 import { materializeBuildSshKey, writeKeyFile } from "./dataplane/build-ssh-key";
 import { selectProvisioner } from "./dataplane/coolify-provisioner";
 import { ControlPlane } from "./core/control-plane";
+import { parseRepo, registerPushWebhook } from "./github/github-files";
 import type { ApiKey, AccountPlan } from "./domain/types";
 import { now } from "./lib/ids";
 import { setRequestContext } from "./lib/request-context";
@@ -163,6 +164,21 @@ const cp = new ControlPlane({
   aiAnalyser,
   engineRegistry,
   resolveSecret: readConnectionSecret,
+  // Live GitHub push-webhook installer — turns `connectGit` into true
+  // push-to-deploy. Parses the repo, then idempotently installs the hook
+  // with the supplied one-time token. Connect degrades to manual on any
+  // failure (bad scope, private repo, network), so this is best-effort.
+  githubWebhookRegistrar: {
+    register: async ({ repoUrl, token, webhookUrl, secret }) => {
+      const ref = parseRepo(repoUrl);
+      if (!ref) throw new Error(`not a GitHub repo URL: ${repoUrl}`);
+      const { hookId } = await registerPushWebhook(ref, token, {
+        url: webhookUrl,
+        secret,
+      });
+      return { hookId };
+    },
+  },
 });
 
 // Per-project agent team (plan: complete-builder). Auto-selects an LLM
@@ -826,6 +842,10 @@ const connectGitSchema = z.object({
   repoUrl: z.string().url(),
   branch: z.string().default("main"),
   autoDeploy: z.boolean().default(true),
+  // One-time GitHub token (admin:repo_hook scope) used to auto-install the
+  // push webhook so the repo deploys on every push. Used once, never
+  // persisted. Omit to set the webhook up manually with the returned URL.
+  registrationToken: z.string().optional(),
 });
 
 const bootstrapGitSchema = z.object({
